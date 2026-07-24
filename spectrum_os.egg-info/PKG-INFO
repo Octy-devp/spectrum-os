@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: spectrum-os
+Version: 0.1.0
+Summary: β₁ worldline NSPV economic deviation detection machine
+Requires-Python: >=3.10
+Requires-Dist: numpy<3.0,>=2.0
