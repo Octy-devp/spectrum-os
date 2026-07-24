@@ -64,7 +64,7 @@ class TestWaveOps:
         sector.create("b_series", b.tolist())
         result = wave_ops.correlate("a_series", "b_series")
         assert "r" in result
-        assert "lag_months" in result
+        assert "lag" in result
 
     def test_decompose_unknown_sector(self):
         with pytest.raises(ValueError, match="not found"):

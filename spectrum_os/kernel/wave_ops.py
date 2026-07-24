@@ -52,11 +52,11 @@ def correlate(a_id: str, b_id: str, max_lag: int = 24) -> dict:
     a_id, b_id
         Registered sector identifiers.
     max_lag
-        Maximum lag in months (passed to :func:`wave.correlate`).
+        Maximum lag (passed to :func:`wave.correlate`).
 
     Returns
     -------
-    dict with keys ``r`` and ``lag_months``.
+    dict with keys ``r``, ``lag``, and ``equiv_lags``.
     """
     sec_a = sector_store.get(a_id)
     if sec_a is None:

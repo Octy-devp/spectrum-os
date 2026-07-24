@@ -75,12 +75,12 @@ spectrum_os/
 | **Max lag = 36 by default** | Autocorrelation at lags > N/3 becomes unreliable for small-N series. The default is conservative. |
 | **In-memory store** | Sectors live in a dict. JSON `save/load` for persistence. No SQLite dependency in kernel. |
 
-## API reference
+## Function reference
 
-All operations accessed via the `osc` singleton:
+All operations (pure Python, no network) accessed via the `osc` singleton:
 
-| Operation | Method | Returns |
-|-----------|--------|---------|
+| Function | Signature | Returns |
+|----------|-----------|---------|
 | Create sector | `osc.sectors.create(id, values, meta)` | `Sector` |
 | List sectors | `osc.sectors.list()` | `dict[str, Sector]` |
 | Get sector | `osc.sectors.get(id)` | `Sector` |

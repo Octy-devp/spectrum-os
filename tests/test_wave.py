@@ -112,20 +112,20 @@ class TestCorrelate:
         b = np.zeros_like(a)
         b[3:] = a[:-3]
         result = correlate(a, b)
-        assert result["lag_months"] == 3, (
-            f"Expected lag=3, got {result['lag_months']} "
+        assert result["lag"] == 3, (
+            f"Expected lag=3, got {result['lag']} "
             f"(r={result['r']:.4f})"
         )
 
     def test_identical_signals(self):
         a = np.random.randn(100)
         result = correlate(a, a)
-        assert result["lag_months"] == 0
+        assert result["lag"] == 0
         assert result["r"] > 0.99
 
     def test_short_arrays(self):
         result = correlate(np.array([1.0]), np.array([2.0]))
-        assert result["lag_months"] == 0
+        assert result["lag"] == 0
 
 
 # ===================================================================

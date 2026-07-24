@@ -188,23 +188,29 @@ def _max_autocorr_peak(timeseries: np.ndarray, max_lag: int = 36) -> float:
 def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24) -> dict:
     """Lagged cross-correlation between two time series.
 
+    Detects the lag that maximises Pearson-like correlation within
+    ``[-max_lag, +max_lag]``.  When the data contains a strong periodic
+    component (dominant period *p*), the reported lag is aliased — lag *L*
+    and *L ± p* are equivalent.  The return dict includes ``equiv_lags``
+    listing all equivalent lags within the search window.
+
     Returns
     -------
-    dict with keys ``r`` (max correlation, Pearson-like) and ``lag_months``.
-    Only lags in ``[-max_lag, +max_lag]`` are considered.
+    dict with keys:
+      ``r``         — max correlation (Pearson-like, [-1, +1])
+      ``lag``       — lag at max correlation (positive = *b* lags behind *a*)
+      ``equiv_lags``— list of (lag, r) for all equivalent peaks
     """
     x = _as_float_array(a)
     y = _as_float_array(b)
     n = min(len(x), len(y))
 
     if n < 2:
-        return {"r": 0.0, "lag_months": 0}
+        return {"r": 0.0, "lag": 0, "equiv_lags": [(0, 0.0)]}
 
-    # Trim to equal length
     x = x[:n]
     y = y[:n]
 
-    # Mean-centre
     x_c = x - np.mean(x)
     y_c = y - np.mean(y)
 
@@ -236,7 +242,43 @@ def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24) -> dict:
             best_r = r
             best_lag = lag
 
-    return {"r": float(best_r), "lag_months": best_lag}
+    # ── detect aliasing: find dominant periods in both series ──────────
+    dominant = dominant_periods(x, max_lag=max_lag // 2) + \
+               dominant_periods(y, max_lag=max_lag // 2)
+    strong_periods = sorted(set(p for p in dominant if p > 1))
+
+    equiv = [(best_lag, float(best_r))]
+    if strong_periods:
+        for period in strong_periods:
+            for k in range(-max_lag // period - 1, max_lag // period + 2):
+                candidate = best_lag + k * period
+                if abs(candidate) <= max_lag and candidate != best_lag:
+                    # Recompute r at this lag
+                    lag = candidate
+                    if lag < 0:
+                        seg_a = x_c[-lag:]
+                        seg_b = y_c[:lag]
+                    elif lag == 0:
+                        seg_a = x_c
+                        seg_b = y_c
+                    else:
+                        seg_a = x_c[:-lag]
+                        seg_b = y_c[lag:]
+                    r = np.sum(seg_a * seg_b) / \
+                        (np.sqrt(np.sum(seg_a ** 2) * np.sum(seg_b ** 2)) + 1e-15)
+                    equiv.append((lag, float(r)))
+        # Deduplicate by lag
+        seen = set()
+        unique_equiv = []
+        for lag, val in equiv:
+            if lag not in seen:
+                seen.add(lag)
+                unique_equiv.append((lag, val))
+        equiv = sorted(unique_equiv, key=lambda x: -abs(x[1]))
+    else:
+        equiv = [(best_lag, float(best_r))]
+
+    return {"r": float(best_r), "lag": best_lag, "equiv_lags": equiv}
 
 
 # ---------------------------------------------------------------------------
