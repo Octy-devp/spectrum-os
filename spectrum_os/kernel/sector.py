@@ -8,9 +8,34 @@ from ._types import Sector
 _sectors: dict[str, Sector] = {}
 _store_path: str | None = None
 
+# Required meta keys when registering a synthetic sector (PLAN-23 §7.3
+# guardrail: 標記優先於生成 — synthetic registration without full
+# provenance is refused).
+_SYNTHETIC_REQUIRED_META = ("anchors", "generated_by", "seed")
 
-def create(name: str, timeseries: list[float], targets: list[float] | None = None) -> Sector:
+
+def _validate_meta(meta: dict | None) -> None:
+    """Enforce synthetic provenance completeness.
+
+    If ``meta["synthetic"]`` is true, the meta dict must also carry
+    ``anchors``, ``generated_by`` and ``seed`` — otherwise the registration
+    is rejected.  Non-synthetic meta passes through unchanged.
+    """
+    if not meta:
+        return
+    if meta.get("synthetic") is True:
+        missing = [k for k in _SYNTHETIC_REQUIRED_META if k not in meta]
+        if missing:
+            raise ValueError(
+                f"synthetic sector meta missing required keys: {missing} "
+                f"(need {list(_SYNTHETIC_REQUIRED_META)})"
+            )
+
+
+def create(name: str, timeseries: list[float], targets: list[float] | None = None,
+           meta: dict | None = None) -> Sector:
     """Register a new sector. ID is auto-generated from name (lowercase, no spaces)."""
+    _validate_meta(meta)
     sector_id = name.lower().replace(" ", "_").replace("-", "_")
     sector = Sector(
         id=sector_id,
@@ -18,6 +43,7 @@ def create(name: str, timeseries: list[float], targets: list[float] | None = Non
         timeseries=timeseries,
         targets=targets,
         created=datetime.now().isoformat(),
+        meta=meta,
     )
     _sectors[sector_id] = sector
     return sector
@@ -45,6 +71,7 @@ def save(path: str | None = None):
             "timeseries": s.timeseries,
             "targets": s.targets,
             "created": s.created,
+            "meta": s.meta,
         }
         for sid, s in _sectors.items()
     }
@@ -65,5 +92,6 @@ def load(path: str):
             timeseries=sdata["timeseries"],
             targets=sdata.get("targets"),
             created=sdata["created"],
+            meta=sdata.get("meta"),
         )
     _store_path = path

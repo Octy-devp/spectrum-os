@@ -129,7 +129,10 @@ def run(signatures: list[dict], n_clusters: int = 5,
     ----------
     signatures
         List of dicts as returned by :func:`template._signature`.  Each must
-        contain ``periods``, ``amplitudes``, ``mean_deviation``.
+        contain ``periods``, ``amplitudes``, ``mean_deviation``.  A signature
+        derived from a synthetic sector should carry ``synthetic: True`` —
+        if any input does, the result is stamped ``synthetic_input: True``
+        (PLAN-23 §7.3 guardrail).
     n_clusters
         Number of clusters (``k``).  Clamped to ``[1, n_samples]``.
     method
@@ -138,8 +141,10 @@ def run(signatures: list[dict], n_clusters: int = 5,
     Returns
     -------
     dict with keys ``labels``, ``centroids``, ``inertia``, ``n_iter``,
-    ``stability``.
+    ``stability``, ``synthetic_input``.
     """
+    synthetic_input = any(bool(sig.get("synthetic")) for sig in signatures)
+
     if not signatures:
         return {
             "labels": {},
@@ -147,6 +152,7 @@ def run(signatures: list[dict], n_clusters: int = 5,
             "inertia": 0.0,
             "n_iter": 0,
             "stability": None,
+            "synthetic_input": False,
         }
 
     n = len(signatures)
@@ -210,4 +216,5 @@ def run(signatures: list[dict], n_clusters: int = 5,
         "inertia": best_inertia,
         "n_iter": best_n_iter,
         "stability": stability,
+        "synthetic_input": synthetic_input,
     }

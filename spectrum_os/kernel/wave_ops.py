@@ -25,10 +25,13 @@ def decompose(sector_id: str, long_window: int = 36, mid_window: int = 6) -> Spe
     if sec is None:
         raise ValueError(f"Sector '{sector_id}' not found")
 
+    synthetic = bool(sec.meta and sec.meta.get("synthetic") is True)
+
     arr = np.array(sec.timeseries, dtype=np.float64)
     targets = np.array(sec.targets, dtype=np.float64) if sec.targets is not None else None
 
-    result = wave.decompose(arr, targets, long_window, mid_window)
+    result = wave.decompose(arr, targets, long_window, mid_window,
+                            synthetic=synthetic)
 
     return SpectrumResult(
         values={
@@ -36,11 +39,14 @@ def decompose(sector_id: str, long_window: int = 36, mid_window: int = 6) -> Spe
             "midwave": result["midwave"],
             "shortwave": result["shortwave"],
             "deviation": result["deviation"],
+            "synthetic_input": result["synthetic_input"],
         },
         verdict=result["verdict"],
         confidence_reason=result["confidence_reason"],
         dominant_periods=result["dominant_periods"],
         valid_range=result["valid_range"],
+        boundary_note=("synthetic input — verdict capped at CONTESTED"
+                       if synthetic else None),
     )
 
 
@@ -56,7 +62,8 @@ def correlate(a_id: str, b_id: str, max_lag: int = 24) -> dict:
 
     Returns
     -------
-    dict with keys ``r``, ``lag``, and ``equiv_lags``.
+    dict with keys ``r``, ``lag``, ``equiv_lags``, and ``synthetic_input``
+    (True when either sector is registered as synthetic).
     """
     sec_a = sector_store.get(a_id)
     if sec_a is None:
@@ -65,7 +72,11 @@ def correlate(a_id: str, b_id: str, max_lag: int = 24) -> dict:
     if sec_b is None:
         raise ValueError(f"Sector '{b_id}' not found")
 
+    synthetic = any(
+        bool(s.meta and s.meta.get("synthetic") is True) for s in (sec_a, sec_b)
+    )
+
     arr_a = np.array(sec_a.timeseries, dtype=np.float64)
     arr_b = np.array(sec_b.timeseries, dtype=np.float64)
 
-    return wave.correlate(arr_a, arr_b, max_lag)
+    return wave.correlate(arr_a, arr_b, max_lag, synthetic=synthetic)

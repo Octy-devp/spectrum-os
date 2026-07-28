@@ -21,3 +21,6 @@ Thumbs.db
 
 # Cache
 *.cache
+
+# Local data layer — synthetic (synth gate) outputs stay local, never committed
+data/

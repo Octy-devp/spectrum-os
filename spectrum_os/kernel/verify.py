@@ -1,7 +1,16 @@
 """Prediction calibration — compare predicted vs realised values.
 
 Stores a bounded in-memory state log for audit and drift tracking.
+Optionally persists every entry to a JSONL file (``init_log``) so the
+log survives restarts; ``query`` / ``summary`` read that file back.
+Persistence is opt-in: without ``init_log`` the module behaves exactly
+as before (memory only).
 """
+
+import json
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 from ._types import Verdict
@@ -13,9 +22,10 @@ _VERIFY_MAPE_THRESHOLD = 0.15       # 15 % MAPE triggers re-calibrate
 _MAX_STATE_LOG_ENTRIES = 10000
 
 # ---------------------------------------------------------------------------
-# In-memory state log
+# In-memory state log + optional JSONL persistence
 # ---------------------------------------------------------------------------
 _state_log: list[dict] = []
+_log_path: Path | None = None
 
 
 def _mape(realized: np.ndarray, predicted: np.ndarray) -> float:
@@ -80,7 +90,9 @@ def verify(prediction_id: str, realized: list[float],
 
     re_calibrate = mape_val >= _VERIFY_MAPE_THRESHOLD
 
+    ts = datetime.now(timezone.utc).isoformat()
     entry = {
+        "ts": ts,
         "prediction_id": prediction_id,
         "mae": mae_val,
         "mape": mape_val,
@@ -94,6 +106,17 @@ def verify(prediction_id: str, realized: list[float],
     _state_log.append(entry)
     if len(_state_log) > _MAX_STATE_LOG_ENTRIES:
         _state_log.pop(0)
+
+    # Persist to JSONL if init_log() was called
+    if _log_path is not None:
+        _append_jsonl(_log_path, {
+            "ts": ts,
+            "prediction_id": prediction_id,
+            "mae": mae_val,
+            "mape": mape_val,
+            "verdict": verdict.value,
+            "re_calibrate": re_calibrate,
+        })
 
     return {
         "prediction_id": prediction_id,
@@ -115,3 +138,190 @@ def get_state_log(n: int = 100) -> list[dict]:
 def clear_state_log():
     """Clear all entries from the state log."""
     _state_log.clear()
+
+
+# PLAN-23 API naming: the verify op is called ``verify.evaluate`` in the
+# plan; ``verify()`` above is the implementation. Alias keeps both usable.
+evaluate = verify
+
+
+# ---------------------------------------------------------------------------
+# JSONL persistence (opt-in via init_log)
+# ---------------------------------------------------------------------------
+
+def init_log(path: str | Path | None = "data/state_log.jsonl") -> Path | None:
+    """Enable JSONL persistence of the verify state log.
+
+    After calling this, every ``verify()`` / ``evaluate()`` call appends
+    one JSON line to *path* with keys ``ts`` (ISO 8601, UTC),
+    ``prediction_id``, ``mae``, ``mape``, ``verdict``, ``re_calibrate``
+    (in addition to the unchanged in-memory buffer). An existing file is
+    kept — re-initialising after a restart continues the same log.
+
+    Parameters
+    ----------
+    path
+        Target JSONL file. Parent directories are created as needed.
+        Pass ``None`` to disable persistence again.
+
+    Returns
+    -------
+    The resolved :class:`~pathlib.Path`, or ``None`` when disabling.
+    """
+    global _log_path
+    if path is None:
+        _log_path = None
+        return None
+    p = Path(path)
+    if str(p.parent) not in ("", "."):
+        p.parent.mkdir(parents=True, exist_ok=True)
+    p.touch(exist_ok=True)
+    _log_path = p
+    return p
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    """Append one JSON line to *path* (open/append/close per call)."""
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _resolve_log_path(path: str | Path | None) -> Path:
+    """Return the explicit *path* or the one set by ``init_log``."""
+    p = Path(path) if path is not None else _log_path
+    if p is None:
+        raise RuntimeError(
+            "state log not persisted: call init_log(path) first "
+            "or pass path= explicitly"
+        )
+    return p
+
+
+def _parse_ts(value) -> datetime:
+    """Parse an ISO 8601 timestamp; naive values are assumed UTC."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _iter_log_records(p: Path):
+    """Yield parsed JSONL records, skipping blank/corrupt lines."""
+    if not p.exists():
+        return
+    with open(p, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                yield rec
+
+
+def query(prediction_id: str | None = None,
+          verdict=None,
+          ts_from=None,
+          ts_to=None,
+          limit: int | None = None,
+          path: str | Path | None = None) -> list[dict]:
+    """Query the persisted JSONL state log.
+
+    Parameters
+    ----------
+    prediction_id
+        Keep only entries with this exact prediction id.
+    verdict
+        Keep only entries with this verdict — a :class:`Verdict` member
+        or its string value (case-insensitive).
+    ts_from, ts_to
+        Inclusive ISO 8601 bounds on the entry ``ts`` (naive datetimes
+        or date-only strings are treated as UTC).
+    limit
+        If given, return at most this many of the *most recent* matches.
+    path
+        Read this file instead of the one set by ``init_log``.
+
+    Returns
+    -------
+    list of record dicts in file (chronological) order.
+    """
+    p = _resolve_log_path(path)
+    if isinstance(verdict, Verdict):
+        v_filter = verdict.value
+    elif verdict is not None:
+        v_filter = str(verdict).lower()
+    else:
+        v_filter = None
+    from_dt = _parse_ts(ts_from) if ts_from is not None else None
+    to_dt = _parse_ts(ts_to) if ts_to is not None else None
+
+    matches: list[dict] = []
+    for rec in _iter_log_records(p):
+        if prediction_id is not None and rec.get("prediction_id") != prediction_id:
+            continue
+        if v_filter is not None and rec.get("verdict") != v_filter:
+            continue
+        if from_dt is not None or to_dt is not None:
+            rec_ts_raw = rec.get("ts")
+            if not rec_ts_raw:
+                continue
+            try:
+                rec_ts = _parse_ts(rec_ts_raw)
+            except ValueError:
+                continue
+            if from_dt is not None and rec_ts < from_dt:
+                continue
+            if to_dt is not None and rec_ts > to_dt:
+                continue
+        matches.append(rec)
+
+    if limit is not None:
+        if limit <= 0:
+            return []
+        matches = matches[-limit:]
+    return matches
+
+
+def summary(n: int = 100, path: str | Path | None = None) -> dict:
+    """Aggregate statistics over the persisted JSONL state log.
+
+    Parameters
+    ----------
+    n
+        Number of most recent entries used for ``recent_mape_mean``.
+    path
+        Read this file instead of the one set by ``init_log``.
+
+    Returns
+    -------
+    dict with keys ``total``, ``verdicts`` (count per verdict value),
+    ``re_calibrate_rate``, ``recent_n``, ``recent_mape_mean``.
+    """
+    p = _resolve_log_path(path)
+    total = 0
+    re_cal = 0
+    verdicts: dict[str, int] = {}
+    recent_mapes: deque[float] = deque(maxlen=max(n, 1))
+    for rec in _iter_log_records(p):
+        total += 1
+        v = rec.get("verdict")
+        verdicts[v] = verdicts.get(v, 0) + 1
+        if rec.get("re_calibrate"):
+            re_cal += 1
+        m = rec.get("mape")
+        if isinstance(m, (int, float)):
+            recent_mapes.append(float(m))
+    return {
+        "total": total,
+        "verdicts": verdicts,
+        "re_calibrate_rate": (re_cal / total) if total else 0.0,
+        "recent_n": len(recent_mapes),
+        "recent_mape_mean": (sum(recent_mapes) / len(recent_mapes)) if recent_mapes else 0.0,
+    }

@@ -185,7 +185,8 @@ def _max_autocorr_peak(timeseries: np.ndarray, max_lag: int = 36) -> float:
 # Cross-correlation
 # ---------------------------------------------------------------------------
 
-def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24) -> dict:
+def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24,
+              synthetic: bool = False) -> dict:
     """Lagged cross-correlation between two time series.
 
     Detects the lag that maximises Pearson-like correlation within
@@ -194,19 +195,28 @@ def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24) -> dict:
     and *L ± p* are equivalent.  The return dict includes ``equiv_lags``
     listing all equivalent lags within the search window.
 
+    Parameters
+    ----------
+    synthetic
+        True when either input series originates from the synth gate layer
+        (PLAN-23 §7.3).  The result is stamped ``synthetic_input: True`` so
+        downstream consumers know the correlation rests on synthetic data.
+
     Returns
     -------
     dict with keys:
       ``r``         — max correlation (Pearson-like, [-1, +1])
       ``lag``       — lag at max correlation (positive = *b* lags behind *a*)
       ``equiv_lags``— list of (lag, r) for all equivalent peaks
+      ``synthetic_input`` — True when any input is synthetic
     """
     x = _as_float_array(a)
     y = _as_float_array(b)
     n = min(len(x), len(y))
 
     if n < 2:
-        return {"r": 0.0, "lag": 0, "equiv_lags": [(0, 0.0)]}
+        return {"r": 0.0, "lag": 0, "equiv_lags": [(0, 0.0)],
+                "synthetic_input": bool(synthetic)}
 
     x = x[:n]
     y = y[:n]
@@ -278,7 +288,8 @@ def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24) -> dict:
     else:
         equiv = [(best_lag, float(best_r))]
 
-    return {"r": float(best_r), "lag": best_lag, "equiv_lags": equiv}
+    return {"r": float(best_r), "lag": best_lag, "equiv_lags": equiv,
+            "synthetic_input": bool(synthetic)}
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +297,8 @@ def correlate(a: np.ndarray, b: np.ndarray, max_lag: int = 24) -> dict:
 # ---------------------------------------------------------------------------
 
 def decompose(timeseries: np.ndarray, targets: np.ndarray | None = None,
-              long_window: int = 36, mid_window: int = 6) -> dict:
+              long_window: int = 36, mid_window: int = 6,
+              synthetic: bool = False) -> dict:
     """Decompose a time series into long/mid/short waves and deviation.
 
     Parameters
@@ -300,11 +312,16 @@ def decompose(timeseries: np.ndarray, targets: np.ndarray | None = None,
         Moving-average window for the long wave (months).  Default 36.
     mid_window
         Moving-average window for the mid wave (months).  Default 6.
+    synthetic
+        True when the series originates from the synth gate layer
+        (PLAN-23 §7.3 guardrail).  The verdict is then capped at
+        CONTESTED and the result is stamped ``synthetic_input: True``.
 
     Returns
     -------
     dict with keys ``longwave``, ``midwave``, ``shortwave``, ``deviation``,
-    ``valid_range``, ``verdict``, ``dominant_periods``, ``confidence_reason``.
+    ``valid_range``, ``verdict``, ``dominant_periods``, ``confidence_reason``,
+    ``synthetic_input``.
     """
     arr = _as_float_array(timeseries)
     n = len(arr)
@@ -376,6 +393,14 @@ def decompose(timeseries: np.ndarray, targets: np.ndarray | None = None,
             f"(len={effective_len}, peak={max_peak:.3f}, NaN={interior_nan})"
         )
 
+    # ---- synthetic verdict ceiling (PLAN-23 §7.3) --------------------------
+    # Synthetic input may never produce an ASSERTED verdict: the anchors come
+    # from an LLM gate, so confidence is capped at CONTESTED regardless of
+    # how clean the expanded series looks.
+    if synthetic and verdict == Verdict.ASSERTED:
+        verdict = Verdict.CONTESTED
+        reason += " | verdict capped at CONTESTED: synthetic input"
+
     return {
         "longwave": longwave,
         "midwave": midwave,
@@ -385,4 +410,5 @@ def decompose(timeseries: np.ndarray, targets: np.ndarray | None = None,
         "verdict": verdict,
         "dominant_periods": periods,
         "confidence_reason": reason,
+        "synthetic_input": bool(synthetic),
     }

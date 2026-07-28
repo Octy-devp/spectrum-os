@@ -28,3 +28,7 @@ class Sector:
     timeseries: list[float]
     targets: list[float] | None
     created: str  # ISO date string
+    # Provenance metadata.  Synthetic sectors (synth gate layer, PLAN-23 §7.3)
+    # must carry meta = {"synthetic": True, "anchors": ..., "generated_by": ...,
+    # "seed": ...} — enforced by sector.create().
+    meta: dict[str, Any] | None = None
