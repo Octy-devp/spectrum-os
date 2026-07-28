@@ -13,3 +13,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["spectrum_os*"]
+
+[project.scripts]
+tio-sh = "spectrum_os.cli:main"

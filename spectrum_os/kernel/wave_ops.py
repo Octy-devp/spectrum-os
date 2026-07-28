@@ -50,6 +50,51 @@ def decompose(sector_id: str, long_window: int = 36, mid_window: int = 6) -> Spe
     )
 
 
+def extrapolate(sector_id: str, horizon: int = 12, long_window: int = 36,
+                n_simulations: int = 200, seed: int | None = None) -> dict:
+    """Look up sector by ID, then call :func:`wave.extrapolate`.
+
+    Parameters
+    ----------
+    sector_id
+        The registered sector identifier.
+    horizon
+        Number of future steps to project.
+    long_window
+        Window for the moving-average trend.
+    n_simulations
+        Monte Carlo resamples for confidence bands.
+    seed
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    dict with ``forecast``, ``lower``, ``upper``, ``verdict``, etc.
+    """
+    sec = sector_store.get(sector_id)
+    if sec is None:
+        raise ValueError(f"Sector '{sector_id}' not found")
+
+    arr = np.array(sec.timeseries, dtype=np.float64)
+    targets = np.array(sec.targets, dtype=np.float64) if sec.targets is not None else None
+
+    result = wave.extrapolate(
+        arr, targets=targets, horizon=horizon, long_window=long_window,
+        n_simulations=n_simulations, seed=seed,
+    )
+
+    # Synthetic ceiling
+    if sec.meta and sec.meta.get("synthetic") is True:
+        if result["verdict"] == Verdict.ASSERTED:
+            result["verdict"] = Verdict.CONTESTED
+        result["confidence_reason"] += " [synthetic ceiling applied]"
+        result["synthetic_input"] = True
+    else:
+        result["synthetic_input"] = False
+
+    return result
+
+
 def correlate(a_id: str, b_id: str, max_lag: int = 24) -> dict:
     """Look up two sectors by ID, then call :func:`wave.correlate`.
 

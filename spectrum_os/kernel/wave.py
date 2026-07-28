@@ -412,3 +412,189 @@ def decompose(timeseries: np.ndarray, targets: np.ndarray | None = None,
         "confidence_reason": reason,
         "synthetic_input": bool(synthetic),
     }
+
+
+# ---------------------------------------------------------------------------
+# Extrapolation — forward projection with confidence bands
+# ---------------------------------------------------------------------------
+
+def extrapolate(timeseries: np.ndarray, targets: np.ndarray | None = None,
+                horizon: int = 12, long_window: int = 36,
+                n_simulations: int = 200, seed: int | None = None) -> dict:
+    """Extrapolate a time series forward by *horizon* steps.
+
+    Method: decompose into longwave trend + dominant-period sinusoids,
+    extend the fit forward, and resample residuals for confidence bands.
+
+    Parameters
+    ----------
+    timeseries
+        Historical data (length N).
+    targets
+        Optional plan/target values (same length).  If provided, the
+        deviation from targets is used to compute residuals.
+    horizon
+        Number of steps to project forward.
+    long_window
+        Window for the moving-average trend (passed to :func:`moving_average`).
+    n_simulations
+        Number of Monte Carlo residual resamples for confidence bands.
+    seed
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    dict with keys:
+
+    * ``forecast`` — ``np.ndarray`` of length *horizon*: point forecast
+    * ``lower`` / ``upper`` — 80% confidence band (P10 / P90)
+    * ``ci_lower`` / ``ci_upper`` — 95% confidence band (P2.5 / P97.5)
+    * ``trend_slope`` — slope of the longwave trend (per step)
+    * ``dominant_periods`` — periods used for sinusoidal extension
+    * ``residual_std`` — std of in-sample residuals
+    * ``verdict`` — ternary confidence
+    * ``confidence_reason`` — human-readable explanation
+    """
+    arr = _as_float_array(timeseries)
+    n = len(arr)
+    if n < max(horizon, 6):
+        return {
+            "forecast": np.full(horizon, np.nan),
+            "lower": np.full(horizon, np.nan),
+            "upper": np.full(horizon, np.nan),
+            "ci_lower": np.full(horizon, np.nan),
+            "ci_upper": np.full(horizon, np.nan),
+            "trend_slope": 0.0,
+            "dominant_periods": [],
+            "residual_std": 0.0,
+            "verdict": Verdict.UNKNOWN,
+            "confidence_reason": f"Data length {n} < horizon {horizon}, cannot extrapolate",
+        }
+
+    # --- Step 1: Longwave trend ---
+    longwave = moving_average(arr, long_window)
+    # Fill NaN edges with nearest valid value
+    first_valid = 0
+    while first_valid < n and np.isnan(longwave[first_valid]):
+        first_valid += 1
+    last_valid = n - 1
+    while last_valid >= 0 and np.isnan(longwave[last_valid]):
+        last_valid -= 1
+
+    if first_valid >= last_valid:
+        # Not enough valid longwave points — fall back to linear trend
+        x_all = np.arange(n, dtype=np.float64)
+        coeffs = np.polyfit(x_all, arr, 1)
+        trend_slope = coeffs[0]
+    else:
+        filled = longwave.copy()
+        filled[:first_valid] = filled[first_valid]
+        filled[last_valid + 1:] = filled[last_valid]
+        # Linear fit on filled longwave
+        x_all = np.arange(n, dtype=np.float64)
+        coeffs = np.polyfit(x_all, filled, 1)
+        trend_slope = coeffs[0]
+
+    # --- Step 2: Dominant periods → sinusoidal fit ---
+    periods = dominant_periods(arr, max_lag=min(36, n // 2))
+
+    # Build sinusoidal components from detected periods
+    # Fit: arr ≈ trend(t) + Σ A_p sin(2π t/p + φ_p) + residuals
+    x_all = np.arange(n, dtype=np.float64)
+    trend_vals = np.polyval(coeffs, x_all)
+
+    if periods:
+        # Design matrix: trend + sinusoids
+        n_cols = 1 + 2 * len(periods)  # intercept + slopes + A_sin + A_cos per period
+        X = np.column_stack([np.ones(n)])
+        for p in periods:
+            omega = 2 * np.pi / p
+            X = np.column_stack([X, np.sin(omega * x_all), np.cos(omega * x_all)])
+
+        # OLS fit
+        try:
+            beta, _, _, _ = np.linalg.lstsq(X, arr, rcond=None)
+            fitted = X @ beta
+        except np.linalg.LinAlgError:
+            fitted = trend_vals
+            periods_used = []
+        else:
+            periods_used = periods
+    else:
+        fitted = trend_vals
+        periods_used = []
+
+    # --- Step 3: Residuals ---
+    residuals = arr - fitted
+    valid_residuals = residuals[~np.isnan(residuals)]
+    residual_std = float(np.std(valid_residuals)) if len(valid_residuals) > 1 else 0.0
+
+    # --- Step 4: Forward extrapolation ---
+    x_future = np.arange(n, n + horizon, dtype=np.float64)
+
+    # Extend trend
+    trend_future = np.polyval(coeffs, x_future)
+
+    # Extend sinusoids
+    if periods_used:
+        X_future = np.column_stack([np.ones(horizon)])
+        for p in periods_used:
+            omega = 2 * np.pi / p
+            X_future = np.column_stack([X_future, np.sin(omega * x_future), np.cos(omega * x_future)])
+        point_forecast = X_future @ beta[:X_future.shape[1]]
+    else:
+        point_forecast = trend_future
+
+    # --- Step 5: Monte Carlo residual resampling ---
+    rng = np.random.default_rng(seed)
+    ensemble = np.zeros((n_simulations, horizon))
+    for sim in range(n_simulations):
+        sampled = rng.choice(valid_residuals, size=horizon, replace=True)
+        # Dampen residuals over time (uncertainty grows → but residuals should decay toward zero for stability)
+        decay = np.linspace(1.0, 0.5, horizon)
+        ensemble[sim] = point_forecast + sampled * decay
+
+    # Confidence bands
+    lower = np.percentile(ensemble, 10, axis=0)
+    upper = np.percentile(ensemble, 90, axis=0)
+    ci_lower = np.percentile(ensemble, 2.5, axis=0)
+    ci_upper = np.percentile(ensemble, 97.5, axis=0)
+
+    # --- Step 6: Verdict ---
+    if n >= _ASSERTED_MIN_LEN and residual_std > 0:
+        # Check R² of fit
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((arr - np.mean(arr)) ** 2)
+        r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        if r_squared >= 0.3 and len(periods_used) > 0:
+            verdict = Verdict.ASSERTED
+            reason = f"R²={r_squared:.3f}, {len(periods_used)} periods fitted, residual_std={residual_std:.4f}"
+        elif r_squared >= 0.1:
+            verdict = Verdict.CONTESTED
+            reason = f"R²={r_squared:.3f} (weak fit), residual_std={residual_std:.4f}"
+        else:
+            verdict = Verdict.UNKNOWN
+            reason = f"R²={r_squared:.3f} (poor fit), extrapolation unreliable"
+    elif n >= _CONTESTED_MIN_LEN:
+        verdict = Verdict.CONTESTED
+        reason = f"Short data ({n} pts), trend-only extrapolation"
+    else:
+        verdict = Verdict.UNKNOWN
+        reason = f"Insufficient data ({n} pts)"
+
+    # Synthetic ceiling
+    # (Caller should check meta.synthetic and downgrade if needed)
+
+    return {
+        "forecast": point_forecast,
+        "lower": lower,
+        "upper": upper,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "trend_slope": float(trend_slope),
+        "dominant_periods": periods_used,
+        "residual_std": residual_std,
+        "verdict": verdict,
+        "confidence_reason": reason,
+    }

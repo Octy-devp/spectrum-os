@@ -31,5 +31,10 @@ class OSC:
         from . import verify
         return verify
 
+    @property
+    def quantum(self):
+        from .. import quantum
+        return quantum
+
 
 osc = OSC()
