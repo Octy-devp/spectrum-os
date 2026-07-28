@@ -24,3 +24,7 @@ Thumbs.db
 
 # Local data layer — synthetic (synth gate) outputs stay local, never committed
 data/
+
+# 🔴 API 密鑰紅線——環境變數方式，永不入 git
+.env
+*.env
