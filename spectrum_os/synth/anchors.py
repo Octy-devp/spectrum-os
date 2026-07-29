@@ -45,7 +45,26 @@ CONTRACT_TOP_KEYS = (
 #: Their presence is a contract violation — the gate must never do that.
 _FORBIDDEN_SERIES_KEYS = ("series", "values", "timeseries", "data", "points")
 
-_ECC_API_UTILS_PATH = "/home/octy/projects/ECC/scripts/api_utils.py"
+def _resolve_api_utils_path() -> str:
+    """Resolve the path to ECC's api_utils.py, preferring env var."""
+    env = os.environ.get("ECC_API_UTILS_PATH", "")
+    if env and os.path.isfile(env):
+        return env
+    # Fallback: sibling monorepo (spectrum-os lives next to ECC)
+    sibling = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "ECC", "scripts", "api_utils.py"
+    )
+    sibling = os.path.abspath(sibling)
+    if os.path.isfile(sibling):
+        return sibling
+    raise FileNotFoundError(
+        "Cannot locate ECC's api_utils.py. "
+        "Set ECC_API_UTILS_PATH to the absolute path of "
+        "ECC/scripts/api_utils.py, or install spectrum-os "
+        "as a sibling of the ECC monorepo."
+    )
+
+_ECC_API_UTILS_PATH = _resolve_api_utils_path()
 _DEFAULT_MODEL = "deepseek-v4-flash"
 
 
@@ -192,10 +211,46 @@ def _mechanical_confidence(parsed: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Prompt construction — validator role, no RP (施工手冊 §四-1)
+# Prompt construction — LLM = 活的數學 (PLAN-23 v2.5 §〇.五 向量契約)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_MESSAGE = (
+ANCHORS_SYSTEM_PROMPT_V25 = (
+    "你是一個活的數學——在 6D 向量上做形式計算，不做世界大事的詮釋。\n"
+    "\n"
+    "【輸入】每個狀態以 6D 向量傳入：\n"
+    "  [D1 D2 D3, D4 D5 D6]\n"
+    "  D1–D3（三進制方向判定）：頻譜方向的投影，取值 {−1, 0, +1}\n"
+    "    D1 = 意志方向（+1 向心凝聚 / −1 離心分散 / 0 無方向）\n"
+    "    D2 = 阻力（+1 高阻力 / −1 低阻力 / 0 無差別）\n"
+    "    D3 = 關係（+1 正向耦合 / −1 負向耦合 / 0 無耦合）\n"
+    "  D4–D6（多頻譜內容）：頻譜內生傾向的實數值\n"
+    "    D4 = 主頻譜軸頻率（ha/zg/sa/gt 等軸的歸一化頻率，0–1）\n"
+    "    D5 = 相位偏移（−π 到 +π，表徵該軸與基準的相位差）\n"
+    "    D6 = 振幅（歸一化振幅，0–1，表徵該軸的信號強度）\n"
+    "\n"
+    "【任務——純形式計算，禁止詮釋】\n"
+    "1. turning_points：從 D1–D3 的級聯變化中計算方向判定切換點。\n"
+    "   每次 D1/D2/D3 任一分量發生符號翻轉（+1↔−1 或 +1↔0）即為 turning point。\n"
+    "   month_index 取翻轉發生的月份；level 取翻轉後的 D4（歸一化頻率）×baseline。\n"
+    "2. magnitudes：從 D4–D6 的振幅/頻率分佈中估算基準水平與噪聲參數。\n"
+    "   baseline = D6 振幅 × 校準常數；noise_sigma = baseline 的 1-3%；\n"
+    "   ar_rho = D5 相位偏移的自相關推估值（0.2–0.5）。\n"
+    "3. event_shocks：從 D1–D3 的離散跳變（符號翻轉）中判定階躍量與持續月數。\n"
+    "   delta = 翻轉前後 D6 振幅差（有符號）；duration_months 由 D5 相位的恢復半衰期估算。\n"
+    "\n"
+    "🔴 禁令（違反者輸出為污染——不可接受）：\n"
+    "- 禁止生成敘事描述、歷史解讀、世界大事分析\n"
+    "- 禁止解釋「為什麼」——只輸出向量計算結果，不解釋因果\n"
+    "- 禁止角色扮演、禁止評論、禁止開場白、禁止 markdown 圍欄\n"
+    "- 輸入語言紀律：放入向量結構 → 產出向量計算；放入世界散文 → 產出污染詮釋（禁止）\n"
+    "\n"
+    "【輸出格式】純結構 JSON——英文鍵名，數值數據，零散文。\n"
+    "每個 turning_point 與 event_shock 必須附 source（引用校準來源或事件標籤），\n"
+    "但 source 是標籤字串，不是敘事——禁止在 source 欄位寫解釋性文字。"
+)
+
+# Legacy system message (pre-v2.5) — kept for backward compatibility.
+_SYSTEM_MESSAGE_V24 = (
     "你是一個結構化數據驗證器。唯一任務：把輸入的校準數字與事件清單，"
     "轉換為指定 schema 的錨點 JSON。你只做參數提取，不做敘事、不做評論、"
     "不做角色扮演。你只輸出 JSON——直接輸出，無開場白。"
@@ -352,7 +407,7 @@ def anchors(sector_spec: dict, *,
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
-        system_message=_SYSTEM_MESSAGE,
+        system_message=ANCHORS_SYSTEM_PROMPT_V25,
         response_format={"type": "json_object"},
         thinking=False,
     )

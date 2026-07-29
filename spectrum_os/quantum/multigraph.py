@@ -135,6 +135,24 @@ class RoleMultigraph:
     mixed/other key-form of the round's entries) and ``template_switch`` (True
     when the form changes vs the previous round of the same faction). Markers
     only — interpretation belongs to the API gate layer (PLAN-23 §6.5)."""
+    _thread_index: dict[str, set[str]] | None = field(default=None, repr=False, compare=False)
+    """Lazy-built index: thread -> set of state_ids."""
+
+    def __init__(self, threads: dict | None = None, **kwargs):
+        """Shorthand: ``RoleMultigraph(threads={thread: {state: role}})``."""
+        # Let the dataclass machinery set the declared fields from kwargs
+        self.__dict__.update(kwargs)
+        if "assignments" not in self.__dict__:
+            self.assignments = {}
+        if "state_times" not in self.__dict__:
+            self.state_times = {}
+        if "state_meta" not in self.__dict__:
+            self.state_meta = {}
+        self._thread_index = None
+        if threads:
+            for thread_name, states in threads.items():
+                for state_id, role in (states or {}).items():
+                    self.assign_role(thread_name, state_id, role)
 
     def add(self, assignment: RoleAssignment) -> None:
         self.assignments.setdefault(assignment.state_id, []).append(assignment)
@@ -153,11 +171,36 @@ class RoleMultigraph:
         self.add(RoleAssignment(from_id, thread, x, weight=weight, source=source))
         self.add(RoleAssignment(to_id, thread, y, weight=weight, source=source))
 
+    def assign_role(self, thread: str, state_id: str, role: str,
+                    weight: float = 1.0, source: str = "") -> None:
+        """Assign a role to a state within a specific thread.
+
+        Adds a :class:`RoleAssignment` for ``(state_id, thread, role)``.
+        This is the primary write operation for the entanglement/intervention
+        API (PLAN-23 §6.3).
+        """
+        if role not in ROLES:
+            raise ValueError(f"unknown role {role!r}; allowed: {ROLES}")
+        self.add(RoleAssignment(state_id, thread, role,
+                                weight=weight, source=source))
+
+    def threads(self) -> dict[str, set[str]]:
+        """Return ``{thread_name: {state_id, ...}}`` index (lazy-built)."""
+        if self._thread_index is None:
+            self._thread_index = {}
+            for sid, assignments in self.assignments.items():
+                for a in assignments:
+                    self._thread_index.setdefault(a.thread, set()).add(sid)
+        return self._thread_index
+
     def states(self) -> list[str]:
         return sorted(self.assignments)
 
     def state_assignments(self, state_id: str) -> list[RoleAssignment]:
         return self.assignments.get(state_id, [])
+
+    # Alias per PLAN-23 v2.5 convention (get_ prefix for external consumers)
+    get_state_assignments = state_assignments
 
     # ------------------------------------------------------------------
     # Constructors from real data shapes (pre-parsed dicts — no I/O here)

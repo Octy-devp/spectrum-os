@@ -6,6 +6,8 @@ them using k-means++ initialisation + Lloyd iteration.
 
 import numpy as np
 
+from ._types import Verdict
+
 # ---------------------------------------------------------------------------
 # Threshold constants (adjustable)
 # ---------------------------------------------------------------------------
@@ -153,6 +155,7 @@ def run(signatures: list[dict], n_clusters: int = 5,
             "n_iter": 0,
             "stability": None,
             "synthetic_input": False,
+            "verdict": Verdict.UNKNOWN.value,
         }
 
     n = len(signatures)
@@ -210,6 +213,17 @@ def run(signatures: list[dict], n_clusters: int = 5,
     for i, lbl in enumerate(best_labels):
         labels_dict[i] = int(lbl)
 
+    # Verdict: asserted if stability is high (>=0.8), contested if moderate,
+    # unknown if unstable or single-run (stability is None).
+    if stability is None:
+        verdict = Verdict.UNKNOWN
+    elif stability >= 0.8:
+        verdict = Verdict.ASSERTED
+    elif stability >= 0.5:
+        verdict = Verdict.CONTESTED
+    else:
+        verdict = Verdict.UNKNOWN
+
     return {
         "labels": labels_dict,
         "centroids": centroid_list,
@@ -217,4 +231,5 @@ def run(signatures: list[dict], n_clusters: int = 5,
         "n_iter": best_n_iter,
         "stability": stability,
         "synthetic_input": synthetic_input,
+        "verdict": verdict.value,
     }

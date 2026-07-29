@@ -247,7 +247,7 @@ class TestSummary:
         target = verify.init_log(tmp_path / "state_log.jsonl")
         s = verify.summary()
         assert s == {"total": 0, "verdicts": {}, "re_calibrate_rate": 0.0,
-                     "recent_n": 0, "recent_mape_mean": 0.0}
+                     "recent_n": 0, "recent_mape_mean": 0.0, "skipped_lines": 0}
         assert target.exists()
 
     def test_summary_via_explicit_path(self, tmp_path):

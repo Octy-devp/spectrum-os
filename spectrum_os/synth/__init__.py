@@ -8,6 +8,7 @@ verdict-capped downstream.
 """
 
 from .anchors import (
+    ANCHORS_SYSTEM_PROMPT_V25,
     CONTRACT_TOP_KEYS,
     AnchorContractError,
     anchors,
@@ -21,6 +22,7 @@ from .expand import (
 )
 
 __all__ = [
+    "ANCHORS_SYSTEM_PROMPT_V25",
     "CONTRACT_TOP_KEYS",
     "AnchorContractError",
     "anchors",

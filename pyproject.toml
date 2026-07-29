@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spectrum-os"
-version = "0.1.0"
-description = "β₁ worldline NSPV economic deviation detection machine"
+version = "2.5.0"
+description = "Dual-worldline spectrum analysis engine — 6D state vector, quantum layer, LLM synthesis gate"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.0,<3.0",

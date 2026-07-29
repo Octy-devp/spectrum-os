@@ -71,6 +71,12 @@ def verify(prediction_id: str, realized: list[float],
     realized_arr = np.array(realized, dtype=np.float64)
     predicted_arr = np.array(predicted, dtype=np.float64)
 
+    # Guard: unequal-length arrays — truncate to common length
+    if len(realized_arr) != len(predicted_arr):
+        min_len = min(len(realized_arr), len(predicted_arr))
+        realized_arr = realized_arr[:min_len]
+        predicted_arr = predicted_arr[:min_len]
+
     # Edge case: empty arrays
     if len(realized_arr) == 0 or len(predicted_arr) == 0:
         mape_val = 0.0
@@ -80,15 +86,29 @@ def verify(prediction_id: str, realized: list[float],
         mae_val = _mae(realized_arr, predicted_arr)
 
     # Verdict
-    half_threshold = _VERIFY_MAPE_THRESHOLD / 2.0
-    if mape_val < half_threshold:
-        verdict = Verdict.ASSERTED
-    elif mape_val < _VERIFY_MAPE_THRESHOLD:
-        verdict = Verdict.CONTESTED
+    # Guard: when all realised values are zero (MAPE undefined / returns 0),
+    # fall back to MAE so we don't silently label large errors as ASSERTED.
+    _mape_undefined = (mape_val == 0.0 and mae_val > 0.0
+                       and np.all(np.abs(realized_arr) < 1e-12))
+    if _mape_undefined:
+        # MAE-only verdict: scale threshold by typical magnitude ~1
+        _effective_mae_threshold = 0.5  # half a unit off → CONTESTED
+        if mae_val < _effective_mae_threshold:
+            verdict = Verdict.ASSERTED
+        elif mae_val < _effective_mae_threshold * 2:
+            verdict = Verdict.CONTESTED
+        else:
+            verdict = Verdict.UNKNOWN
     else:
-        verdict = Verdict.UNKNOWN
+        half_threshold = _VERIFY_MAPE_THRESHOLD / 2.0
+        if mape_val < half_threshold:
+            verdict = Verdict.ASSERTED
+        elif mape_val < _VERIFY_MAPE_THRESHOLD:
+            verdict = Verdict.CONTESTED
+        else:
+            verdict = Verdict.UNKNOWN
 
-    re_calibrate = mape_val >= _VERIFY_MAPE_THRESHOLD
+    re_calibrate = (verdict == Verdict.UNKNOWN)
 
     ts = datetime.now(timezone.utc).isoformat()
     entry = {
@@ -158,6 +178,10 @@ def init_log(path: str | Path | None = "data/state_log.jsonl") -> Path | None:
     (in addition to the unchanged in-memory buffer). An existing file is
     kept — re-initialising after a restart continues the same log.
 
+    If *path* is not None and persistence was not previously enabled,
+    any existing in-memory ``_state_log`` entries are flushed to the
+    file before switching to file-backed mode.
+
     Parameters
     ----------
     path
@@ -176,6 +200,18 @@ def init_log(path: str | Path | None = "data/state_log.jsonl") -> Path | None:
     if str(p.parent) not in ("", "."):
         p.parent.mkdir(parents=True, exist_ok=True)
     p.touch(exist_ok=True)
+    # Flush in-memory buffer to file when transitioning from memory-only
+    # to file-backed mode.
+    if _log_path is None and _state_log:
+        for entry in _state_log:
+            _append_jsonl(p, {
+                "ts": entry.get("ts", ""),
+                "prediction_id": entry.get("prediction_id", ""),
+                "mae": entry.get("mae", 0.0),
+                "mape": entry.get("mape", 0.0),
+                "verdict": entry.get("verdict", ""),
+                "re_calibrate": entry.get("re_calibrate", False),
+            })
     _log_path = p
     return p
 
@@ -209,7 +245,12 @@ def _parse_ts(value) -> datetime:
 
 
 def _iter_log_records(p: Path):
-    """Yield parsed JSONL records, skipping blank/corrupt lines."""
+    """Yield parsed JSONL records, skipping blank/corrupt lines.
+
+    Caller can access ``_skipped_lines`` post-iteration for a count
+    of lines that were corrupt/non-dict and silently discarded.
+    """
+    _iter_log_records._skipped_lines = 0  # type: ignore[attr-defined]
     if not p.exists():
         return
     with open(p, "r", encoding="utf-8") as fh:
@@ -220,9 +261,12 @@ def _iter_log_records(p: Path):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                _iter_log_records._skipped_lines += 1  # type: ignore[attr-defined]
                 continue
-            if isinstance(rec, dict):
-                yield rec
+            if not isinstance(rec, dict):
+                _iter_log_records._skipped_lines += 1  # type: ignore[attr-defined]
+                continue
+            yield rec
 
 
 def query(prediction_id: str | None = None,
@@ -302,7 +346,8 @@ def summary(n: int = 100, path: str | Path | None = None) -> dict:
     Returns
     -------
     dict with keys ``total``, ``verdicts`` (count per verdict value),
-    ``re_calibrate_rate``, ``recent_n``, ``recent_mape_mean``.
+    ``re_calibrate_rate``, ``recent_n``, ``recent_mape_mean``,
+    ``skipped_lines`` (corrupt JSONL lines silently discarded).
     """
     p = _resolve_log_path(path)
     total = 0
@@ -324,4 +369,101 @@ def summary(n: int = 100, path: str | Path | None = None) -> dict:
         "re_calibrate_rate": (re_cal / total) if total else 0.0,
         "recent_n": len(recent_mapes),
         "recent_mape_mean": (sum(recent_mapes) / len(recent_mapes)) if recent_mapes else 0.0,
+        "skipped_lines": getattr(_iter_log_records, "_skipped_lines", 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2C: query_state_log / summarize_state_log
+# ---------------------------------------------------------------------------
+
+def query_state_log(sector_id: str | None = None, n: int = 10) -> list[dict]:
+    """Read the persisted JSONL state log, optionally filter by *sector_id*,
+    and return the most recent *n* entries.
+
+    Parameters
+    ----------
+    sector_id
+        If provided, only return entries whose ``sector_id`` field matches.
+    n
+        Maximum number of most recent entries to return.
+
+    Returns
+    -------
+    List of record dicts, or ``[]`` if the log file does not exist.
+    """
+    log_file = Path("data/state_log.jsonl")
+    if not log_file.exists():
+        return []
+    entries: list[dict] = []
+    for rec in _iter_log_records(log_file):
+        if sector_id is not None:
+            if rec.get("sector_id") != sector_id:
+                continue
+        entries.append(rec)
+    if n <= 0:
+        return []
+    return entries[-n:]
+
+
+def summarize_state_log(sector_id: str | None = None) -> dict:
+    """Aggregate statistics over the persisted JSONL state log,
+    optionally filtered by *sector_id*.
+
+    Parameters
+    ----------
+    sector_id
+        If provided, only consider entries whose ``sector_id`` matches.
+
+    Returns
+    -------
+    dict with keys ``total_entries``, ``avg_mape``,
+    ``verdict_distribution`` (``{ASSERTED: N, CONTESTED: N, UNKNOWN: N}``),
+    ``calibration_trend`` (list of ``(entry_index, mape)`` for the last 20
+    entries), and ``last_entry`` (most recent entry dict or ``None``).
+    """
+    log_file = Path("data/state_log.jsonl")
+    entries: list[dict] = []
+    for rec in _iter_log_records(log_file):
+        if sector_id is not None:
+            if rec.get("sector_id") != sector_id:
+                continue
+        entries.append(rec)
+
+    if not entries:
+        return {
+            "total_entries": 0,
+            "avg_mape": 0.0,
+            "verdict_distribution": {"ASSERTED": 0, "CONTESTED": 0, "UNKNOWN": 0},
+            "calibration_trend": [],
+            "last_entry": None,
+        }
+
+    total = len(entries)
+    mape_values = [
+        float(e["mape"])
+        for e in entries
+        if isinstance(e.get("mape"), (int, float))
+    ]
+    avg_mape = sum(mape_values) / len(mape_values) if mape_values else 0.0
+
+    verdict_dist: dict[str, int] = {"ASSERTED": 0, "CONTESTED": 0, "UNKNOWN": 0}
+    for e in entries:
+        v = str(e.get("verdict", "")).upper()
+        if v in verdict_dist:
+            verdict_dist[v] += 1
+
+    # calibration_trend: last 20 entries as (entry_index, mape)
+    recent = entries[-20:]
+    calibration_trend = [
+        (total - len(recent) + i, e.get("mape", 0.0))
+        for i, e in enumerate(recent)
+    ]
+
+    return {
+        "total_entries": total,
+        "avg_mape": avg_mape,
+        "verdict_distribution": verdict_dist,
+        "calibration_trend": calibration_trend,
+        "last_entry": entries[-1],
     }
