@@ -19,10 +19,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "falsify009_rupture_experiment.py"
 ECC_WARFARE_FIELDS = "/home/octy/projects/ECC/index/warfare/data/fields"
+SECTORS_JSON = ROOT / "data" / "sectors" / "sectors.json"
 
 needs_ecc = pytest.mark.skipif(
-    not os.path.exists(ECC_WARFARE_FIELDS),
-    reason="ECC data sources not available",
+    not os.path.exists(ECC_WARFARE_FIELDS) or not SECTORS_JSON.exists(),
+    reason="ECC data sources or local sectors.json not available",
 )
 
 
