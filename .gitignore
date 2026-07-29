@@ -28,3 +28,6 @@ data/
 # 🔴 API 密鑰紅線——環境變數方式，永不入 git
 .env
 *.env
+
+# Feed 快取——可再生的數據層，永不入 git
+feeds/cache/
