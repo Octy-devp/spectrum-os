@@ -85,6 +85,24 @@ def field_mass(value: object) -> int:
     return len(text)
 
 
+def _text_key(value: object) -> str:
+    """Whitespace-normalized text key for duplicate detection (§6.5)."""
+    return " ".join(str(value).split())
+
+
+def _entry_form(keys: set[str]) -> str:
+    """Template form of a warfare quad entry from its populated keys.
+
+    ``5key`` = chosen_path/strategic_intent family; ``4key`` = alternative/
+    direction family. A round mixing forms is flagged ``mixed`` by the caller.
+    """
+    if keys & {"chosen_path", "strategic_intent"}:
+        return "5key"
+    if keys & {"alternative", "direction"}:
+        return "4key"
+    return "other"
+
+
 @dataclass
 class RoleAssignment:
     """One role observation of a state within one measurement context (thread)."""
@@ -96,6 +114,9 @@ class RoleAssignment:
     mass: int = 0        # informative character mass (warfare fields; 0 elsewhere)
     stale: bool = False  # carried-over placeholder — recorded but unmeasured
     source: str = ""     # provenance tag (loader-defined)
+    note: str = ""       # provenance flag, e.g. "dup_text:direction" — measured
+                         # but a verbatim duplicate of another role field in the
+                         # same entry (one measurement, not two; see §6.5)
 
 
 @dataclass
@@ -110,6 +131,11 @@ class RoleMultigraph:
 
     assignments: dict[str, list[RoleAssignment]] = field(default_factory=dict)
     state_times: dict[str, float] = field(default_factory=dict)
+    state_meta: dict[str, dict] = field(default_factory=dict)
+    """Per-state provenance metadata (warfare trees): ``template`` (4key/5key/
+    mixed/other key-form of the round's entries) and ``template_switch`` (True
+    when the form changes vs the previous round of the same faction). Markers
+    only — interpretation belongs to the API gate layer (PLAN-23 §6.5)."""
 
     def add(self, assignment: RoleAssignment) -> None:
         self.assignments.setdefault(assignment.state_id, []).append(assignment)
@@ -173,6 +199,8 @@ class RoleMultigraph:
         graph = cls()
         for faction, entries in (data.get("factions") or {}).items():
             branch_counts: dict[int, int] = {}
+            round_forms: dict[int, set[str]] = {}
+            prev_form: str | None = None
             for entry in entries:
                 rnd = entry.get("round")
                 if rnd is None:
@@ -182,18 +210,47 @@ class RoleMultigraph:
                 state_id = f"{faction}/r{int(rnd):02d}"
                 thread = f"{state_id}/b{branch_idx}"
                 graph.state_times[state_id] = float(rnd)
+
+                seen_texts: dict[str, str] = {}  # per-entry: text_key -> first role
+                populated: set[str] = set()
                 for key, value in (entry.get("dca") or {}).items():
                     role = _WARFARE_KEY_TO_ROLE.get(key)
                     if role is None:
                         continue
                     mass = field_mass(value)
+                    note = ""
+                    if mass > 0:
+                        populated.add(key)
+                        tk = _text_key(value)
+                        other = seen_texts.get(tk)
+                        if other is not None and other != role:
+                            # §6.5 artifact filter: two role fields with verbatim
+                            # identical text are ONE measurement, not two roles.
+                            mass = 0
+                            note = f"dup_text:{other}"
+                        else:
+                            seen_texts.setdefault(tk, role)
                     graph.add(RoleAssignment(
                         state_id, thread, role,
                         weight=1.0 if mass > 0 else 0.0,
                         mass=mass,
-                        stale=(mass == 0),
+                        stale=(mass == 0 and not note),
+                        note=note,
                         source=system_id,
                     ))
+                if populated:
+                    round_forms.setdefault(int(rnd), set()).add(_entry_form(populated))
+
+            # Template-form markers (mechanical flags; interpretation is API-gate work)
+            for rnd in sorted(round_forms):
+                forms = round_forms[rnd]
+                form = forms.pop() if len(forms) == 1 else "mixed"
+                state_id = f"{faction}/r{rnd:02d}"
+                meta = graph.state_meta.setdefault(state_id, {})
+                meta["template"] = form
+                if prev_form is not None and form != prev_form:
+                    meta["template_switch"] = True
+                prev_form = form
         return graph
 
 

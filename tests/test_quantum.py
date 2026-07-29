@@ -339,7 +339,16 @@ def test_real_warfare_tomography_track0():
 
 @needs_ecc
 def test_real_warfare_decoherence_1915_rus():
-    """The 1915 rus series has a genuine entropy window at rounds 5–7."""
+    """The 1915 rus series shows an entropy window at rounds 5–7.
+
+    PROVENANCE CAVEAT (20260728 rupture report): this window mixes genuine
+    crystallization with measurement artifacts — template switch 5key→4key at
+    r04→r05 (now flagged in ``state_meta[...]["template_switch"]``), carried-over
+    stale fields, and alt==dir verbatim duplicates (now deduped with
+    ``note="dup_text"``). Whether it is a real phase transition is API-gate
+    interpretation work, not a mechanical given. The label "genuine entropy
+    window" was premature.
+    """
     graph = load_warfare_tree(
         f"{ECC_WARFARE_FIELDS}/anti-intervention-war-1915/dca-branch-tree.yaml")
     watch = decoherence_watch(graph, "rus")
@@ -369,3 +378,44 @@ def test_real_warfare_cycle2_thin_series_contested():
         f"{ECC_WARFARE_FIELDS}/anti-intervention-war-cycle2/dca-branch-tree.yaml")
     watch = decoherence_watch(graph, "rus")
     assert watch.verdict is Verdict.CONTESTED  # 2 rounds only
+
+
+# ---------------------------------------------------------------------------
+# §6.5 artifact filtering: dup_text dedup + template_switch markers
+# ---------------------------------------------------------------------------
+
+def test_dup_text_dedup_same_entry():
+    """Verbatim-identical alternative/direction text = one measurement, not two."""
+    data = {"factions": {"rus": [
+        {"round": 1, "dca": {"crisis": "кризис", "lag": "лага",
+                              "alternative": "SAME TEXT", "direction": "SAME TEXT"}},
+    ]}}
+    graph = RoleMultigraph.from_warfare_tree(data, "test")
+    assigns = graph.state_assignments("rus/r01")
+    active = {a.role: a for a in assigns if a.weight > 0}
+    dupes = [a for a in assigns if a.note.startswith("dup_text:")]
+    assert len(active) == 3  # crisis, lag, alternative(first) — direction deduped
+    assert len(dupes) == 1 and dupes[0].role == "direction"
+    assert dupes[0].weight == 0.0 and not dupes[0].stale
+
+
+def test_dup_text_different_text_kept():
+    data = {"factions": {"rus": [
+        {"round": 1, "dca": {"alternative": "TEXT A", "direction": "TEXT B"}},
+    ]}}
+    graph = RoleMultigraph.from_warfare_tree(data, "test")
+    active = [a for a in graph.state_assignments("rus/r01") if a.weight > 0]
+    assert len(active) == 2
+    assert all(not a.note for a in active)
+
+
+def test_template_switch_marked():
+    data = {"factions": {"rus": [
+        {"round": 1, "dca": {"crisis": "x", "chosen_path": "y", "strategic_intent": "z"}},
+        {"round": 2, "dca": {"crisis": "x", "alternative": "y", "direction": "z"}},
+    ]}}
+    graph = RoleMultigraph.from_warfare_tree(data, "test")
+    assert graph.state_meta["rus/r01"]["template"] == "5key"
+    assert "template_switch" not in graph.state_meta["rus/r01"]
+    assert graph.state_meta["rus/r02"]["template"] == "4key"
+    assert graph.state_meta["rus/r02"]["template_switch"] is True
