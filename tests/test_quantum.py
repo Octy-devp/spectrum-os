@@ -384,8 +384,8 @@ def test_real_warfare_cycle2_thin_series_contested():
 # §6.5 artifact filtering: dup_text dedup + template_switch markers
 # ---------------------------------------------------------------------------
 
-def test_dup_text_dedup_same_entry():
-    """Verbatim-identical alternative/direction text = one measurement, not two."""
+def test_identical_text_marked_not_judged():
+    """Identical alternative/direction text: both stay active, flag recorded, no judging."""
     data = {"factions": {"rus": [
         {"round": 1, "dca": {"crisis": "кризис", "lag": "лага",
                               "alternative": "SAME TEXT", "direction": "SAME TEXT"}},
@@ -393,13 +393,14 @@ def test_dup_text_dedup_same_entry():
     graph = RoleMultigraph.from_warfare_tree(data, "test")
     assigns = graph.state_assignments("rus/r01")
     active = {a.role: a for a in assigns if a.weight > 0}
-    dupes = [a for a in assigns if a.note.startswith("dup_text:")]
-    assert len(active) == 3  # crisis, lag, alternative(first) — direction deduped
-    assert len(dupes) == 1 and dupes[0].role == "direction"
-    assert dupes[0].weight == 0.0 and not dupes[0].stale
+    flags = [a for a in assigns if a.note.startswith("identical_text:")]
+    assert len(active) == 4  # crisis, lag, alternative, direction — all preserved
+    assert active["direction"].mass > 0  # mass NOT zeroed
+    assert len(flags) == 1 and flags[0].role == "direction"
+    assert flags[0].weight == 1.0 and not flags[0].stale
 
 
-def test_dup_text_different_text_kept():
+def test_identical_text_different_text_no_flag():
     data = {"factions": {"rus": [
         {"round": 1, "dca": {"alternative": "TEXT A", "direction": "TEXT B"}},
     ]}}

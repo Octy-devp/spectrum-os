@@ -114,9 +114,8 @@ class RoleAssignment:
     mass: int = 0        # informative character mass (warfare fields; 0 elsewhere)
     stale: bool = False  # carried-over placeholder — recorded but unmeasured
     source: str = ""     # provenance tag (loader-defined)
-    note: str = ""       # provenance flag, e.g. "dup_text:direction" — measured
-                         # but a verbatim duplicate of another role field in the
-                         # same entry (one measurement, not two; see §6.5)
+    note: str = ""       # provenance flag, e.g. "identical_text:direction" —
+                         # two fields carry identical text (marked, not judged)
 
 
 @dataclass
@@ -224,24 +223,27 @@ class RoleMultigraph:
                         tk = _text_key(value)
                         other = seen_texts.get(tk)
                         if other is not None and other != role:
-                            # §6.5 artifact filter: two role fields with verbatim
-                            # identical text are ONE measurement, not two roles.
-                            mass = 0
-                            note = f"dup_text:{other}"
+                            # Pure marking only: two role fields carry verbatim
+                            # identical text. We record the fact and the flag —
+                            # we do NOT zero the mass, do NOT dedup, and do NOT
+                            # judge whether this is artifact or signature.
+                            # Understanding belongs to the human.
+                            note = f"identical_text:{other}"
                         else:
                             seen_texts.setdefault(tk, role)
                     graph.add(RoleAssignment(
                         state_id, thread, role,
                         weight=1.0 if mass > 0 else 0.0,
                         mass=mass,
-                        stale=(mass == 0 and not note),
+                        stale=(mass == 0),
                         note=note,
                         source=system_id,
                     ))
                 if populated:
                     round_forms.setdefault(int(rnd), set()).add(_entry_form(populated))
 
-            # Template-form markers (mechanical flags; interpretation is API-gate work)
+            # Template-form markers (mechanical flags only; understanding is
+            # reserved for the human, not for this loader and not for any LLM)
             for rnd in sorted(round_forms):
                 forms = round_forms[rnd]
                 form = forms.pop() if len(forms) == 1 else "mixed"
