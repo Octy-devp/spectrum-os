@@ -66,7 +66,7 @@ class TestVectorFromRoles:
     def test_with_spectrum(self):
         v = vector_from_roles(
             {'direction': 0.4, 'crisis': 0.3, 'lag': 0.2, 'alternative': 0.1},
-            {'freq': 3.5, 'phase': 1.57, 'amplitude': 0.8}
+            {'period_months': 3.5, 'phase': 1.57, 'amplitude': 0.8}
         )
         assert v.d4 == 3.5
         assert v.d5 == 1.57
@@ -81,7 +81,7 @@ class TestVectorFromRoles:
         """Ban check: D4-D6 must not be constrained by ternary."""
         v = vector_from_roles(
             {'direction': 0.4, 'crisis': 0.3, 'lag': 0.2, 'alternative': 0.1},
-            {'freq': 99.0, 'phase': 6.28, 'amplitude': 0.99}  # far beyond any ternary range
+            {'period_months': 99.0, 'phase': 6.28, 'amplitude': 0.99}  # far beyond any ternary range
         )
         assert v.d4 == 99.0   # NOT clamped to {-1,0,1}
         assert v.d6 == 0.99   # NOT clamped

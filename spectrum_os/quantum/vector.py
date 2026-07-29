@@ -6,9 +6,16 @@ D1–D3: ternary direction projection — {−1, 0, +1}
   - D3 = relation (關係) — Alternative role weight minus (Crisis + Lag + Direction)/3
 
 D4–D6: multi-spectrum content — endogenous tendency of spectrum axes
-  - D4 = frequency (dominant period in months, or 0)
+  - D4 = period_months (dominant cycle period in months, or 0 if none)
   - D5 = phase (phase angle in radians, wrapped to [-π, π])
   - D6 = amplitude (normalized deviation amplitude)
+
+Canonical unit: D4 is ALWAYS period_months (12 = annual cycle).
+Derived quantities — freq_per_month = 1/period_months, and norm_freq
+(0–1, relative to a stated band) — may only be produced by explicit
+conversion at the point of use; they are never stored in D4.
+Bands (period_months): seasonal 6–18, kitchin 24–60, juglar 60–132,
+longwave >132 (not measurable within a 252-month window).
 
 The quantum superposition is the PARALLEL coexistence of D4–D6 content —
 the ternary (D1–D3) is a direction projection, NOT a cage for the state.
@@ -25,11 +32,11 @@ _ROLE_ORDER: tuple[str, ...] = ("direction", "crisis", "lag", "alternative")
 @dataclass
 class StateVector:
     """6D state vector: [D1 will, D2 resistance, D3 relation,
-                         D4 frequency, D5 phase, D6 amplitude]."""
+                         D4 period_months, D5 phase, D6 amplitude]."""
     d1: int = 0   # will: −1/0/+1
     d2: int = 0   # resistance: −1/0/+1
     d3: int = 0   # relation: −1/0/+1
-    d4: float = 0.0  # frequency (dominant period in months, ≥ 0)
+    d4: float = 0.0  # period_months (dominant cycle period in months, ≥ 0; 0 = none)
     d5: float = 0.0  # phase (radians, [-π, π])
     d6: float = 0.0  # amplitude (normalized, [0, 1])
 
@@ -37,7 +44,7 @@ class StateVector:
         """Validate and normalise range contracts after construction.
 
         D1–D3: strictly −1, 0, or +1 (ternary direction).
-        D4: non-negative (frequency).
+        D4: non-negative (period_months).
         D5: auto-wrapped to [-π, π] via atan2 — phase is periodic;
             any real value is accepted and normalised, not rejected.
         D6: [0, 1] (amplitude).
@@ -46,7 +53,7 @@ class StateVector:
             if attr not in (-1, 0, 1):
                 raise ValueError(f"{name} must be −1, 0, or +1, got {attr}")
         if self.d4 < 0:
-            raise ValueError(f"d4 (frequency) must be ≥ 0, got {self.d4}")
+            raise ValueError(f"d4 (period_months) must be ≥ 0, got {self.d4}")
         # Phase wrapping: sin/cos preserve equivalence; atan2 normalises to [-π, π]
         self.d5 = math.atan2(math.sin(self.d5), math.cos(self.d5))
         if not (0 <= self.d6 <= 1):
@@ -133,7 +140,7 @@ def vector_from_roles(role_distribution: dict[str, float],
         Dict mapping role names to weights (``direction``, ``crisis``,
         ``lag``, ``alternative``).
     spectrum_data
-        Optional dict with keys ``freq``, ``phase``, ``amplitude``.
+        Optional dict with keys ``period_months``, ``phase``, ``amplitude``.
         If None, D4–D6 default to 0.0.
 
     Returns
@@ -142,7 +149,7 @@ def vector_from_roles(role_distribution: dict[str, float],
     """
     d1, d2, d3 = project_ternary(role_distribution)
     if spectrum_data is not None:
-        d4 = float(spectrum_data.get("freq", 0.0))
+        d4 = float(spectrum_data.get("period_months", 0.0))
         d5 = float(spectrum_data.get("phase", 0.0))
         d6 = float(spectrum_data.get("amplitude", 0.0))
     else:

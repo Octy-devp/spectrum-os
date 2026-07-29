@@ -18,8 +18,9 @@ def fft_decompose(timeseries, top_k: int = 5) -> SpectrumResult:
     """Compute the FFT amplitude/phase spectrum and top-k peaks.
 
     Returns a :class:`SpectrumResult` whose ``values`` contains ``peaks``
-    (each with ``freq``, ``period``, ``amplitude``, ``amplitude_share``,
-    ``phase_angle``) plus the full ``magnitude``/``phase`` spectra.
+    (each with ``freq_per_month``, ``period_months``, ``amplitude``,
+    ``amplitude_share``, ``phase_angle``) plus the full
+    ``magnitude``/``phase`` spectra.
     """
     x = np.asarray(timeseries, dtype=np.float64)
     n = x.size
@@ -43,8 +44,8 @@ def fft_decompose(timeseries, top_k: int = 5) -> SpectrumResult:
     top_idx = np.argsort(mags)[::-1][:top_k]
     peaks = [
         {
-            "freq": float(freqs[i + 1]),
-            "period": float(1.0 / freqs[i + 1]) if freqs[i + 1] > 0 else float("inf"),
+            "freq_per_month": float(freqs[i + 1]),
+            "period_months": float(1.0 / freqs[i + 1]) if freqs[i + 1] > 0 else float("inf"),
             "amplitude": float(mags[i]),
             "amplitude_share": float(mags[i] / total) if total > 0 else 0.0,
             "phase_angle": float(phase[i + 1]),
@@ -72,5 +73,5 @@ def fft_decompose(timeseries, top_k: int = 5) -> SpectrumResult:
         },
         verdict=verdict,
         confidence_reason=reason,
-        dominant_periods=[round(p["period"]) for p in peaks if np.isfinite(p["period"])],
+        dominant_periods=[round(p["period_months"]) for p in peaks if np.isfinite(p["period_months"])],
     )

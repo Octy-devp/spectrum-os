@@ -22,7 +22,7 @@ class TestFFT:
         x = np.sin(2 * np.pi * t / 12.0)
         res = fft_decompose(x)
         top = res.values["peaks"][0]
-        assert abs(top["period"] - 12.0) < 0.5
+        assert abs(top["period_months"] - 12.0) < 0.5
         assert res.verdict == Verdict.ASSERTED
 
     def test_phase_difference_recovered(self):
