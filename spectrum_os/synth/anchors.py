@@ -45,26 +45,52 @@ CONTRACT_TOP_KEYS = (
 #: Their presence is a contract violation — the gate must never do that.
 _FORBIDDEN_SERIES_KEYS = ("series", "values", "timeseries", "data", "points")
 
-def _resolve_api_utils_path() -> str:
-    """Resolve the path to ECC's api_utils.py, preferring env var."""
+def _resolve_api_utils_path() -> str | None:
+    """Resolve the path to ECC's api_utils.py.
+
+    Search order: ``ECC_API_UTILS_PATH`` env var, then known layouts —
+    standalone repo as sibling of the ECC monorepo, and spectrum-os
+    checked out as a submodule inside ECC. Returns ``None`` when no
+    candidate exists; the error is raised lazily by
+    :func:`_get_api_utils_path` so importing this module never fails
+    for users who do not call the LLM gate.
+    """
     env = os.environ.get("ECC_API_UTILS_PATH", "")
     if env and os.path.isfile(env):
         return env
-    # Fallback: sibling monorepo (spectrum-os lives next to ECC)
-    sibling = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "ECC", "scripts", "api_utils.py"
+    base = os.path.dirname(__file__)
+    candidates = (
+        # Standalone: .../projects/spectrum-os next to .../projects/ECC
+        os.path.join(base, "..", "..", "..", "ECC", "scripts", "api_utils.py"),
+        # Submodule: ECC/spectrum-os inside the ECC monorepo
+        os.path.join(base, "..", "..", "..", "scripts", "api_utils.py"),
     )
-    sibling = os.path.abspath(sibling)
-    if os.path.isfile(sibling):
-        return sibling
-    raise FileNotFoundError(
-        "Cannot locate ECC's api_utils.py. "
-        "Set ECC_API_UTILS_PATH to the absolute path of "
-        "ECC/scripts/api_utils.py, or install spectrum-os "
-        "as a sibling of the ECC monorepo."
-    )
+    for cand in candidates:
+        cand = os.path.abspath(cand)
+        if os.path.isfile(cand):
+            return cand
+    return None
 
-_ECC_API_UTILS_PATH = _resolve_api_utils_path()
+
+_RESOLVED_API_UTILS_PATH: str | None = None
+
+
+def _get_api_utils_path() -> str:
+    """Lazily resolve and cache the api_utils path (raises only on use)."""
+    global _RESOLVED_API_UTILS_PATH
+    if _RESOLVED_API_UTILS_PATH is None:
+        path = _resolve_api_utils_path()
+        if path is None:
+            raise FileNotFoundError(
+                "Cannot locate ECC's api_utils.py. "
+                "Set ECC_API_UTILS_PATH to the absolute path of "
+                "ECC/scripts/api_utils.py, or install spectrum-os "
+                "as a sibling of the ECC monorepo (or as a submodule inside it)."
+            )
+        _RESOLVED_API_UTILS_PATH = path
+    return _RESOLVED_API_UTILS_PATH
+
+
 _DEFAULT_MODEL = "deepseek-v4-flash"
 
 
@@ -333,12 +359,9 @@ def _build_prompt(sector_spec: dict) -> str:
 
 def _load_ecc_call_api() -> Callable:
     """Import ``call_api`` from ECC's scripts/api_utils.py."""
-    if not os.path.exists(_ECC_API_UTILS_PATH):
-        raise RuntimeError(
-            f"ECC api_utils not found at {_ECC_API_UTILS_PATH} — "
-            f"the synth gate requires ECC's shared API module")
+    path = _get_api_utils_path()
     spec = importlib.util.spec_from_file_location(
-        "ecc_api_utils", _ECC_API_UTILS_PATH)
+        "ecc_api_utils", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.call_api
