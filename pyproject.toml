@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spectrum-os"
-version = "2.5.0"
+version = "2.7.0"
 description = "Dual-worldline spectrum analysis engine — 6D state vector, quantum layer, LLM synthesis gate"
 requires-python = ">=3.10"
 dependencies = [

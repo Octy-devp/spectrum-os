@@ -36,5 +36,15 @@ class OSC:
         from .. import quantum
         return quantum
 
+    @property
+    def contracts(self):
+        from .. import contracts
+        return contracts
+
+    @property
+    def sources(self):
+        from .. import sources
+        return sources
+
 
 osc = OSC()

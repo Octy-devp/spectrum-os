@@ -14,11 +14,11 @@ This module provides the two things the rest of ``spectrum_os.quantum`` needs:
   real data sources.
 * Loaders for the two real sources surveyed for PLAN-23 task F:
 
-  1. ``knowledge-dca-edges.yaml`` (α₂, ECC ``index/data/``) — a true typed-edge
+  1. ``knowledge-dca-edges.yaml`` (α₂) — a true typed-edge
      multigraph. Each edge ``(A --[X->Y]--> B)`` assigns role ``X`` to the
      source state and role ``Y`` to the target state *within that edge's
      relational context*. The edge is the finest "thread" the data provides.
-  2. ``dca-branch-tree.yaml`` (β₁, ECC ``index/warfare/data/fields/*/``) —
+  2. ``dca-branch-tree.yaml`` (β₁) —
      per-faction time series of DCA quads (free-text crisis / lag /
      alternative / direction fields per round, with multiple branch entries
      per round = superposed candidate measurements). No typed edges; the

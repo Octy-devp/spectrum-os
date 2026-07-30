@@ -63,24 +63,26 @@ def estimate_rate_matrix(
     counts: np.ndarray,
     alpha: float = 1.0,
     min_total_count: float = 10.0,
+    bias_flags: list[dict] | None = None,
 ) -> dict:
     """Estimate stochastic transition rate matrix with Dirichlet prior smoothing.
 
-    Forbidden cells are enforced to be identically 0.0. The denominator for row i
-    is sum_{j in A_i} C_{i,j} + alpha * |A_i|, where A_i is the set of allowed target
-    roles from role i.
+    Forbidden cells are enforced to be identically 0.0. Denominator calculation,
+    rate estimation, and bias flag verdict downgrading follow PLAN-23 §6.6.
 
     Args:
         counts: 4x4 array of transition counts.
         alpha: Dirichlet prior parameter (pseudo-counts). Default 1.0.
         min_total_count: Threshold for total_count to mark verdict as ASSERTED vs UNKNOWN.
+        bias_flags: Optional list of bias flag dicts to evaluate verdict downgrades.
 
     Returns:
         Dict containing:
         - ``"matrix"``: 4x4 stochastic transition matrix.
-        - ``"verdict"``: ``"ASSERTED"`` if total_count >= min_total_count else ``"UNKNOWN"``.
+        - ``"verdict"``: ``"ASSERTED"``, ``"CONTESTED"``, or ``"UNKNOWN"``.
         - ``"counts"``: The input counts array (as float64 ndarray).
         - ``"total_count"``: Total transition count sum (float).
+        - ``"bias_notes"``: List of str describing downgrade reasons (if any).
     """
     counts_arr = np.asarray(counts, dtype=np.float64)
     num_roles = len(ROLES)
@@ -98,12 +100,49 @@ def estimate_rate_matrix(
 
     total_count = float(np.sum(counts_arr))
     verdict = "ASSERTED" if total_count >= min_total_count else "UNKNOWN"
+    bias_notes: list[str] = []
+
+    if bias_flags:
+        downgrade_map = {"ASSERTED": "CONTESTED", "CONTESTED": "UNKNOWN", "UNKNOWN": "UNKNOWN"}
+        for flag in bias_flags:
+            kind = flag.get("kind", "bias")
+            note = flag.get("note", "")
+            scope = flag.get("scope", {})
+
+            triggered = False
+            # Check roles scope
+            for r in scope.get("roles", []):
+                if r in ROLES:
+                    r_idx = ROLES.index(r)
+                    r_total = float(np.sum(counts_arr[r_idx, :]))
+                    if r_total < min_total_count:
+                        triggered = True
+                        bias_notes.append(
+                            f"Role '{r}' total count {r_total:.1f} < min_total_count ({min_total_count:.1f}) [{kind}]: {note}".strip()
+                        )
+
+            # Check transitions scope
+            for trans in scope.get("transitions", []):
+                if isinstance(trans, (list, tuple)) and len(trans) == 2:
+                    src, dst = trans[0], trans[1]
+                    if src in ROLES and dst in ROLES:
+                        s_idx, d_idx = ROLES.index(src), ROLES.index(dst)
+                        t_count = float(counts_arr[s_idx, d_idx])
+                        if t_count < min_total_count:
+                            triggered = True
+                            bias_notes.append(
+                                f"Transition '{src}->{dst}' count {t_count:.1f} < min_total_count ({min_total_count:.1f}) [{kind}]: {note}".strip()
+                            )
+
+            if triggered:
+                verdict = downgrade_map.get(verdict, verdict)
 
     return {
         "matrix": matrix,
         "verdict": verdict,
         "counts": counts_arr,
         "total_count": total_count,
+        "bias_notes": bias_notes,
     }
 
 

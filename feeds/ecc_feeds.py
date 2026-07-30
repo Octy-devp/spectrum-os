@@ -68,6 +68,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from spectrum_os import osc  # noqa: E402
 from spectrum_os.kernel._types import Verdict  # noqa: E402
+from spectrum_os.sources import SourceSpec, register_source  # noqa: E402
 
 # --- ECC 數據源（唯讀） -------------------------------------------------------
 ECC_DATA = Path("/home/octy/projects/ECC/index/data")
@@ -86,6 +87,89 @@ MOOD_ARCS = {
 
 MAX_FILL_RUN = 12          # 月；超過即視為資訊真空，切段
 DEFAULT_WINDOWS = (36, 6)  # kernel 預設 (long, mid)
+
+
+def get_ecc_source_specs() -> list[SourceSpec]:
+    """Return declarative SourceSpec objects for all ECC data feeds (PLAN-23 §6.6)."""
+    return [
+        SourceSpec(
+            driver="file",
+            locator=str(COMPILED_SCENES),
+            emits="Sector",
+            mapping={"values": "values"},
+            meta={"arc": MOOD_ARCS["hk_mood"]},
+            source_id="hk_mood",
+        ),
+        SourceSpec(
+            driver="file",
+            locator=str(COMPILED_SCENES),
+            emits="Sector",
+            mapping={"values": "values"},
+            meta={"arc": MOOD_ARCS["germany_mood"]},
+            source_id="germany_mood",
+        ),
+        SourceSpec(
+            driver="file",
+            locator=str(COMPILED_SCENES),
+            emits="Sector",
+            mapping={"values": "values"},
+            meta={"arc": MOOD_ARCS["return_mood"]},
+            source_id="return_mood",
+        ),
+        SourceSpec(
+            driver="file",
+            locator=str(HISTORICAL_ATMOSPHERE),
+            emits="Sector",
+            mapping={"values": "values"},
+            meta={"kind": "historical_tension_gravity_baseline"},
+            source_id="ha_tension",
+        ),
+        SourceSpec(
+            driver="file",
+            locator=str(Path("/home/octy/projects/ECC/index/warfare/data/fields/experiment-track0/dca-branch-tree.yaml")),
+            emits="RoleTrajectory",
+            mapping={"points": "points", "thread_id": "thread_id"},
+            source_id="ecc-warfare-track0",
+        ),
+        SourceSpec(
+            driver="file",
+            locator=str(ECC_DATA / "knowledge-dca-edges.yaml"),
+            emits="DCASubstrate",
+            mapping={"nodes": "nodes", "edges": "edges"},
+            bias_flags=[
+                {
+                    "kind": "under_measurement",
+                    "scope": {"roles": ["lag"]},
+                    "note": "lag role is under-measured in knowledge edges",
+                },
+                {
+                    "kind": "orphan_region",
+                    "scope": {"nodes": ["210-political-economy-*"]},
+                    "note": "210-political-economy-* orphan nodes region",
+                },
+            ],
+            source_id="ecc-knowledge-edges",
+        ),
+        SourceSpec(
+            driver="file",
+            locator=str(ECC_DATA / "clad-gene-pool.jsonl"),
+            emits="CLADCorpus",
+            mapping={"entries": "entries"},
+            source_id="ecc-clad-books",
+        ),
+    ]
+
+
+def register_ecc_sources() -> list[str]:
+    """Register all ECC SourceSpec declarations into spectrum_os.sources registry."""
+    ids = []
+    for spec in get_ecc_source_specs():
+        ids.append(register_source(spec))
+    return ids
+
+
+# Automatically register ECC sources on module import
+register_ecc_sources()
 
 
 # ---------------------------------------------------------------------------
