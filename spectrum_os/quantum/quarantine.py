@@ -3,7 +3,12 @@ Double-layer anti-pollution quarantine system (PLAN-23 §六.五-2).
 
 Layer 1: Mechanical blacklist — blocks α₁ concepts that cannot exist before
 their historical emergence date.
-Layer 2: Inspector gate — second LLM inspector (mechanical fallback for now).
+Layer 2: Semantic era-consistency check — performed by the adversary gate
+(PLAN-23 §六․五-5).  Since PLAN-23 v2.6.1 there is NO separate second-LLM
+inspector: gate output is already compressed to structure/numbers, so
+concept smuggling survives only in alternative labels, which is exactly
+the adversary gate's range.  `inspector_gate()` here remains as the
+mechanical fallback (emergence-year check).
 
 This is the output-side quarantine: after generation, before ingestion into
 β₁ SSOT or spectrum computation.  Complemented by input-side knowledge
@@ -65,10 +70,10 @@ def mechanical_filter(text: str) -> tuple[bool, list[str]]:
 def inspector_gate(text: str, year: int) -> dict:
     """Second-layer inspector gate — mechanical fallback.
 
-    In the full pipeline (PLAN-23 §六.五-2), this would call a second LLM
-    with a knowledge-cutoff prompt anchored at *year*.  For now we implement
-    the mechanical fallback: check each blacklisted concept's emergence year
-    against the given *year*.
+    The full semantic inspector is NOT a separate LLM: since PLAN-23 v2.6.1
+    the era-consistency attack is performed by the adversary gate
+    (§六․五-5).  What remains here is the mechanical fallback: check each
+    blacklisted concept's emergence year against the given *year*.
 
     Returns:
         ``{"passed": bool, "anachronisms": [str], "confidence": float,

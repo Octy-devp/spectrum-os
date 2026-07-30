@@ -29,15 +29,15 @@ Plan specified properties returning `np.array([d1,d2,d3])`, `np.array([d4,d5,d6]
 
 ## 4. Branch DCA grammar validation not wired
 
-Plan specified: "Add DCA grammar validation step in `simulate()` — each adjustment mutation must pass `validate_alternative()` before being accepted." Code in `branch.py` has no DCA grammar import or validation. This is a real gap: branch simulations can produce role transitions that violate DCA grammar rules.
+Plan specified: "Add DCA grammar validation step in `simulate()` — each adjustment mutation must pass `validate_alternative()` before being accepted." Code in `branch.py` has no DCA grammar import or validation.
 
-**Decision**: Deferred to v2.6 — requires non-trivial refactoring of `branch.py`'s simulation loop to inject grammar checks. **Fix in v2.6.**
+**Resolution (PLAN-23 v2.6.1): WITHDRAWN — category error.** `branch.simulate` is numeric Monte Carlo on deviation series (`{sector_id: fractional_change}`); it contains no role transitions to validate. Post-v2.6, grammar's structural zeros live in the Markov rate matrix (PLAN-23 §6.6.1), and generation-time checks run at the Stage 3 gate's output boundary, not inside the numeric simulator. **No fix needed.**
 
 ## 5. "Second LLM inspector" is mechanical fallback only
 
-Plan described `inspector_gate()` as a second LLM call that cross-validates the first LLM's output. Code is honest: `inspector_gate` is a pure mechanical filter (TEMPORAL_BLACKLIST + emergence-year check), and the code labels it "mechanical fallback (Phase 3 scope)" in its docstring.
+Plan described `inspector_gate()` as a second LLM call that cross-validates the first LLM's output. Code is honest: `inspector_gate` is a pure mechanical filter (TEMPORAL_BLACKLIST + emergence-year check).
 
-**Decision**: Full LLM cross-validation is a v3.0 feature — requires a second API call with different prompt, cost implications, and latency concerns. Mechanical fallback is adequate for v2.5. **No change for now.**
+**Resolution (PLAN-23 v2.6.1): FOLDED — no separate inspector.** The semantic era-consistency attack is the adversary gate's existing job (PLAN-23 §六․五-5). Gate output is now compressed to structure/numbers, so concept smuggling survives only in alternative labels — inside the adversary gate's range. The mechanical fallback here stays as the cheap deterministic layer. **No separate second-LLM item.**
 
 ---
 
@@ -48,7 +48,7 @@ Plan described `inspector_gate()` as a second LLM call that cross-validates the 
 | D1–D3 discrete vs continuous | Low | Update plan to match code (or vice versa) |
 | Missing `project_spectrum()` | None | Covered by `vector_from_roles` dict interface |
 | Missing numpy array properties | Low | v3.0 if needed; stay numpy-free for now |
-| Branch DCA validation not wired | **Medium** | v2.6 |
-| Second LLM inspector not implemented | Low | v3.0 |
+| Branch DCA validation not wired | — | **Withdrawn**（v2.6.1：範疇錯誤，§6.6.1 結構性零住進速率矩陣） |
+| Second LLM inspector not implemented | — | **Folded**（v2.6.1：對抗閘兼任，§六․五-5） |
 
 All five gaps are **conscious, documented divergences** — not bugs. The implementation is internally consistent with its own docstrings.
