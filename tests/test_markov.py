@@ -3,10 +3,12 @@ import pytest
 
 from spectrum_os.quantum.markov import (
     count_transitions,
+    count_transitions_soft,
     estimate_rate_matrix,
     sample_rate_matrix,
     hitting_times,
     absorption_probabilities,
+    smoothed_role_posteriors,
     stationary_distribution,
     entropy_rate,
     spectral_gap,
@@ -265,6 +267,120 @@ def test_stationary_distribution_edge_cases():
     pi_disc = stationary_distribution(P_disc)
     assert pi_disc.shape == (4,)
     np.testing.assert_allclose(np.sum(pi_disc), 1.0)
+
+
+def test_smoothed_role_posteriors_analytical_2state():
+    # 2-state HMM analytical test (roles 0 and 1 active)
+    # P matrix: role 0->0 (0.8), 0->1 (0.2); role 1->0 (0.3), 1->1 (0.7)
+    P = np.array([
+        [0.8, 0.2, 0.0, 0.0],
+        [0.3, 0.7, 0.0, 0.0],
+        [0.0, 0.0, 0.5, 0.5],
+        [0.0, 0.0, 0.5, 0.5],
+    ])
+    emission_loglik = np.array([
+        [np.log(0.9), np.log(0.1), -100.0, -100.0],
+        [np.log(0.2), np.log(0.8), -100.0, -100.0],
+        [np.log(0.7), np.log(0.3), -100.0, -100.0],
+    ])
+    res = smoothed_role_posteriors(emission_loglik, P)
+    gamma = res["gamma"]
+    xi = res["xi"]
+    loglik = res["loglik"]
+
+    assert gamma.shape == (3, 4)
+    assert xi.shape == (2, 4, 4)
+    assert np.isfinite(loglik)
+    np.testing.assert_allclose(gamma.sum(axis=1), np.ones(3))
+    np.testing.assert_allclose(xi.sum(axis=(1, 2)), np.ones(2))
+    assert not np.isnan(gamma).any()
+    assert not np.isnan(xi).any()
+
+
+def test_smoothed_role_posteriors_single_obs_boundary():
+    P = np.ones((4, 4)) * 0.25
+    emission_loglik = np.zeros((1, 4))  # T=1
+    res = smoothed_role_posteriors(emission_loglik, P)
+
+    assert res["gamma"].shape == (1, 4)
+    assert res["xi"].shape == (0, 4, 4)
+    np.testing.assert_allclose(res["gamma"].sum(axis=1), [1.0])
+
+
+def test_smoothed_role_posteriors_zero_prob_no_nan():
+    P = np.array([
+        [0.5, 0.5, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0],
+        [0.0, 0.0, 0.5, 0.5],
+        [0.0, 0.0, 0.5, 0.5],
+    ])
+    # Extreme log likelihoods including -inf
+    emission_loglik = np.array([
+        [-np.inf, -np.inf, 0.0, 0.0],
+        [-1e9, -1e9, 0.0, 0.0],
+        [0.0, 0.0, -np.inf, -np.inf],
+    ])
+    res = smoothed_role_posteriors(emission_loglik, P)
+    assert not np.isnan(res["gamma"]).any()
+    assert not np.isnan(res["xi"]).any()
+
+
+def test_smoothed_role_posteriors_delta_limit_consistency():
+    # Delta emission (hard labels limit) -> soft count must match v1 hard count
+    P = estimate_rate_matrix(np.zeros((4, 4)), alpha=1.0)["matrix"]
+    seq = ["crisis", "lag", "alternative", "direction", "crisis"]
+    role_to_idx = {r: i for i, r in enumerate(ROLES)}
+
+    # Build hard delta emission loglik
+    T = len(seq)
+    delta_emission = np.full((T, 4), -1e9, dtype=np.float64)
+    for t, r in enumerate(seq):
+        delta_emission[t, role_to_idx[r]] = 0.0  # log(1.0) = 0.0
+
+    res = smoothed_role_posteriors(delta_emission, P)
+    soft_counts = count_transitions_soft(res["xi"])
+    hard_counts, _ = count_transitions([seq])
+
+    # Soft transition matrix should match hard transition matrix
+    np.testing.assert_allclose(soft_counts, hard_counts, atol=1e-5)
+
+
+def test_smoothed_role_posteriors_impossible_sequence_fallback():
+    P = np.eye(4) * 0.25
+    # T=3 with all -inf emission loglik (impossible observations)
+    emission_loglik = np.full((3, 4), -np.inf, dtype=np.float64)
+    res = smoothed_role_posteriors(emission_loglik, P)
+
+    assert res["loglik"] == -np.inf
+    assert res["gamma"].shape == (3, 4)
+    # Each row in gamma must sum to 1.0 (uniform distribution fallback)
+    np.testing.assert_allclose(res["gamma"].sum(axis=1), np.ones(3))
+    np.testing.assert_allclose(res["gamma"], np.full((3, 4), 0.25))
+
+
+def test_soft_counts_structural_zero_preservation():
+    # Verify that structural zero transitions (lag->direction [1,3], direction->alternative [3,2])
+    # remain exactly 0.0 in count_transitions_soft and subsequent estimate_rate_matrix.
+    counts_init = np.zeros((4, 4))
+    P = estimate_rate_matrix(counts_init, alpha=1.0)["matrix"]
+
+    # Random emission loglik sequence
+    rng = np.random.default_rng(42)
+    obs_log = rng.normal(size=(10, 4))
+
+    res = smoothed_role_posteriors(obs_log, P)
+    soft_counts = count_transitions_soft(res["xi"])
+
+    # Structural zeros must be exactly 0.0
+    assert soft_counts[1, 3] == 0.0
+    assert soft_counts[3, 2] == 0.0
+
+    # Rate matrix estimated from soft_counts must also maintain 0.0
+    P_new = estimate_rate_matrix(soft_counts, alpha=1.0)["matrix"]
+    assert P_new[1, 3] == 0.0
+    assert P_new[3, 2] == 0.0
+
+
 
 
 

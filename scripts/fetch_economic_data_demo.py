@@ -15,9 +15,9 @@ import numpy as np
 
 from spectrum_os.extras.fft_spectrum import fft_decompose
 from spectrum_os.quantum.markov import (
-    count_transitions, estimate_rate_matrix, sample_rate_matrix,
+    count_transitions, count_transitions_soft, estimate_rate_matrix, sample_rate_matrix,
     hitting_times, absorption_probabilities, stationary_distribution,
-    entropy_rate, spectral_gap, summarize_samples
+    entropy_rate, spectral_gap, summarize_samples, smoothed_role_posteriors
 )
 from spectrum_os.quantum.multigraph import ROLES
 
@@ -64,12 +64,28 @@ def discretize_gdp_to_dca_role(val: float) -> str:
         return "direction"
 
 
+def compute_gdp_emission_loglik(val: float, sigma: float = 1.0) -> list[float]:
+    """Compute log P(obs_t = val | role_k) using Gaussian emission likelihood.
+
+    Programmer semantic choice (docstring explicit):
+    Role centers:
+    - Crisis (0): 0.0%
+    - Lag (1): 2.0%
+    - Alternative (2): 3.75%
+    - Direction (3): 5.5%
+    Log likelihood is unnormalized Gaussian: -0.5 * ((val - center) / sigma)^2.
+    """
+    centers = [0.0, 2.0, 3.75, 5.5]
+    return [-0.5 * ((val - c) / sigma) ** 2 for c in centers]
+
+
 def run_experiment(out_path: str = "data/world_economic_spectrum_report.json") -> dict:
     print("Fetching 40-year world economic data from World Bank (1984-2024)...")
     
     indicator_data = {}
     spectral_analysis = {}
     role_sequences = []
+    gdp_series_list = []
 
     for key, (country, ind_code, label) in INDICATORS.items():
         records = fetch_worldbank_series(country, ind_code)
@@ -89,7 +105,6 @@ def run_experiment(out_path: str = "data/world_economic_spectrum_report.json") -
 
         # 1. Experimental FFT Spectrum Analysis
         fft_res = fft_decompose(values, top_k=5)
-        # Convert period in steps (years)
         top_peaks = []
         for p in fft_res.values.get("peaks", []):
             freq = p["freq_per_month"]  # per step
@@ -111,18 +126,31 @@ def run_experiment(out_path: str = "data/world_economic_spectrum_report.json") -
         if "gdp" in key:
             seq = [discretize_gdp_to_dca_role(v) for v in values]
             role_sequences.append(seq)
+            gdp_series_list.append(values)
 
-    # 3. Markov Dynamics Kernel on Economic Sequences
-    counts, anomalies = count_transitions(role_sequences)
-    rate_res = estimate_rate_matrix(counts, alpha=1.0)
-    P_point = rate_res["matrix"]
-    samples = sample_rate_matrix(counts, alpha=1.0, n=200, seed=42)
+    # 3. Markov Dynamics Kernel on Economic Sequences (Hard vs Soft)
+    counts_hard, anomalies = count_transitions(role_sequences)
+    rate_res_hard = estimate_rate_matrix(counts_hard, alpha=1.0)
+    P_hard = rate_res_hard["matrix"]
 
-    ht_point = hitting_times(P_point, target="direction")
-    abs_point = absorption_probabilities(P_point, absorbing=["direction", "crisis"])
-    pi_point = stationary_distribution(P_point)
-    h_point = entropy_rate(P_point)
-    sg_point = spectral_gap(P_point)
+    # HMM Soft Reconstruction
+    total_soft_counts = np.zeros((4, 4), dtype=np.float64)
+    for vals in gdp_series_list:
+        emission_log = np.array([compute_gdp_emission_loglik(v) for v in vals])
+        hmm_res = smoothed_role_posteriors(emission_log, P_hard)
+        xi = hmm_res["xi"]
+        total_soft_counts += count_transitions_soft(xi)
+
+    rate_res_soft = estimate_rate_matrix(total_soft_counts, alpha=1.0)
+    P_soft = rate_res_soft["matrix"]
+
+    samples = sample_rate_matrix(total_soft_counts, alpha=1.0, n=200, seed=42)
+
+    ht_point = hitting_times(P_soft, target="direction")
+    abs_point = absorption_probabilities(P_soft, absorbing=["direction", "crisis"])
+    pi_point = stationary_distribution(P_soft)
+    h_point = entropy_rate(P_soft)
+    sg_point = spectral_gap(P_soft)
 
     h_samples = [entropy_rate(P) for P in samples]
     sg_samples = [spectral_gap(P) for P in samples]
@@ -135,17 +163,20 @@ def run_experiment(out_path: str = "data/world_economic_spectrum_report.json") -
         "spectral_analysis": spectral_analysis,
         "markov_dynamics": {
             "num_economic_sequences": len(role_sequences),
-            "total_transitions": int(counts.sum()),
-            "verdict": rate_res["verdict"],
+            "total_transitions_hard": int(counts_hard.sum()),
+            "total_transitions_soft": float(total_soft_counts.sum()),
+            "verdict": rate_res_soft["verdict"],
             "anomalies": anomalies,
-            "transition_counts": counts.tolist(),
-            "rate_matrix_point": P_point.tolist(),
-            "stationary_distribution": {r: round(float(pi_point[i]), 4) for i, r in enumerate(ROLES)},
-            "entropy_rate": {
+            "transition_counts_hard": counts_hard.tolist(),
+            "transition_counts_soft": total_soft_counts.tolist(),
+            "rate_matrix_hard": P_hard.tolist(),
+            "rate_matrix_soft": P_soft.tolist(),
+            "stationary_distribution_soft": {r: round(float(pi_point[i]), 4) for i, r in enumerate(ROLES)},
+            "entropy_rate_soft": {
                 "point": round(h_point, 4),
                 "interval_95ci": summarize_samples(h_samples)
             },
-            "spectral_gap": {
+            "spectral_gap_soft": {
                 "point": round(sg_point, 4),
                 "interval_95ci": summarize_samples(sg_samples)
             },
@@ -165,3 +196,4 @@ def run_experiment(out_path: str = "data/world_economic_spectrum_report.json") -
 
 if __name__ == "__main__":
     run_experiment()
+

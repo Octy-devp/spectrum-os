@@ -359,3 +359,154 @@ def summarize_samples(values: list[float]) -> dict[str, float]:
         "ci95_high": ci_high,
     }
 
+
+def _logsumexp_1d(a: np.ndarray) -> float:
+    max_val = np.max(a)
+    if not np.isfinite(max_val):
+        return -np.inf
+    return float(max_val + np.log(np.sum(np.exp(a - max_val))))
+
+
+def smoothed_role_posteriors(
+    emission_loglik: np.ndarray,
+    matrix: np.ndarray,
+    initial_dist: np.ndarray | None = None,
+) -> dict:
+    """Compute smoothed role posteriors (gamma) and soft transitions (xi) via Forward-Backward.
+
+    PLAN-23 §6.6.2 + WORKFLOW §2.8: H schema superposition bridge implementation.
+    Computes log-space forward-backward probabilities to prevent numerical underflow.
+
+    Args:
+        emission_loglik: Array of shape (T, 4) containing log P(obs_t | role_k).
+        matrix: 4x4 stochastic transition matrix P_ij = P(s_{t+1}=j | s_t=i).
+        initial_dist: Optional 1D array of length 4 for P(s_0=i). If None, defaults to
+            stationary_distribution(matrix).
+
+    Returns:
+        Dict containing:
+        - "gamma": Array of shape (T, 4) with smoothed posteriors P(s_t=k | O).
+        - "xi": Array of shape (T-1, 4, 4) with soft transition probabilities P(s_t=i, s_{t+1}=j | O).
+        - "loglik": Float sequence log-likelihood log P(O).
+    """
+    obs_log = np.asarray(emission_loglik, dtype=np.float64)
+    P_arr = np.asarray(matrix, dtype=np.float64)
+    T, K = obs_log.shape
+    if K != len(ROLES) or P_arr.shape != (len(ROLES), len(ROLES)):
+        raise ValueError(
+            f"Expected state dimension {len(ROLES)}, got emission shape {obs_log.shape} "
+            f"and matrix shape {P_arr.shape}"
+        )
+
+    if initial_dist is None:
+        pi = stationary_distribution(P_arr)
+    else:
+        pi = np.asarray(initial_dist, dtype=np.float64)
+
+    log_pi = np.full(K, -np.inf, dtype=np.float64)
+    np.log(pi, out=log_pi, where=pi > 0)
+
+    log_P = np.full((K, K), -np.inf, dtype=np.float64)
+    np.log(P_arr, out=log_P, where=P_arr > 0)
+
+    if T == 0:
+        return {
+            "gamma": np.zeros((0, K), dtype=np.float64),
+            "xi": np.zeros((0, K, K), dtype=np.float64),
+            "loglik": 0.0,
+        }
+
+    if T == 1:
+        alpha0 = log_pi + obs_log[0]
+        loglik = _logsumexp_1d(alpha0)
+        gamma = np.zeros((1, K), dtype=np.float64)
+        if np.isfinite(loglik):
+            gamma[0] = np.exp(alpha0 - loglik)
+            s = np.sum(gamma[0])
+            if s > 0:
+                gamma[0] /= s
+            else:
+                gamma[0] = np.full(K, 1.0 / K, dtype=np.float64)
+        else:
+            gamma[0] = np.full(K, 1.0 / K, dtype=np.float64)
+
+        return {
+            "gamma": gamma,
+            "xi": np.zeros((0, K, K), dtype=np.float64),
+            "loglik": float(loglik) if np.isfinite(loglik) else -np.inf,
+        }
+
+    # Forward pass (log-space)
+    alpha = np.full((T, K), -np.inf, dtype=np.float64)
+    alpha[0] = log_pi + obs_log[0]
+
+    for t in range(T - 1):
+        for j in range(K):
+            term = alpha[t, :] + log_P[:, j]
+            alpha[t + 1, j] = obs_log[t + 1, j] + _logsumexp_1d(term)
+
+    loglik = _logsumexp_1d(alpha[T - 1])
+
+    # Backward pass (log-space)
+    beta = np.full((T, K), -np.inf, dtype=np.float64)
+    beta[T - 1] = 0.0
+
+    for t in range(T - 2, -1, -1):
+        for i in range(K):
+            term = log_P[i, :] + obs_log[t + 1, :] + beta[t + 1, :]
+            beta[t, i] = _logsumexp_1d(term)
+
+    gamma = np.zeros((T, K), dtype=np.float64)
+    xi = np.zeros((T - 1, K, K), dtype=np.float64)
+
+    if np.isfinite(loglik):
+        log_gamma = alpha + beta - loglik
+        gamma = np.exp(log_gamma)
+        for t in range(T):
+            s = np.sum(gamma[t])
+            if s > 0:
+                gamma[t] /= s
+            else:
+                gamma[t] = np.full(K, 1.0 / K, dtype=np.float64)
+
+        for t in range(T - 1):
+            for i in range(K):
+                for j in range(K):
+                    log_xi_ij = (
+                        alpha[t, i]
+                        + log_P[i, j]
+                        + obs_log[t + 1, j]
+                        + beta[t + 1, j]
+                        - loglik
+                    )
+                    xi[t, i, j] = np.exp(log_xi_ij)
+            s = np.sum(xi[t])
+            if s > 0:
+                xi[t] /= s
+    else:
+        gamma = np.full((T, K), 1.0 / K, dtype=np.float64)
+
+    return {
+        "gamma": gamma,
+        "xi": xi,
+        "loglik": float(loglik) if np.isfinite(loglik) else -np.inf,
+    }
+
+
+def count_transitions_soft(xi: np.ndarray) -> np.ndarray:
+    """Sum soft transition probabilities across time steps into 4x4 count matrix.
+
+    PLAN-23 §6.6.2 + WORKFLOW §2.8 implementation.
+
+    Args:
+        xi: Array of shape (T-1, 4, 4) from smoothed_role_posteriors.
+
+    Returns:
+        4x4 float64 NumPy array of soft transition counts.
+    """
+    xi_arr = np.asarray(xi, dtype=np.float64)
+    if xi_arr.ndim == 3 and xi_arr.shape[0] > 0:
+        return np.sum(xi_arr, axis=0, dtype=np.float64)
+    return np.zeros((len(ROLES), len(ROLES)), dtype=np.float64)
+
+

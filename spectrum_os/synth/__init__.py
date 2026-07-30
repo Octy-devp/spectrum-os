@@ -20,6 +20,13 @@ from .expand import (
     expand_plan,
     register_synthetic_sector,
 )
+from .rate_gate import (
+    RATE_GATE_SYSTEM_PROMPT_V1,
+    RateGateContractError,
+    assert_rate_gate_contract,
+    mechanical_confidence_rate_gate,
+    rate_gate,
+)
 
 __all__ = [
     "ANCHORS_SYSTEM_PROMPT_V25",
@@ -31,4 +38,9 @@ __all__ = [
     "expand_pair",
     "expand_plan",
     "register_synthetic_sector",
+    "RATE_GATE_SYSTEM_PROMPT_V1",
+    "RateGateContractError",
+    "assert_rate_gate_contract",
+    "mechanical_confidence_rate_gate",
+    "rate_gate",
 ]
