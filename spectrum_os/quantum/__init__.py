@@ -33,6 +33,17 @@ from .quarantine import (
     mechanical_filter,
     quarantine_check,
 )
+from .markov import (
+    absorption_probabilities,
+    count_transitions,
+    entropy_rate,
+    estimate_rate_matrix,
+    hitting_times,
+    sample_rate_matrix,
+    spectral_gap,
+    stationary_distribution,
+    summarize_samples,
+)
 
 # Re-export ANCHORS_SYSTEM_PROMPT_V25 from synth layer — it is conceptually
 # a synth-layer constant (LLM prompt), but the quantum UX surface (osc.quantum)
@@ -63,4 +74,14 @@ __all__ = [
     "mechanical_filter",
     "inspector_gate",
     "quarantine_check",
+    "count_transitions",
+    "estimate_rate_matrix",
+    "sample_rate_matrix",
+    "hitting_times",
+    "absorption_probabilities",
+    "stationary_distribution",
+    "entropy_rate",
+    "spectral_gap",
+    "summarize_samples",
 ]
+
