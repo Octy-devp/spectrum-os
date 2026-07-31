@@ -50,7 +50,7 @@ ANCHORS_1914_1918 = {
 }
 
 
-def dry_run_gate(gate_input: dict) -> dict:
+def dry_run_gate(gate_input: dict, **_kwargs: Any) -> dict:
     """Mock gate function for dry-run ensemble simulation."""
     t = gate_input.get("state_vector", {}).get("t", 0)
     tags = ["july crisis", "crisis management"]
@@ -165,6 +165,7 @@ def run_sarajevo_pilot(
     horizon: int = 24,
     seed: int = 42,
     out_path: str = "data/stage3_sarajevo_report.json",
+    n_samples: int = 3,
 ) -> dict:
     """Run full Sarajevo 1914 pilot pipeline."""
     # 1. Register sources & load via registry
@@ -198,6 +199,8 @@ def run_sarajevo_pilot(
         gate_every=4,
         max_gates=12,
         seed=seed,
+        unified=True,
+        n_samples=n_samples,
     )
 
     # 6. Standing wave decomposition
@@ -266,6 +269,7 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="Run with live LLM gate")
     parser.add_argument("--branches", type=int, default=10, help="Number of branches")
     parser.add_argument("--horizon", type=int, default=24, help="Horizon steps")
+    parser.add_argument("--n-samples", type=int, default=3, help="Number of candidate samples")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--out", type=str, default="data/stage3_sarajevo_report.json", help="Output path")
 
@@ -276,6 +280,7 @@ def main() -> int:
         horizon=args.horizon,
         seed=args.seed,
         out_path=args.out,
+        n_samples=args.n_samples,
     )
     return 0
 
