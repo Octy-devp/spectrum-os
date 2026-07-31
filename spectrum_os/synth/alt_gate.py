@@ -181,6 +181,10 @@ def assert_alt_gate_contract(output_data: dict) -> None:
         label = cand["label"]
         if not isinstance(label, str):
             raise AltGateContractError(f"candidate[{i}].label must be str, got {label!r}")
+        if label.strip() in PROMPT_EXAMPLE_LABELS:
+            raise AltGateContractError(
+                f"example echo: candidate[{i}].label matches prompt example label '{label.strip()}'"
+            )
         if len(label) > 20:
             raise AltGateContractError(f"candidate[{i}].label exceeds length limit (<=20): {label!r}")
         clean, matches = mechanical_filter(label)
@@ -191,6 +195,10 @@ def assert_alt_gate_contract(output_data: dict) -> None:
         if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
             raise AltGateContractError(f"candidate[{i}].concept_tags must be list of str, got {tags!r}")
         for t in tags:
+            if t.strip() in PROMPT_EXAMPLE_LABELS:
+                raise AltGateContractError(
+                    f"example echo: candidate[{i}].concept_tag matches prompt example label '{t.strip()}'"
+                )
             clean, matches = mechanical_filter(t)
             if not clean:
                 raise AltGateContractError(f"candidate[{i}].concept_tag '{t}' failed mechanical filter: {matches}")
@@ -265,7 +273,7 @@ def _build_alt_gate_prompt(input_data: dict) -> str:
     return json.dumps(input_data, indent=2, ensure_ascii=False)
 
 
-def _write_alt_gate_state_log(result: dict) -> None:
+def _write_alt_gate_state_log(result: dict, observations: list[str] | None = None) -> None:
     """Append a gate-call record to the verify state_log."""
     called_at = result["generated_by"]["called_at"]
     entry = {
@@ -278,6 +286,8 @@ def _write_alt_gate_state_log(result: dict) -> None:
         "n_candidates": len(result.get("candidates", [])),
         "confidence_score": result["confidence"]["score"],
     }
+    if observations:
+        entry["observation"] = observations if len(observations) > 1 else observations[0]
     _verify._state_log.append(entry)
     if _verify._log_path is not None:
         _verify._append_jsonl(_verify._log_path, entry)
@@ -285,6 +295,7 @@ def _write_alt_gate_state_log(result: dict) -> None:
 
 from spectrum_os.synth.gate_prompts import (
     GATE_SYSTEM_PROMPT_UNIFIED,
+    PROMPT_EXAMPLE_LABELS,
     ROUTING_LEAK_KEYWORDS,
     check_routing_leak_or_schema,
 )
@@ -300,6 +311,7 @@ def alt_gate_generate(
     n_samples: int = 3,
     max_tokens: int = 2048,
     unified: bool = False,
+    reporter: bool = False,
     **_kwargs: Any,
 ) -> dict:
     """Stage 1: Candidate Generation for LLM Alternative Gate."""
@@ -310,51 +322,139 @@ def alt_gate_generate(
     if not api_key:
         raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
 
-    base_prompt = _build_alt_gate_prompt(input_data)
-    user_prompt = f"{base_prompt}\n[task:generate]" if unified else base_prompt
-    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if unified else ALT_GATE_SYSTEM_PROMPT_V1
+    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if (unified or reporter) else ALT_GATE_SYSTEM_PROMPT_V1
     existing_labels_set = set(input_data.get("existing_labels", []))
 
     candidate_samples: list[list[dict]] = []
     walks: list[dict] = []
     evidences: list[list[str]] = []
+    observations: list[str] = []
 
     for _ in range(n_samples):
-        parsed = None
-        for attempt in range(2):
-            raw = call_api_fn(
-                user_prompt,
+        if reporter:
+            # --- Two-Stage Reporter Generation Path: observe -> compress ---
+            # 1. Observe call (hot temp 0.6–0.7, prose output <= 150 words, NO format examples)
+            obs_user_prompt = f"{_build_alt_gate_prompt(input_data)}\n[task:observe]"
+            obs_raw = call_api_fn(
+                obs_user_prompt,
                 api_key,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 system_message=sys_prompt,
-                response_format={"type": "json_object"},
                 thinking=False,
             )
-            try:
-                if unified:
+            leak_err = check_routing_leak_or_schema(obs_raw, None, "observe")
+            if leak_err:
+                raise AltGateContractError(leak_err)
+            observation_text = obs_raw.strip()
+            observations.append(observation_text)
+
+            # 2. Compress call (cool temp 0.0–0.25, distills observation prose into contract structure)
+            compress_input = {
+                "observation": observation_text,
+                "state_vector": input_data.get("state_vector"),
+                "situation": input_data.get("situation"),
+            }
+            comp_user_prompt = f"{_build_alt_gate_prompt(compress_input)}\n[task:compress]"
+
+            parsed = None
+            for attempt in range(2):
+                curr_temp = min(0.25, 0.1 + attempt * 0.1)
+                raw = call_api_fn(
+                    comp_user_prompt,
+                    api_key,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=curr_temp,
+                    system_message=sys_prompt,
+                    response_format={"type": "json_object"},
+                    thinking=False,
+                )
+                try:
                     for lk in ROUTING_LEAK_KEYWORDS:
                         if lk in raw:
                             raise AltGateContractError(f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'")
-                candidate_parsed = _parse_json_loose(raw)
-                if unified:
-                    leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "generate")
+                    candidate_parsed = _parse_json_loose(raw)
+                    leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "compress")
                     if leak_err:
                         raise AltGateContractError(leak_err)
-                assert_alt_gate_contract(candidate_parsed)
-                parsed = candidate_parsed
-                break
-            except Exception as e:
-                if attempt == 0:
-                    continue
-                if isinstance(e, AltGateContractError):
-                    raise e
-                raise AltGateContractError(str(e)) from e
+                    assert_alt_gate_contract(candidate_parsed)
+                    parsed = candidate_parsed
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        continue
+                    if isinstance(e, AltGateContractError):
+                        if "example echo" in str(e) and 'candidate_parsed' in locals() and isinstance(candidate_parsed, dict):
+                            clean_cands = []
+                            for cand in candidate_parsed.get("candidates", []):
+                                lbl = cand.get("label", "").strip()
+                                c_tags = [t.strip() for t in cand.get("concept_tags", [])]
+                                if lbl in PROMPT_EXAMPLE_LABELS or any(t in PROMPT_EXAMPLE_LABELS for t in c_tags):
+                                    continue
+                                clean_cands.append(cand)
+                            candidate_parsed["candidates"] = clean_cands
+                            parsed = candidate_parsed
+                            break
+                        raise e
+                    raise AltGateContractError(str(e)) from e
 
-        candidate_samples.append(parsed["candidates"])
-        walks.append(parsed["walk"])
-        evidences.append(parsed["evidence"])
+            candidate_samples.append(parsed["candidates"])
+            walks.append(parsed["walk"])
+            evidences.append(parsed["evidence"])
+
+        else:
+            # --- Legacy Direct Path ---
+            base_prompt = _build_alt_gate_prompt(input_data)
+            user_prompt = f"{base_prompt}\n[task:generate]" if unified else base_prompt
+            parsed = None
+            for attempt in range(2):
+                curr_temp = temperature + (0.1 if attempt == 1 else 0.0)
+                raw = call_api_fn(
+                    user_prompt,
+                    api_key,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=curr_temp,
+                    system_message=sys_prompt,
+                    response_format={"type": "json_object"},
+                    thinking=False,
+                )
+                try:
+                    if unified:
+                        for lk in ROUTING_LEAK_KEYWORDS:
+                            if lk in raw:
+                                raise AltGateContractError(f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'")
+                    candidate_parsed = _parse_json_loose(raw)
+                    if unified:
+                        leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "generate")
+                        if leak_err:
+                            raise AltGateContractError(leak_err)
+                    assert_alt_gate_contract(candidate_parsed)
+                    parsed = candidate_parsed
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        continue
+                    if isinstance(e, AltGateContractError):
+                        if "example echo" in str(e) and 'candidate_parsed' in locals() and isinstance(candidate_parsed, dict):
+                            clean_cands = []
+                            for cand in candidate_parsed.get("candidates", []):
+                                lbl = cand.get("label", "").strip()
+                                c_tags = [t.strip() for t in cand.get("concept_tags", [])]
+                                if lbl in PROMPT_EXAMPLE_LABELS or any(t in PROMPT_EXAMPLE_LABELS for t in c_tags):
+                                    continue
+                                clean_cands.append(cand)
+                            candidate_parsed["candidates"] = clean_cands
+                            parsed = candidate_parsed
+                            break
+                        raise e
+                    raise AltGateContractError(str(e)) from e
+
+            candidate_samples.append(parsed["candidates"])
+            walks.append(parsed["walk"])
+            evidences.append(parsed["evidence"])
 
     # Aggregate & mechanically deduplicate candidates
     seen_labels: set[str] = set()
@@ -376,7 +476,7 @@ def alt_gate_generate(
 
     confidence = mechanical_confidence_alt_gate(candidate_samples)
 
-    return {
+    res = {
         "walks": walks,
         "evidences": evidences,
         "aggregated_candidates": aggregated_candidates,
@@ -385,6 +485,9 @@ def alt_gate_generate(
         "n_samples": n_samples,
         "temperature": temperature,
     }
+    if reporter and observations:
+        res["observations"] = observations
+    return res
 
 
 def alt_gate_adversary(
@@ -415,8 +518,8 @@ def alt_gate_adversary(
         "candidate_tags": [c["concept_tags"] for c in aggregated_candidates],
     }
     base_adv_prompt = json.dumps(adv_input, ensure_ascii=False)
-    adv_prompt = f"{base_adv_prompt}\n[task:adversary]" if unified else base_adv_prompt
-    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if unified else ADVERSARY_SYSTEM_PROMPT_V1
+    adv_prompt = f"{base_adv_prompt}\n[task:adversary]" if (unified or "observations" in stage1_res) else base_adv_prompt
+    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if (unified or "observations" in stage1_res) else ADVERSARY_SYSTEM_PROMPT_V1
 
     adv_parsed = None
     for attempt in range(2):
@@ -431,12 +534,12 @@ def alt_gate_adversary(
             thinking=False,
         )
         try:
-            if unified:
+            if unified or "observations" in stage1_res:
                 for lk in ROUTING_LEAK_KEYWORDS:
                     if lk in adv_raw:
                         raise AltGateContractError(f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'")
             candidate_adv = _parse_json_loose(adv_raw)
-            if unified:
+            if unified or "observations" in stage1_res:
                 leak_err = check_routing_leak_or_schema(adv_raw, candidate_adv, "adversary")
                 if leak_err:
                     raise AltGateContractError(leak_err)
@@ -480,7 +583,7 @@ def alt_gate_adversary(
         },
     }
 
-    _write_alt_gate_state_log(result)
+    _write_alt_gate_state_log(result, observations=stage1_res.get("observations"))
     return result
 
 
@@ -494,6 +597,8 @@ def alt_gate(
     n_samples: int = 3,
     max_tokens: int = 2048,
     unified: bool = False,
+    reporter: bool = False,
+    **kwargs: Any,
 ) -> dict:
     """LLM Alternative Generation Gate with H schema + 2-Stage Adversarial Call.
 
@@ -507,6 +612,7 @@ def alt_gate(
         n_samples: Number of sampling calls for generation (default 3).
         max_tokens: Token limit for completion.
         unified: If True, use GATE_SYSTEM_PROMPT_UNIFIED with [task:X] tags.
+        reporter: If True, use two-stage reporter generation path (observe -> compress).
 
     Returns:
         Dict containing walk, candidates, evidence, confidence, generated_by provenance.
@@ -520,6 +626,8 @@ def alt_gate(
         n_samples=n_samples,
         max_tokens=max_tokens,
         unified=unified,
+        reporter=reporter,
+        **kwargs,
     )
     return alt_gate_adversary(
         stage1_res,
@@ -528,9 +636,11 @@ def alt_gate(
         model=model,
         max_tokens=max_tokens,
         unified=unified,
+        **kwargs,
     )
 
 
 alt_gate.stage1 = alt_gate_generate
 alt_gate.stage2 = alt_gate_adversary
+
 

@@ -14,6 +14,18 @@ ROUTING_LEAK_KEYWORDS = [
     "When called with [task:",
 ]
 
+PROMPT_EXAMPLE_LABELS: set[str] = {
+    "物資替換點",
+    "物資網絡",
+    "替代通道",
+    "補給線斷裂",
+    "動員法令未完成",
+    "邊界物資替換機制",
+    "物資流動滯後",
+    "鐵路延遲3日",
+    "角色已持續14月",
+}
+
 GATE_SYSTEM_PROMPT_UNIFIED = (
     "你是這個歷史處境的活數學——你分配的每個強度與生成的每個標籤決定哪個可能性繼續活著。\n"
     "\n"
@@ -79,6 +91,35 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     "- candidates 的 label ≤ 12 字，concept_tags 為短標籤陣列。\n"
     "- candidates 的鍵只有 label、concept_tags、provenance_hint、novel。\n"
     "\n"
+    "When called with [task:observe]:\n"
+    "你是此刻處境的現場觀察者。讀完這份處境（向量、質地、軌跡），告訴我：你看到了什麼？哪些可能性還活著？什麼在堵死它們？\n"
+    "請輸出不超過 150 字的現場觀察散文。回答必須緊扣傳入處境的物質事實與向量。\n"
+    "\n"
+    "When called with [task:compress]:\n"
+    "此刻你是觀察的蒸餾者與結構化壓縮器。\n"
+    "把傳入的現場觀察散文蒸餾為結構標籤：每個標籤必須在觀察原文中有出處。\n"
+    "Format:\n"
+    "{\n"
+    '  "walk": {\n'
+    '    "crisis": "補給線斷裂",\n'
+    '    "lag": "動員法令未完成",\n'
+    '    "alive_space": "邊界物資替換機制"\n'
+    "  },\n"
+    '  "candidates": [\n'
+    "    {\n"
+    '      "label": "物資替換點",\n'
+    '      "concept_tags": ["物資網絡", "替代通道"],\n'
+    '      "provenance_hint": "novel",\n'
+    '      "novel": true\n'
+    "    }\n"
+    "  ],\n"
+    '  "evidence": ["物資流動滯後"]\n'
+    "}\n"
+    "細則：\n"
+    "- walk 的每個標籤 ≤ 20 字，只裝觀察原文中的處境短語。\n"
+    "- candidates 的 label ≤ 12 字，concept_tags 為短標籤陣列。\n"
+    "- candidates 的鍵只有 label、concept_tags、provenance_hint、novel。\n"
+    "\n"
     "When called with [task:adversary]:\n"
     "此刻你不是這個處境的活數學——你來自一條不同的歷史線，是這些候選的敵對審查者。\n"
     "你的任務只有一個：找出這些候選標籤偷渡了哪個既定結局。\n"
@@ -105,17 +146,22 @@ def check_routing_leak_or_schema(
         if lk in raw_text:
             return f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'"
 
+    if expected_task == "observe":
+        # Observe task returns raw prose text (string), not JSON
+        return None
+
     if not isinstance(parsed_json, dict):
         return f"SCHEMA_MISMATCH: expected dict for task '{expected_task}', got {type(parsed_json).__name__}"
 
     if expected_task == "rate":
         if "rates" not in parsed_json or "candidates" in parsed_json or "flagged_labels" in parsed_json:
             return f"SCHEMA_MISMATCH: task [task:rate] received incorrect schema (keys: {list(parsed_json.keys())})"
-    elif expected_task == "generate":
+    elif expected_task in ("generate", "compress"):
         if "candidates" not in parsed_json or "rates" in parsed_json or "flagged_labels" in parsed_json:
-            return f"SCHEMA_MISMATCH: task [task:generate] received incorrect schema (keys: {list(parsed_json.keys())})"
+            return f"SCHEMA_MISMATCH: task [task:{expected_task}] received incorrect schema (keys: {list(parsed_json.keys())})"
     elif expected_task == "adversary":
         if "flagged_labels" not in parsed_json or "candidates" in parsed_json or "rates" in parsed_json:
             return f"SCHEMA_MISMATCH: task [task:adversary] received incorrect schema (keys: {list(parsed_json.keys())})"
 
     return None
+

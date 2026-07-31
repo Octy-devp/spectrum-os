@@ -30,6 +30,7 @@ def run_ensemble(
     gate_every: int = 4,
     max_gates: int = 12,
     seed: int = 42,
+    situation: dict | None = None,
     **gate_kwargs: Any,
 ) -> dict:
     """Run pay-as-you-go branch ensemble simulation with Batch-by-Phase scheduling.
@@ -52,6 +53,7 @@ def run_ensemble(
         gate_every: Step interval for calling gate_fn (default 4).
         max_gates: Maximum gate calls per branch (default 12).
         seed: Random seed for reproducible trajectory sampling.
+        situation: Optional situation context payload dict containing vector_6d, local_texture, digest.
         **gate_kwargs: Additional keyword arguments passed to gate_fn.
 
     Returns:
@@ -172,6 +174,13 @@ def run_ensemble(
     for b_idx, gps in branch_gate_map.items():
         accumulated_tags: list[str] = []
         for gp in gps:
+            if situation is not None:
+                sit_payload = dict(situation)
+                sit_payload["t"] = gp["t"]
+                sit_payload["thread_history"] = gp["thread_history"]
+            else:
+                sit_payload = None
+
             gate_input = {
                 "state_vector": {
                     "current_role": gp["current_role"],
@@ -180,6 +189,7 @@ def run_ensemble(
                 },
                 "thread_history": gp["thread_history"],
                 "existing_labels": accumulated_tags[:],
+                "situation": sit_payload,
             }
             if has_stages:
                 stage1_res = gate_fn.stage1(gate_input, **gate_kwargs)

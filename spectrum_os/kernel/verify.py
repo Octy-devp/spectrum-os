@@ -204,14 +204,22 @@ def init_log(path: str | Path | None = "data/state_log.jsonl") -> Path | None:
     # to file-backed mode.
     if _log_path is None and _state_log:
         for entry in _state_log:
-            _append_jsonl(p, {
+            # Preserve the FULL entry: gate records carry custom keys
+            # (gate_type / observation / rates / confidence_score …).
+            # Cherry-picking core keys here silently destroyed them
+            # (S4 reporter observations were lost this way).
+            full = {
                 "ts": entry.get("ts", ""),
                 "prediction_id": entry.get("prediction_id", ""),
                 "mae": entry.get("mae", 0.0),
                 "mape": entry.get("mape", 0.0),
                 "verdict": entry.get("verdict", ""),
                 "re_calibrate": entry.get("re_calibrate", False),
-            })
+            }
+            for k, v in entry.items():
+                if k not in full:
+                    full[k] = v
+            _append_jsonl(p, full)
     _log_path = p
     return p
 

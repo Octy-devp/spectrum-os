@@ -36,24 +36,45 @@ from feeds.ecc_feeds import register_ecc_sources
 
 
 ANCHORS_1914_1918 = {
-    "austrian ultimatum to serbia (1914-07)": ["ultimatum"],
-    "war declarations (1914-08)": ["declaration of war", "declares war", "declared war", "war on"],
-    "german invasion of belgium (1914-08)": ["belgium", "liège", "liege"],
-    "tannenberg (1914-08)": ["tannenberg"],
-    "first marne (1914-09)": ["marne"],
-    "trench stalemate (1915)": ["trench", "stalemate"],
-    "verdun (1916)": ["verdun"],
-    "somme (1916)": ["somme"],
-    "russian revolution (1917)": ["revolution", "february", "october", "tsar"],
-    "us entry (1917)": ["united states", "america", "u.s."],
-    "armistice (1918-11)": ["armistice"],
+    "austrian ultimatum to serbia (1914-07)": ["ultimatum", "通牒"],
+    "war declarations (1914-08)": ["declaration of war", "declares war", "declared war", "war on", "宣戰"],
+    "german invasion of belgium (1914-08)": ["belgium", "liège", "liege", "比利時"],
+    "tannenberg (1914-08)": ["tannenberg", "坦能堡"],
+    "first marne (1914-09)": ["marne", "馬恩河"],
+    "trench stalemate (1915)": ["trench", "stalemate", "壕溝", "對峙"],
+    "verdun (1916)": ["verdun", "凡爾登"],
+    "somme (1916)": ["somme", "索姆河"],
+    "russian revolution (1917)": ["revolution", "february", "october", "tsar", "革命", "沙皇"],
+    "us entry (1917)": ["united states", "america", "u.s.", "美國", "美軍"],
+    "armistice (1918-11)": ["armistice", "停戰"],
 }
+
+SARAJEVO_1914_LOCAL_TEXTURE = {
+    "ultimatum_deadline_hours": 48,
+    "mobilization_timetable_days": {
+        "austria_hungary": 16,
+        "russia": 14,
+        "germany": 3,
+        "france": 10,
+    },
+    "railway_capacity_trains_per_day": 360,
+    "belgrade_border_distance_km": 5,
+    "provenance": "1914 July Crisis historical logistics and diplomatic parameters (CMH & M-E-G baseline)",
+}
+
+SARAJEVO_1914_DIGEST = "July 1914 Sarajevo assassination triggers 48-hour Austrian ultimatum to Serbia; rapid mobilization timetables constraint European diplomatic maneuvers."
 
 
 def dry_run_gate(gate_input: dict, **_kwargs: Any) -> dict:
     """Mock gate function for dry-run ensemble simulation."""
     t = gate_input.get("state_vector", {}).get("t", 0)
     tags = ["july crisis", "crisis management"]
+
+    if gate_input.get("situation") is not None:
+        tags.append("situation_received")
+        if "local_texture" in gate_input["situation"]:
+            tags.append("texture_attached")
+
     if t <= 4:
         tags.extend(["ultimatum", "austrian ultimatum"])
     elif t <= 8:
@@ -102,6 +123,16 @@ def build_sarajevo_initial_vector() -> dict:
             "dca_role": "crisis",
             "6d_vector_repr": repr(vec),
         },
+    }
+
+
+def build_sarajevo_situation() -> dict:
+    """Construct 1914-07 situation payload for Sarajevo pilot."""
+    init_vec = build_sarajevo_initial_vector()
+    return {
+        "vector_6d": init_vec["vector"],
+        "local_texture": SARAJEVO_1914_LOCAL_TEXTURE,
+        "digest": SARAJEVO_1914_DIGEST,
     }
 
 
@@ -161,6 +192,7 @@ def evaluate_anchor_comparison(branches: list[dict]) -> dict:
 
 def run_sarajevo_pilot(
     live: bool = False,
+    reporter: bool = False,
     n_branches: int = 10,
     horizon: int = 24,
     seed: int = 42,
@@ -173,8 +205,9 @@ def run_sarajevo_pilot(
     substrate = sources.load_source("ecc-knowledge-edges")
     corpus = sources.load_source("ecc-clad-books")
 
-    # 2. Initial state vector
+    # 2. Initial state vector & situation payload
     initial_vec_data = build_sarajevo_initial_vector()
+    situation = build_sarajevo_situation()
 
     # 3. Action injection
     action = {"t": 1, "reweight": {"role": "alternative", "factor": 2.0}}
@@ -199,7 +232,9 @@ def run_sarajevo_pilot(
         gate_every=4,
         max_gates=12,
         seed=seed,
+        situation=situation,
         unified=True,
+        reporter=reporter,
         n_samples=n_samples,
     )
 
@@ -223,7 +258,9 @@ def run_sarajevo_pilot(
     report = {
         "title": "Stage 3 Sarajevo 1914 Counterfactual Branch Pilot Report",
         "mode": "live" if live else "dry-run",
+        "reporter": reporter,
         "initial_vector": initial_vec_data,
+        "situation_payload": situation,
         "action_injection": action,
         "substrate_info": {
             "source_id": substrate.source_id,
@@ -239,6 +276,13 @@ def run_sarajevo_pilot(
             "horizon": ensemble_res["meta"]["horizon"],
             "total_gate_calls": ensemble_res["meta"]["total_gate_calls"],
             "seed": ensemble_res["meta"]["seed"],
+        },
+        # Per-branch tag inventory — makes anchor hits auditable from the artifact
+        "branch_tags": {
+            str(b.get("branch_id", i)): sorted(
+                {t for tags in b.get("tags_per_step", {}).values() for t in tags}
+            )
+            for i, b in enumerate(ensemble_res["branches"])
         },
         "standing_wave": sw,
         "anchor_comparison": anchor_comp,
@@ -267,6 +311,7 @@ def run_sarajevo_pilot(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 3 Sarajevo 1914 Pilot")
     parser.add_argument("--live", action="store_true", help="Run with live LLM gate")
+    parser.add_argument("--reporter", action="store_true", help="Run with reporter mode")
     parser.add_argument("--branches", type=int, default=10, help="Number of branches")
     parser.add_argument("--horizon", type=int, default=24, help="Horizon steps")
     parser.add_argument("--n-samples", type=int, default=3, help="Number of candidate samples")
@@ -276,6 +321,7 @@ def main() -> int:
     args = parser.parse_args()
     run_sarajevo_pilot(
         live=args.live,
+        reporter=args.reporter,
         n_branches=args.branches,
         horizon=args.horizon,
         seed=args.seed,
@@ -283,6 +329,7 @@ def main() -> int:
         n_samples=args.n_samples,
     )
     return 0
+
 
 
 if __name__ == "__main__":
