@@ -86,3 +86,257 @@ class TestEnsembleEngine:
         assert res["meta"]["total_gate_calls"] == 0
         for b in res["branches"]:
             assert b["tags_per_step"] == {}
+            assert b["accidents_by_step"] == {}
+
+
+class TestEnsembleResidualTrigger:
+    """N4: two-phase state switching (Mode A reflect <-> Mode B enumerate)."""
+
+    def _reflect_gate(self, input_data, **kwargs):
+        return {
+            "candidates": [
+                {
+                    "label": "reflected",
+                    "concept_tags": ["tag_reflect"],
+                    "provenance_hint": "novel",
+                    "novel": True,
+                }
+            ]
+        }
+
+    def _enumerate_gate(self, input_data, **kwargs):
+        return {
+            "accidents": [
+                {
+                    "pattern": "意外模式",
+                    "instances": ["實例一"],
+                    "domain": "政治",
+                    "source": "emergent",
+                    "usage": "expression",
+                    "grounding": "合理推測",
+                    "world_development": "導向的世界",
+                }
+            ]
+        }
+
+    def test_trigger_hit_switches_to_enumerate(self):
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=2,
+            horizon=8,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            residual_trigger=lambda t, context: True,
+            enumerate_gate_fn=enumer,
+        )
+
+        # horizon 8 -> gate points at t=3 only; 2 branches -> 2 enumerate calls
+        assert calls["enumerate"] == 2
+        assert calls["reflect"] == 0
+        assert res["meta"]["total_enumerate_calls"] == 2
+        for b in res["branches"]:
+            assert len(b["accidents_by_step"][3]) == 1
+            assert b["accidents_by_step"][3][0]["pattern"] == "意外模式"
+            # accidents never leak into tags_per_step
+            assert b["tags_per_step"][3] == []
+
+    def test_trigger_miss_keeps_reflect(self):
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=2,
+            horizon=8,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            residual_trigger=lambda t, context: False,
+            enumerate_gate_fn=enumer,
+        )
+
+        assert calls["reflect"] == 2
+        assert calls["enumerate"] == 0
+        assert res["meta"]["total_enumerate_calls"] == 0
+        for b in res["branches"]:
+            assert b["accidents_by_step"] == {}
+            assert b["tags_per_step"][3] == ["tag_reflect"]
+
+    def test_mixed_trigger(self):
+        # horizon 12, gate_every 4 -> gate points at t=3 and t=7; trigger only at t=3
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=1,
+            horizon=12,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            residual_trigger=lambda t, context: t == 3,
+            enumerate_gate_fn=enumer,
+        )
+
+        assert calls["enumerate"] == 1
+        assert calls["reflect"] == 1
+        b = res["branches"][0]
+        assert list(b["accidents_by_step"].keys()) == [3]
+        assert b["tags_per_step"][3] == []
+        assert b["tags_per_step"][7] == ["tag_reflect"]
+
+    def test_residual_trigger_none_unchanged(self):
+        # Backward compatibility: without residual_trigger the engine never
+        # enumerates and accidents_by_step stays empty.
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=2,
+            horizon=8,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            enumerate_gate_fn=enumer,
+        )
+
+        assert calls["reflect"] == 2
+        assert calls["enumerate"] == 0
+        assert res["meta"]["total_enumerate_calls"] == 0
+        for b in res["branches"]:
+            assert b["accidents_by_step"] == {}
+            assert b["tags_per_step"][3] == ["tag_reflect"]
+
+    def test_residual_table_mapping_auto_wrapped(self):
+        # A residual table Mapping passed as residual_trigger is auto-wrapped;
+        # gate_input is the trigger context (t keys match int steps directly).
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=1,
+            horizon=8,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            residual_trigger={3: {"criteria": ["saturation"]}},
+            enumerate_gate_fn=enumer,
+        )
+
+        assert calls["enumerate"] == 1
+        assert calls["reflect"] == 0
+        b = res["branches"][0]
+        assert 3 in b["accidents_by_step"]
+
+    def test_residual_table_mapping_with_key_fn_hits_date_key(self):
+        # A date-keyed residual table Mapping requires residual_key_fn to map
+        # the gate point to the date carried in the situation payload; with it,
+        # the date-keyed table hits and Mode B switches on.
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=1,
+            horizon=8,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            situation={"date": "1914-08-02"},
+            residual_trigger={"1914-08-02": {"criteria": ["saturation"]}},
+            residual_key_fn=lambda t, ctx: ctx["situation"].get("date"),
+            enumerate_gate_fn=enumer,
+        )
+
+        assert calls["enumerate"] == 1
+        assert calls["reflect"] == 0
+        assert res["meta"]["total_enumerate_calls"] == 1
+        b = res["branches"][0]
+        assert 3 in b["accidents_by_step"]
+
+    def test_residual_table_mapping_without_key_fn_date_key_misses(self):
+        # Guard against the silent-death regression: a date-keyed Mapping
+        # WITHOUT residual_key_fn must NOT enumerate (identity int-step lookup
+        # never matches the date key), so Mode B stays off. This is documented
+        # behaviour — date-keyed tables must always supply residual_key_fn.
+        calls = {"reflect": 0, "enumerate": 0}
+
+        def reflect(input_data, **kwargs):
+            calls["reflect"] += 1
+            return self._reflect_gate(input_data, **kwargs)
+
+        def enumer(input_data, **kwargs):
+            calls["enumerate"] += 1
+            return self._enumerate_gate(input_data, **kwargs)
+
+        res = run_ensemble(
+            "crisis",
+            n_branches=1,
+            horizon=8,
+            gate_fn=reflect,
+            gate_every=4,
+            max_gates=2,
+            seed=42,
+            situation={"date": "1914-08-02"},
+            residual_trigger={"1914-08-02": {"criteria": ["saturation"]}},
+            enumerate_gate_fn=enumer,
+        )
+
+        assert calls["enumerate"] == 0
+        assert calls["reflect"] == 1
+        assert res["meta"]["total_enumerate_calls"] == 0
+        assert res["branches"][0]["accidents_by_step"] == {}

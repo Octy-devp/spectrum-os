@@ -9,7 +9,7 @@ PLAN-23 §5 + §6.6 implementation:
 
 from __future__ import annotations
 
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, Mapping, TYPE_CHECKING
 
 import numpy as np
 
@@ -31,6 +31,9 @@ def run_ensemble(
     max_gates: int = 12,
     seed: int = 42,
     situation: dict | None = None,
+    residual_trigger: Callable | Mapping | None = None,
+    residual_key_fn: Callable | None = None,
+    enumerate_gate_fn: Callable | None = None,
     **gate_kwargs: Any,
 ) -> dict:
     """Run pay-as-you-go branch ensemble simulation with Batch-by-Phase scheduling.
@@ -54,6 +57,27 @@ def run_ensemble(
         max_gates: Maximum gate calls per branch (default 12).
         seed: Random seed for reproducible trajectory sampling.
         situation: Optional situation context payload dict containing vector_6d, local_texture, digest.
+        residual_trigger: Optional Mode-B trigger. Either a callable
+            ``(t, context) -> bool`` (context is the gate_input dict) or a
+            residual table Mapping (auto-wrapped via
+            ``residual_trigger.make_residual_trigger`` with
+            ``key_fn=residual_key_fn``). When it returns True at a gate point,
+            the engine switches to the enumerate path (Mode B — spectrum
+            failure) instead of the reflect path. None (default) keeps the
+            pre-N4 behaviour exactly.
+        residual_key_fn: Optional key mapping for a Mapping ``residual_trigger``
+            — ``(t, gate_input) -> lookup key``, passed through to
+            ``make_residual_trigger``. ⚠️ A date-keyed table WITHOUT it is
+            silently dead: the identity int-step lookup never matches
+            ``"YYYY-MM-DD"`` keys, so Mode B stays off with no error. For a
+            date-keyed table whose date lives in the situation payload, use
+            ``residual_key_fn=lambda t, ctx: ctx["situation"].get("date")``.
+            Ignored when ``residual_trigger`` is already a callable.
+        enumerate_gate_fn: Mode-B gate called at triggered gate points.
+            Defaults to ``alt_gate_enumerate``. It returns
+            ``{"accidents": [...]}`` (NOT ``{"candidates": [...]}``) — results
+            are recorded in each branch's ``accidents_by_step`` and never flow
+            into ``tags_per_step`` / accumulated candidate tags (F10).
         **gate_kwargs: Additional keyword arguments passed to gate_fn.
 
     Returns:
@@ -147,10 +171,26 @@ def run_ensemble(
                 "roles": branch_roles,
                 "interventions": interventions,
                 "tags_per_step": {},
+                "accidents_by_step": {},
             }
         )
 
     total_gate_calls = len(gate_points)
+
+    # --- N4 (Mode B) trigger setup ---
+    # residual_trigger accepts either a callable ``(t, context) -> bool`` or a
+    # residual table Mapping (auto-wrapped). enumerate_gate_fn defaults to the
+    # historical-accident enumeration gate (alt_gate_enumerate).
+    if isinstance(residual_trigger, Mapping):
+        from spectrum_os.synth.residual_trigger import make_residual_trigger
+
+        residual_trigger = make_residual_trigger(
+            residual_trigger, key_fn=residual_key_fn
+        )
+    if enumerate_gate_fn is None:
+        from spectrum_os.synth.alt_gate import alt_gate_enumerate
+
+        enumerate_gate_fn = alt_gate_enumerate
 
     if gate_fn is None or not gate_points:
         return {
@@ -159,6 +199,7 @@ def run_ensemble(
                 "n_branches": n_branches,
                 "horizon": horizon,
                 "total_gate_calls": 0,
+                "total_enumerate_calls": 0,
                 "seed": seed,
             },
         }
@@ -170,6 +211,8 @@ def run_ensemble(
     branch_gate_map: dict[int, list[dict]] = {}
     for gp in gate_points:
         branch_gate_map.setdefault(gp["branch_id"], []).append(gp)
+
+    total_enumerate_calls = 0
 
     for b_idx, gps in branch_gate_map.items():
         accumulated_tags: list[str] = []
@@ -191,6 +234,25 @@ def run_ensemble(
                 "existing_labels": accumulated_tags[:],
                 "situation": sit_payload,
             }
+
+            # --- N4: two-phase state switching ---
+            # Subcritical (trigger False) -> Mode A reflect path (gate_fn /
+            # stage1-stage2). Critical (trigger True) -> Mode B enumerate path:
+            # the enumerate gate is called DIRECTLY (no stage1/stage2) and its
+            # ``accidents`` are stored separately in ``accidents_by_step`` —
+            # never merged into accumulated tags (F10).
+            use_enumerate = bool(
+                residual_trigger is not None and residual_trigger(gp["t"], gate_input)
+            )
+            if use_enumerate:
+                gp["mode"] = "enumerate"
+                enum_res = enumerate_gate_fn(gate_input, **gate_kwargs)
+                gp["enumerate_res"] = enum_res
+                gp["n_accidents"] = len(enum_res.get("accidents", []))
+                total_enumerate_calls += 1
+                continue
+
+            gp["mode"] = "reflect"
             if has_stages:
                 stage1_res = gate_fn.stage1(gate_input, **gate_kwargs)
                 gp["stage1_res"] = stage1_res
@@ -210,6 +272,17 @@ def run_ensemble(
     for gp in gate_points:
         b_idx = gp["branch_id"]
         t = gp["t"]
+        if gp.get("mode") == "enumerate":
+            # Mode B points record accidents ONLY in ``accidents_by_step``.
+            # ``tags_per_step[t]`` is set to an empty list so the per-gate-point
+            # presence invariant holds without ever leaking accident data into
+            # tag logic.
+            branch_records[b_idx]["accidents_by_step"][t] = gp["enumerate_res"].get(
+                "accidents", []
+            )
+            branch_records[b_idx]["tags_per_step"][t] = []
+            continue
+
         if has_stages and "stage1_res" in gp:
             final_res = gate_fn.stage2(gp["stage1_res"], **gate_kwargs)
         else:
@@ -226,6 +299,7 @@ def run_ensemble(
             "n_branches": n_branches,
             "horizon": horizon,
             "total_gate_calls": total_gate_calls,
+            "total_enumerate_calls": total_enumerate_calls,
             "seed": seed,
         },
     }
