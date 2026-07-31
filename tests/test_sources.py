@@ -207,6 +207,13 @@ class TestCoreGeneralityMechanicalCheck:
             repo_root / "spectrum_os" / "sources.py",
             repo_root / "spectrum_os" / "kernel",
             repo_root / "spectrum_os" / "quantum",
+            repo_root / "spectrum_os" / "synth",
+            repo_root / "scripts" / "stage3_sarajevo_pilot.py",
+            repo_root / "scripts" / "stage3_universality_check.py",
+            repo_root / "tests" / "test_alt_gate.py",
+            repo_root / "tests" / "test_ensemble.py",
+            repo_root / "tests" / "test_standing_wave.py",
+            repo_root / "tests" / "test_stage3_pilot.py",
         ]
 
         forbidden_literals = ["/home/octy/projects/ECC", "index/"]

@@ -27,6 +27,15 @@ from .rate_gate import (
     mechanical_confidence_rate_gate,
     rate_gate,
 )
+from .alt_gate import (
+    ALT_GATE_SYSTEM_PROMPT_V1,
+    ADVERSARY_SYSTEM_PROMPT_V1,
+    AltGateContractError,
+    assert_alt_gate_contract,
+    mechanical_confidence_alt_gate,
+    alt_gate,
+)
+from .ensemble import run_ensemble
 
 __all__ = [
     "ANCHORS_SYSTEM_PROMPT_V25",
@@ -43,4 +52,12 @@ __all__ = [
     "assert_rate_gate_contract",
     "mechanical_confidence_rate_gate",
     "rate_gate",
+    "ALT_GATE_SYSTEM_PROMPT_V1",
+    "ADVERSARY_SYSTEM_PROMPT_V1",
+    "AltGateContractError",
+    "assert_alt_gate_contract",
+    "mechanical_confidence_alt_gate",
+    "alt_gate",
+    "run_ensemble",
 ]
+

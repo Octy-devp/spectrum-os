@@ -210,8 +210,27 @@ def _build_contract_object(spec: SourceSpec, raw_data: Any) -> Any:
             entries = raw_data
         else:
             entries = []
+        norm_entries = []
+        for e in entries:
+            if isinstance(e, dict):
+                ec = dict(e)
+                if "id" not in ec and "gene_id" in ec:
+                    ec["id"] = ec["gene_id"]
+                if "clad" not in ec:
+                    if "book_clad_avg" in ec and isinstance(ec["book_clad_avg"], dict):
+                        ec["clad"] = ec["book_clad_avg"]
+                    elif "CLAD" in ec and isinstance(ec["CLAD"], (list, tuple)) and len(ec["CLAD"]) == 4:
+                        ec["clad"] = {
+                            "crisis": float(ec["CLAD"][0]),
+                            "lag": float(ec["CLAD"][1]),
+                            "alternative": float(ec["CLAD"][2]),
+                            "direction": float(ec["CLAD"][3]),
+                        }
+                norm_entries.append(ec)
+            else:
+                norm_entries.append(e)
         return CLADCorpus(
-            entries=entries,
+            entries=norm_entries,
             source_id=spec.source_id,
             bias_flags=spec.bias_flags,
             meta=spec.meta,
