@@ -21,7 +21,7 @@ class TestShouldEnumerate:
         assert should_enumerate({"5": {"criteria": ["saturation"]}}, 5) is True
 
     def test_date_keyed_hit(self):
-        table = {"1914-08-02": {"criteria": ["correlation_flip"]}}
+        table = {"1914-08-02": {"criteria": ["saturation"]}}
         assert should_enumerate(table, "1914-08-02") is True
 
     def test_month_keyed_hit(self):
@@ -37,29 +37,73 @@ class TestShouldEnumerate:
         # degenerate Mode B from "spectrum failure" into "whole timeline".
         assert should_enumerate({7: {"criteria": ["gap"]}}, 7) is False
 
+    def test_correlation_flip_alone_does_not_trigger(self):
+        # correlation_flip is engine-demoted (v2.10, N6): its 91-month net
+        # (1913-06..1920-12) covers nearly the whole query window — the same
+        # wide-net degeneration as gap. A pure-correlation_flip entry never
+        # fires, on day keys or month keys.
+        assert (
+            should_enumerate({7: {"criteria": ["correlation_flip"]}}, 7) is False
+        )
+        assert (
+            should_enumerate(
+                {"1916-05": {"criteria": ["correlation_flip"]}}, "1916-05"
+            )
+            is False
+        )
+
     def test_gap_with_sharp_fires_via_sharp(self):
         # gap riding alongside a sharp criterion fires — but only because the
         # sharp signal is present (gap amplifies, never ignites).
         assert should_enumerate({7: {"criteria": ["gap", "saturation"]}}, 7) is True
 
-    def test_gap_with_correlation_flip_fires(self):
+    def test_correlation_flip_with_sharp_fires_via_sharp(self):
+        # correlation_flip riding alongside a sharp criterion fires — but only
+        # because the sharp signal is present (amplifies, never ignites).
         assert (
             should_enumerate(
-                {"1916-05": {"criteria": ["gap", "correlation_flip"]}}, "1916-05"
+                {"1916-05": {"criteria": ["correlation_flip", "decoupling"]}},
+                "1916-05",
+            )
+            is True
+        )
+        assert (
+            should_enumerate(
+                {"1916-05": {"criteria": ["correlation_flip", "saturation"]}},
+                "1916-05",
             )
             is True
         )
 
+    def test_gap_with_correlation_flip_does_not_fire(self):
+        # Both are amplifier-only — together they still never ignite: no sharp
+        # criterion ①–② is present to ride on.
+        assert (
+            should_enumerate(
+                {"1916-05": {"criteria": ["gap", "correlation_flip"]}}, "1916-05"
+            )
+            is False
+        )
+
     def test_day_key_miss_falls_back_to_month_key(self):
         # 1914-08-02 is absent but the month key 1914-08 is present — the
-        # day-key miss must narrow to the month prefix and hit correlation_flip.
-        table = {"1914-08": {"criteria": ["correlation_flip"]}}
+        # day-key miss must narrow to the month prefix and hit decoupling.
+        table = {"1914-08": {"criteria": ["decoupling"]}}
         assert should_enumerate(table, "1914-08-02") is True
 
     def test_day_key_miss_falls_back_to_month_key_gap_is_still_false(self):
         # The month-prefix fallback reaches month-keyed gap entries too — but
         # pure gap never fires, so the day-key miss stays False.
         table = {"1914-08": {"criteria": ["gap"]}}
+        assert should_enumerate(table, "1914-08-02") is False
+
+    def test_day_key_miss_falls_back_to_month_key_correlation_flip_is_still_false(
+        self,
+    ):
+        # The month-prefix fallback reaches month-keyed correlation_flip too —
+        # but pure correlation_flip never fires (engine-demoted), so the
+        # day-key miss stays False.
+        table = {"1914-08": {"criteria": ["correlation_flip"]}}
         assert should_enumerate(table, "1914-08-02") is False
 
     def test_day_key_hit_precedes_month_fallback(self):

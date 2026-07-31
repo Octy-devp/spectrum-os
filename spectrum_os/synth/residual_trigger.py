@@ -8,18 +8,28 @@ PLAN-23 v2.9.5–7 (版本 B：歷史的意外). Two-phase state switching:
   accidents through ``alt_gate_enumerate``. Residual diagnosis is the
   phase-state thermometer.
 
-Residual criteria (v2.9.7, Round-3 fix):
+Residual criteria (v2.10, N6 — correlation_flip engine demotion):
   ① ``saturation``        — L1 field strength saturates (>= 0.9), no resolution.
-  ② ``correlation_flip``  — arc correlation turns positive (r > 0), gravity
-                            collapse.
-  ③ ``decoupling``        — zg/ha decouple (pct_divergence > 40, ha_pct high
+  ② ``decoupling``        — zg/ha decouple (pct_divergence > 40, ha_pct high
                             vs zg_pct low).
+  ③ ``correlation_flip``  — arc correlation turns positive (r > 0), gravity
+                            collapse. **Amplifier only (v2.10, N6)**: demoted
+                            from SHARP — its coverage is a 91-month-wide net
+                            (1913-06 .. 1920-12), i.e. nearly the whole query
+                            window; letting it fire alone would degenerate Mode
+                            B from "spectrum failure" into "the whole window".
+                            Rides on a sharp criterion ①–② in the same entry.
   ④ ``gap``               — character gap hit (institutional vacuum / affective
                             lag). **Amplifier only**: never fires by itself —
-                            rides on a sharp criterion ①–③ in the same entry.
+                            rides on a sharp criterion ①–② in the same entry.
   ⑤ language sensitivity  — the same situation under n language perturbations
                             yields high output divergence. LLM-backed, so it is
                             a pluggable callback; default None = disabled.
+
+Wide-net degeneration rule: any criterion whose table coverage approaches the
+query-window ratio (``correlation_flip`` ≈ 91/91 months ≈ 100%) is demoted to
+amplifier at the **engine layer** — not at any pilot layer — so no future run
+that skips a pilot-specific filter can re-hit full-window Mode B.
 
 This module is deliberately pure — numpy-free, no LLM dependency (⑤ is supplied
 by the caller as a callback).
@@ -31,11 +41,13 @@ import json
 import os
 from typing import Any, Callable, Mapping
 
-# Criteria ①–③ are table-driven SHARP triggers; ④ ``gap`` is table-driven but
-# amplifier-only (never ignites by itself); ⑤ is callback-driven.
-SHARP_CRITERIA = ("saturation", "correlation_flip", "decoupling")
-GAP_CRITERION = "gap"
-CRITERIA_KEYS = SHARP_CRITERIA + (GAP_CRITERION,)
+# Criteria ①–② are table-driven SHARP triggers; ③ ``correlation_flip`` and ④
+# ``gap`` are table-driven but amplifier-only (never ignite by themselves —
+# wide-net degeneration, see module docstring); ⑤ is callback-driven.
+SHARP_CRITERIA = ("saturation", "decoupling")
+AMPLIFIER_CRITERIA = ("correlation_flip", "gap")
+GAP_CRITERION = AMPLIFIER_CRITERIA[1]  # backward-compat alias
+CRITERIA_KEYS = SHARP_CRITERIA + AMPLIFIER_CRITERIA
 
 
 def _entry_hits(entry: Any) -> bool:
@@ -44,11 +56,13 @@ def _entry_hits(entry: Any) -> bool:
     Safe degradation: non-dict entry, missing/empty/non-list ``criteria`` or an
     all-unknown criteria list all mean "no hit" — never crashes.
 
-    ``gap`` is deliberately excluded from firing. Gap coverage is character-arc
-    granularity and saturates the whole timeline; letting a pure-``gap`` entry
-    fire would degenerate Mode B from "spectrum failure" into "the entire
-    timeline", destroying the two-phase meaning. ``gap`` only rides along when
-    a sharp criterion ①–③ sits in the same entry (it amplifies, never ignites).
+    Amplifier criteria (``correlation_flip``, ``gap``) are deliberately excluded
+    from firing. Their coverage saturates a wide net over the query window
+    (gap: the whole timeline; correlation_flip: 91 months of 1913-06..1920-12);
+    letting a pure-amplifier entry fire would degenerate Mode B from "spectrum
+    failure" into "the entire window", destroying the two-phase meaning. They
+    only ride along when a sharp criterion ①–② sits in the same entry (they
+    amplify, never ignite).
     """
     if not isinstance(entry, dict):
         return False
@@ -118,12 +132,13 @@ def should_enumerate(
         context: Opaque context passed through to ``sensitivity_cb``.
 
     Returns:
-        True when the residual table hits any SHARP criterion ①–③ at ``t``
+        True when the residual table hits any SHARP criterion ①–② at ``t``
         (day key, month-prefix fallback, or int round-trip), or when
-        ``sensitivity_cb`` reports a score at/above the threshold. ``gap`` (④)
-        is amplifier-only: a pure-``gap`` entry (e.g. ``criteria == ["gap"]``)
-        never fires by itself. False when there is no table, no sharp hit, or
-        no (or below-threshold) callback.
+        ``sensitivity_cb`` reports a score at/above the threshold. Amplifier
+        criteria (③ ``correlation_flip``, ④ ``gap``) are engine-demoted: a
+        pure-amplifier entry (e.g. ``criteria == ["correlation_flip"]``) never
+        fires by itself. False when there is no table, no sharp hit, or no (or
+        below-threshold) callback.
     """
     if residual_table is not None:
         entry = residual_table.get(t)
