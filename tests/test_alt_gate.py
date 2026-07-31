@@ -7,6 +7,7 @@ import pytest
 
 from spectrum_os.kernel import verify as _verify
 from spectrum_os.synth.alt_gate import (
+    ADVERSARY_SYSTEM_PROMPT_V1,
     AltGateContractError,
     alt_gate,
     alt_gate_enumerate,
@@ -14,7 +15,10 @@ from spectrum_os.synth.alt_gate import (
     mechanical_confidence_alt_gate,
     validate_accident,
 )
-from spectrum_os.synth.gate_prompts import check_routing_leak_or_schema
+from spectrum_os.synth.gate_prompts import (
+    GATE_SYSTEM_PROMPT_UNIFIED,
+    check_routing_leak_or_schema,
+)
 
 
 class TestAltGateContract:
@@ -334,6 +338,140 @@ class TestAltGateExecution:
             assert gi["situation"]["local_texture"]["ultimatum_deadline_hours"] == 48
             assert "t" in gi["situation"]
             assert "thread_history" in gi["situation"]
+
+
+class TestN2AdversarySituationAwareness:
+    """Round 2 N2: adversary must receive and judge against the situation."""
+
+    def test_stage1_res_carries_situation_and_adversary_prompt_contains_it(self):
+        """stage1 result must carry situation (ensemble stage2 path) and adversary prompt must include it."""
+        from spectrum_os.synth.alt_gate import alt_gate_adversary, alt_gate_generate
+
+        calls = []
+
+        def mock_call_api(prompt, api_key, system_message="", temperature=0.6, **kwargs):
+            calls.append(prompt)
+            if "[task:adversary]" in prompt:
+                return json.dumps({"flagged_labels": [], "reasons": {}})
+            return json.dumps({
+                "walk": {"crisis": "物資滯留", "lag": "命令延遲", "alive_space": "備用物資點"},
+                "candidates": [
+                    {
+                        "label": "調撥節點",
+                        "concept_tags": ["網絡"],
+                        "provenance_hint": "novel",
+                        "novel": True,
+                    }
+                ],
+                "evidence": ["鐵路滯後"],
+            })
+
+        situation = {
+            "vector_6d": [0, 0, 0, 12, 0, 0.85],
+            "local_texture": {"mode": "條約制衡"},
+            "digest": "1914 年 7 月危機：鐵路運力制約外交選擇",
+        }
+        input_data = {
+            "state_vector": {"role": "crisis"},
+            "thread_history": ["crisis"],
+            "existing_labels": [],
+            "situation": situation,
+        }
+
+        stage1_res = alt_gate_generate(
+            input_data, call_api_fn=mock_call_api, api_key="k", n_samples=1, unified=True
+        )
+        assert stage1_res["situation"] == situation
+
+        alt_gate_adversary(stage1_res, call_api_fn=mock_call_api, api_key="k", unified=True)
+        adv_prompt = [p for p in calls if "[task:adversary]" in p][-1]
+        assert "1914 年 7 月危機" in adv_prompt
+        assert "條約制衡" in adv_prompt
+
+    def test_unified_adversary_clause_is_usage_judge(self):
+        """[task:adversary] clause must be usage-judge positioned and situation-grounded."""
+        assert "用法裁判" in GATE_SYSTEM_PROMPT_UNIFIED
+        assert "以處境為據" in GATE_SYSTEM_PROMPT_UNIFIED
+        assert "expression" in GATE_SYSTEM_PROMPT_UNIFIED
+        assert "substitution" in GATE_SYSTEM_PROMPT_UNIFIED
+
+    def test_legacy_adversary_prompt_is_usage_judge(self):
+        """Legacy ADVERSARY_SYSTEM_PROMPT_V1 must also be usage-judge framed."""
+        assert "用法裁判" in ADVERSARY_SYSTEM_PROMPT_V1
+        assert "以處境為據" in ADVERSARY_SYSTEM_PROMPT_V1
+
+
+class TestN3SituationEchoRejection:
+    """Round 2 N3: echo rejection referenced by situation labels."""
+
+    def test_label_verbatim_in_situation_labels_raises(self):
+        sit_labels = ["條約制衡", "鐵路優先權"]
+        echo_dict = {
+            "walk": {"crisis": "ok"},
+            "candidates": [
+                {
+                    "label": "條約制衡",  # verbatim in situation_labels
+                    "concept_tags": ["自訂標籤"],
+                    "provenance_hint": "novel",
+                    "novel": True,
+                }
+            ],
+            "evidence": ["ok"],
+        }
+        with pytest.raises(AltGateContractError, match="situation echo"):
+            assert_alt_gate_contract(echo_dict, situation_labels=sit_labels)
+
+    def test_concept_tag_material_reference_allowed(self):
+        """concept_tags referencing situation material must NOT raise (revival protection)."""
+        sit_labels = ["鐵路優先權"]
+        revival_dict = {
+            "walk": {"crisis": "ok"},
+            "candidates": [
+                {
+                    "label": "鐵路再調配",  # distinct from situation label
+                    "concept_tags": ["繼承的鐵路優先權"],  # material reference — legal
+                    "provenance_hint": "novel",
+                    "novel": True,
+                }
+            ],
+            "evidence": ["ok"],
+        }
+        assert_alt_gate_contract(revival_dict, situation_labels=sit_labels)
+
+    def test_no_situation_labels_behavior_unchanged(self):
+        """Without situation_labels the echo check is skipped (backwards compatible)."""
+        valid = {
+            "walk": {"crisis": "ok"},
+            "candidates": [
+                {
+                    "label": "條約制衡",  # would echo only if situation_labels were given
+                    "concept_tags": ["標籤"],
+                    "provenance_hint": "novel",
+                    "novel": True,
+                }
+            ],
+            "evidence": ["ok"],
+        }
+        assert_alt_gate_contract(valid)
+
+    def test_extract_situation_labels_from_input_data(self):
+        """_extract_situation_labels pulls digest + local_texture string values."""
+        from spectrum_os.synth.alt_gate import _extract_situation_labels
+
+        input_data = {
+            "situation": {
+                "vector_6d": [0, 0, 0, 12, 0, 0.85],
+                "local_texture": {"mode": "條約制衡", "deadline": 48},
+                "digest": "鐵路優先權下的七月危機",
+            }
+        }
+        labels = _extract_situation_labels(input_data)
+        assert "鐵路優先權下的七月危機" in labels
+        assert "條約制衡" in labels
+        assert 48 not in labels
+
+        assert _extract_situation_labels({"situation": None}) is None
+        assert _extract_situation_labels({}) is None
 
 
 class TestVersionBEnumerate:

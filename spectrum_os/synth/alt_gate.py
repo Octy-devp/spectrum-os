@@ -15,7 +15,7 @@ PLAN-23 §5 + §6.5 (抗污染憲章) + WORKFLOW §2.8 implementation:
   - Mechanical filter (Quarantine Layer 1) on text fields.
 - 2-Stage Adversarial Call (§六․五-5):
   - Stage 1: Candidate generation.
-  - Stage 2: Adversary attack prompt ("你來自一條不同的歷史線——找出這些候選偷渡了哪個既定結局").
+  - Stage 2: Adversary usage-judge prompt (判別 expression vs substitution，以處境為據).
   - Flagged candidates get `adversary_flag: true` and weight halved (`weight: 0.5`).
 - State log recording: `gate_type: "alt_gate"`.
 """
@@ -74,12 +74,19 @@ ALT_GATE_SYSTEM_PROMPT_V1 = (
 )
 
 ADVERSARY_SYSTEM_PROMPT_V1 = (
-    "你來自一條不同的歷史線——找出這些候選偷渡了哪個既定結局。\n"
-    "你必須審查傳入的候選標籤，指出哪些偷渡了既定歷史結局。\n"
+    "此刻你是用法裁判——你判定每個候選把承繼的詞彙用成了表達（expression）還是取代（substitution）。\n"
+    "你接收：處境（社會物質結構與鏡角）+ 候選（labels、concept_tags）。\n"
+    "【兩軸判準】\n"
+    "- expression：借用的詞服務於分支自己的內容——復活，合法。\n"
+    "- substitution·gravity：把既定結局當必然前提塞入——偷渡，非法。\n"
+    "- substitution·parody：無內容的借用——鬧劇，非法。\n"
+    "- substitution·self-deception：借來的崇高感掩蓋有限內容——非法。\n"
+    "【鐵律】判定必須以處境為據——同一個詞，在這種社會語境下可能是復活，換一種語境就是偷渡。\n"
+    "不可無處境空判；也不可因詞彙來自過去就當偷渡（繼承是合法的）。\n"
     "輸出格式：純 JSON。\n"
     "{\n"
     '  "flagged_labels": ["偷渡結局標籤"],\n'
-    '  "reasons": {"偷渡結局標籤": "偷渡既定結局"}\n'
+    '  "reasons": {"偷渡結局標籤": "substitution（gravity）——把既定結局當必然前提"}\n'
     "}\n"
 )
 
@@ -111,10 +118,18 @@ def _has_shell_refusal_or_placeholder(obj: Any) -> bool:
     return False
 
 
-def assert_alt_gate_contract(output_data: dict) -> None:
+def assert_alt_gate_contract(
+    output_data: dict,
+    situation_labels: list[str] | None = None,
+) -> None:
     """Mechanical contract assertion for alt_gate output.
 
     PLAN-23 §5 + §6.5 implementation.
+
+    N3 (Round 2): when ``situation_labels`` is provided, candidate LABELS that
+    verbatim-repeat a situation-provided label are rejected (echo rejection is
+    referenced by situation, not by a fixed vocabulary). Only LABEL is checked —
+    concept_tags may reference situation material (revival / expression is legal).
     """
     if not isinstance(output_data, dict):
         raise AltGateContractError(f"output must be dict, got {type(output_data).__name__}")
@@ -162,6 +177,12 @@ def assert_alt_gate_contract(output_data: dict) -> None:
     if not isinstance(candidates, list):
         raise AltGateContractError(f"candidates must be a list, got {type(candidates).__name__}")
 
+    situation_set: set[str] | None = None
+    if situation_labels:
+        situation_set = {
+            s.strip() for s in situation_labels if isinstance(s, str) and s.strip()
+        }
+
     for i, cand in enumerate(candidates):
         if not isinstance(cand, dict):
             raise AltGateContractError(f"candidate[{i}] must be a dict, got {type(cand).__name__}")
@@ -184,6 +205,10 @@ def assert_alt_gate_contract(output_data: dict) -> None:
         if label.strip() in PROMPT_EXAMPLE_LABELS:
             raise AltGateContractError(
                 f"example echo: candidate[{i}].label matches prompt example label '{label.strip()}'"
+            )
+        if situation_set is not None and label.strip() in situation_set:
+            raise AltGateContractError(
+                f"situation echo: candidate[{i}].label '{label.strip()}' repeats a label already provided by the situation"
             )
         if len(label) > 20:
             raise AltGateContractError(f"candidate[{i}].label exceeds length limit (<=20): {label!r}")
@@ -268,6 +293,29 @@ def mechanical_confidence_alt_gate(candidate_samples: list[list[dict]]) -> dict:
     }
 
 
+def _extract_situation_labels(input_data: dict) -> list[str] | None:
+    """Extract situation-referenced labels from ``input_data["situation"]``.
+
+    N3 (Round 2): echo rejection is referenced by situation — the situation's
+    digest full text plus local_texture string values become the reference
+    labels. Returns None when no situation payload is provided (behavior
+    unchanged).
+    """
+    situation = input_data.get("situation")
+    if not isinstance(situation, dict):
+        return None
+    labels: list[str] = []
+    digest = situation.get("digest")
+    if isinstance(digest, str) and digest.strip():
+        labels.append(digest.strip())
+    local_texture = situation.get("local_texture")
+    if isinstance(local_texture, dict):
+        for v in local_texture.values():
+            if isinstance(v, str) and v.strip():
+                labels.append(v.strip())
+    return labels or None
+
+
 def _build_alt_gate_prompt(input_data: dict) -> str:
     """Construct user prompt JSON string from input_data."""
     return json.dumps(input_data, indent=2, ensure_ascii=False)
@@ -325,6 +373,7 @@ def alt_gate_generate(
 
     sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if (unified or reporter) else ALT_GATE_SYSTEM_PROMPT_V1
     existing_labels_set = set(input_data.get("existing_labels", []))
+    situation_labels = _extract_situation_labels(input_data)
 
     candidate_samples: list[list[dict]] = []
     walks: list[dict] = []
@@ -380,7 +429,7 @@ def alt_gate_generate(
                     leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "compress")
                     if leak_err:
                         raise AltGateContractError(leak_err)
-                    assert_alt_gate_contract(candidate_parsed)
+                    assert_alt_gate_contract(candidate_parsed, situation_labels)
                     parsed = candidate_parsed
                     break
                 except Exception as e:
@@ -432,7 +481,7 @@ def alt_gate_generate(
                         leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "generate")
                         if leak_err:
                             raise AltGateContractError(leak_err)
-                    assert_alt_gate_contract(candidate_parsed)
+                    assert_alt_gate_contract(candidate_parsed, situation_labels)
                     parsed = candidate_parsed
                     break
                 except Exception as e:
@@ -485,6 +534,7 @@ def alt_gate_generate(
         "model": model,
         "n_samples": n_samples,
         "temperature": temperature,
+        "situation": input_data.get("situation"),
     }
     if reporter and observations:
         res["observations"] = observations
@@ -501,7 +551,14 @@ def alt_gate_adversary(
     unified: bool = False,
     **_kwargs: Any,
 ) -> dict:
-    """Stage 2: Adversarial Review for LLM Alternative Gate."""
+    """Stage 2: Adversarial Usage-Judge Review for LLM Alternative Gate.
+
+    The adversary judges each candidate as expression (revival, legal) vs
+    substitution (smuggling, illegal), grounded in the situation payload
+    carried in ``stage1_res["situation"]`` (social-material structure + mirror
+    angle when present). Flagged candidates get ``adversary_flag: true`` and
+    halved weight.
+    """
     if call_api_fn is None:
         call_api_fn = _load_ecc_call_api()
     if api_key is None:
@@ -513,11 +570,14 @@ def alt_gate_adversary(
     walks = stage1_res["walks"]
     evidences = stage1_res["evidences"]
     confidence = stage1_res["confidence"]
+    situation = stage1_res.get("situation")
 
     adv_input = {
         "candidate_labels": [c["label"] for c in aggregated_candidates],
         "candidate_tags": [c["concept_tags"] for c in aggregated_candidates],
     }
+    if isinstance(situation, dict):
+        adv_input["situation"] = situation
     base_adv_prompt = json.dumps(adv_input, ensure_ascii=False)
     adv_prompt = f"{base_adv_prompt}\n[task:adversary]" if (unified or "observations" in stage1_res) else base_adv_prompt
     sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if (unified or "observations" in stage1_res) else ADVERSARY_SYSTEM_PROMPT_V1
@@ -605,7 +665,8 @@ def alt_gate(
 
     Args:
         input_data: Input dict containing 'state_vector', 'thread_history',
-            'local_texture', and optional 'existing_labels'.
+            'local_texture', and optional 'existing_labels' / 'situation'
+            (the situation payload grounds the adversary's usage judgment).
         call_api_fn: Callable for API invocation (injected for testing/mocking).
         api_key: DeepSeek API key. Read from DEEPSEEK_API_KEY env var if None.
         model: Model name. Default 'deepseek-v4-flash'.

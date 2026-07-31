@@ -5,12 +5,31 @@ from pathlib import Path
 import pytest
 
 from feeds.ecc_feeds import register_ecc_sources
-from scripts.stage3_sarajevo_pilot import run_sarajevo_pilot, build_sarajevo_initial_vector
+from scripts.stage3_sarajevo_pilot import (
+    run_sarajevo_pilot,
+    build_sarajevo_initial_vector,
+    build_sarajevo_situation,
+)
 from scripts.stage3_universality_check import run_universality_check, run_pipeline, dry_run_gate
 from spectrum_os import sources
 
 register_ecc_sources()
 ECC_DATA_EXISTS = Path(sources.get_source("ecc-knowledge-edges").locator).exists()
+
+
+class TestStage3SarajevoSituation:
+    """承載量定律：厚 DIGEST（社會物質結構 4 節）解鎖多維可能性。"""
+
+    def test_build_sarajevo_situation_thick_digest_markers(self):
+        situation = build_sarajevo_situation()
+        digest = situation["digest"]
+        for marker in ["鐵路工會", "kmet", "zadruga", "菸草專賣", "農業危機"]:
+            assert marker in digest, f"DIGEST 缺少社會物質結構關鍵標記: {marker}"
+
+    def test_build_sarajevo_situation_local_texture_deadline(self):
+        situation = build_sarajevo_situation()
+        assert situation["local_texture"]["ultimatum_deadline_hours"] == 48
+        assert situation["local_texture"]["railway_capacity_trains_per_day"] == 360
 
 
 @pytest.mark.skipif(not ECC_DATA_EXISTS, reason="ECC source data directory not found")

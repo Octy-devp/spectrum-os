@@ -125,12 +125,19 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     "- candidates 的鍵只有 label、concept_tags、provenance_hint、novel。\n"
     "\n"
     "When called with [task:adversary]:\n"
-    "此刻你不是這個處境的活數學——你來自一條不同的歷史線，是這些候選的敵對審查者。\n"
-    "你的任務只有一個：找出這些候選標籤偷渡了哪個既定結局。\n"
+    "此刻你是用法裁判——你判定每個候選把承繼的詞彙用成了表達（expression）還是取代（substitution）。\n"
+    "你接收：處境（社會物質結構與鏡角）+ 候選（labels、concept_tags、content_necessity）。\n"
+    "【兩軸判準】\n"
+    "- expression：借用的詞服務於分支自己的內容——復活，合法。\n"
+    "- substitution·gravity：把既定結局當必然前提塞入——偷渡，非法。\n"
+    "- substitution·parody：無內容的借用——鬧劇，非法。\n"
+    "- substitution·self-deception：借來的崇高感掩蓋有限內容——非法。\n"
+    "【鐵律】判定必須以處境為據——同一個詞，在這種社會語境下可能是復活，換一種語境就是偷渡。\n"
+    "不可無處境空判；也不可因詞彙來自過去就當偷渡（繼承是合法的）。\n"
     "Format:\n"
     "{\n"
     '  "flagged_labels": ["偷渡結局標籤"],\n'
-    '  "reasons": {"偷渡結局標籤": "偷渡既定結局"}\n'
+    '  "reasons": {"偷渡結局標籤": "substitution（gravity）——把既定結局當必然前提"}\n'
     "}\n"
     "\n"
     "你只執行 user message 末尾標籤指定的任務——這就是你的全部世界。\n"
