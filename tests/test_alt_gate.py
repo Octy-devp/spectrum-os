@@ -9,9 +9,12 @@ from spectrum_os.kernel import verify as _verify
 from spectrum_os.synth.alt_gate import (
     AltGateContractError,
     alt_gate,
+    alt_gate_enumerate,
     assert_alt_gate_contract,
     mechanical_confidence_alt_gate,
+    validate_accident,
 )
+from spectrum_os.synth.gate_prompts import check_routing_leak_or_schema
 
 
 class TestAltGateContract:
@@ -331,3 +334,148 @@ class TestAltGateExecution:
             assert gi["situation"]["local_texture"]["ultimatum_deadline_hours"] == 48
             assert "t" in gi["situation"]
             assert "thread_history" in gi["situation"]
+
+
+class TestVersionBEnumerate:
+    """Version B: [task:enumerate] accident schema contract (S7)."""
+
+    def _good_accident(self):
+        return {
+            "pattern": "軍方-右派政變",
+            "instances": ["毛奇政變(1914)", "容克政變(β₁柏林)"],
+            "domain": "政治",
+            "source": "emergent",
+            "usage": "expression",
+            "grounding": "合理推測",
+            "world_development": "戰爭爆發但德國政治孤立",
+        }
+
+    def test_validate_accident_valid(self):
+        validate_accident(self._good_accident(), 0)
+
+    def test_validate_accident_bad_domain(self):
+        bad = self._good_accident()
+        bad["domain"] = "天氣突變"
+        with pytest.raises(AltGateContractError, match="domain"):
+            validate_accident(bad, 0)
+
+    def test_validate_accident_bad_grounding(self):
+        bad = self._good_accident()
+        bad["grounding"] = "不確定"
+        with pytest.raises(AltGateContractError, match="grounding"):
+            validate_accident(bad, 0)
+
+    def test_validate_accident_bad_pattern(self):
+        bad = self._good_accident()
+        bad["pattern"] = ""
+        with pytest.raises(AltGateContractError, match="pattern"):
+            validate_accident(bad, 0)
+
+    def test_validate_accident_missing_world_development(self):
+        bad = self._good_accident()
+        bad["world_development"] = ""
+        with pytest.raises(AltGateContractError, match="world_development"):
+            validate_accident(bad, 0)
+
+    def test_enumerate_schema_check(self):
+        assert check_routing_leak_or_schema('{}', {"accidents": []}, "enumerate") is None
+        err = check_routing_leak_or_schema('{}', {"candidates": []}, "enumerate")
+        assert err is not None and "enumerate" in err
+        err2 = check_routing_leak_or_schema('{}', {"rates": {}}, "enumerate")
+        assert err2 is not None and "enumerate" in err2
+
+    def test_alt_gate_enumerate_mock(self):
+        """alt_gate_enumerate calls API with version B prompt + [task:enumerate], validates schema."""
+        from spectrum_os.synth.alt_gate import alt_gate_enumerate
+
+        mock = MagicMock()
+        mock.return_value = json.dumps(
+            {
+                "accidents": [
+                    {
+                        "pattern": "蒂薩阻止對塞戰爭",
+                        "instances": ["蒂薩在匈牙利議會否決戰爭"],
+                        "domain": "政治",
+                        "source": "inherited",
+                        "usage": "expression",
+                        "grounding": "文獻偶發",
+                        "world_development": "危機降溫，奧匈內部民族矛盾激化",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        res = alt_gate_enumerate(
+            {"situation": {"digest": "測試處境"}},
+            call_api_fn=mock,
+            api_key="test-key",
+        )
+        assert len(res["accidents"]) == 1
+        assert res["accidents"][0]["pattern"] == "蒂薩阻止對塞戰爭"
+        assert res["generated_by"]["gate"] == "alt_gate_enumerate"
+        args = mock.call_args
+        assert "[task:enumerate]" in args.args[0]
+        assert "歷史的意外" in args.kwargs["system_message"]
+
+    def test_alt_gate_enumerate_contract_reject(self):
+        """alt_gate_enumerate raises when schema is wrong."""
+        from spectrum_os.synth.alt_gate import alt_gate_enumerate
+
+        mock = MagicMock()
+        mock.return_value = json.dumps({"candidates": [{"label": "x"}]}, ensure_ascii=False)
+        with pytest.raises(AltGateContractError):
+            alt_gate_enumerate({"situation": {}}, call_api_fn=mock, api_key="test-key")
+
+    def test_invalid_json_normalized_to_alt_gate_contract_error(self):
+        """Malformed JSON from the API must surface as AltGateContractError (not AnchorContractError)."""
+        mock = MagicMock()
+        mock.return_value = "{not json"
+        with pytest.raises(AltGateContractError):
+            alt_gate_enumerate({"situation": {}}, call_api_fn=mock, api_key="test-key")
+
+    def test_retry_after_parse_failure(self):
+        """First attempt returns malformed JSON, second returns valid accidents — retry must succeed."""
+        good = json.dumps(
+            {
+                "accidents": [
+                    {
+                        "pattern": "鐵路罷工蔓延",
+                        "instances": ["莫斯科樞紐癱瘓"],
+                        "domain": "社會",
+                        "source": "emergent",
+                        "usage": "expression",
+                        "grounding": "合理推測",
+                        "world_development": "罷工網由鐵路節點向工業城市擴散",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        mock = MagicMock()
+        mock.side_effect = ["{not json", good]
+        res = alt_gate_enumerate({"situation": {}}, call_api_fn=mock, api_key="test-key")
+        assert len(res["accidents"]) == 1
+        assert mock.call_count == 2
+        temps = [c.kwargs.get("temperature") for c in mock.call_args_list]
+        assert temps[1] > temps[0]
+
+    def test_validate_accident_quarantine_placeholder(self):
+        """validate_accident rejects pattern='None' via quarantine (placeholder / shell refusal)."""
+        bad = self._good_accident()
+        bad["pattern"] = "None"
+        with pytest.raises(AltGateContractError, match="placeholder|shell"):
+            validate_accident(bad, 0)
+
+    def test_validate_accident_empty_instances(self):
+        """validate_accident rejects an empty instances list (burst mode requires >= 1 instance)."""
+        bad = self._good_accident()
+        bad["instances"] = []
+        with pytest.raises(AltGateContractError, match="instances"):
+            validate_accident(bad, 0)
+
+    def test_enumerate_schema_rejects_flagged_labels(self):
+        """[task:enumerate] schema check must reject flagged_labels contamination (mirrors adversary)."""
+        err = check_routing_leak_or_schema(
+            '{}', {"accidents": [], "flagged_labels": []}, "enumerate"
+        )
+        assert err is not None and "enumerate" in err

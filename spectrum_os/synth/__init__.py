@@ -34,16 +34,19 @@ from .alt_gate import (
     assert_alt_gate_contract,
     mechanical_confidence_alt_gate,
     alt_gate,
+    alt_gate_enumerate,
 )
 from .gate_prompts import (
     GATE_SYSTEM_PROMPT_UNIFIED,
     ROUTING_LEAK_KEYWORDS,
+    VERSION_B_SYSTEM_PROMPT,
     check_routing_leak_or_schema,
 )
 from .ensemble import run_ensemble
 
 __all__ = [
     "GATE_SYSTEM_PROMPT_UNIFIED",
+    "VERSION_B_SYSTEM_PROMPT",
     "ROUTING_LEAK_KEYWORDS",
     "check_routing_leak_or_schema",
     "ANCHORS_SYSTEM_PROMPT_V25",
@@ -66,6 +69,7 @@ __all__ = [
     "assert_alt_gate_contract",
     "mechanical_confidence_alt_gate",
     "alt_gate",
+    "alt_gate_enumerate",
     "run_ensemble",
 ]
 

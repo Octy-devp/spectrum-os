@@ -297,6 +297,7 @@ from spectrum_os.synth.gate_prompts import (
     GATE_SYSTEM_PROMPT_UNIFIED,
     PROMPT_EXAMPLE_LABELS,
     ROUTING_LEAK_KEYWORDS,
+    VERSION_B_SYSTEM_PROMPT,
     check_routing_leak_or_schema,
 )
 
@@ -642,5 +643,170 @@ def alt_gate(
 
 alt_gate.stage1 = alt_gate_generate
 alt_gate.stage2 = alt_gate_adversary
+
+
+# --- Version B: Historical Accident Enumeration ([task:enumerate]) ---
+
+ACCIDENT_DOMAINS = {"政治", "經濟", "社會", "軍事", "自然"}
+ACCIDENT_SOURCES = {"inherited", "emergent"}
+ACCIDENT_USAGES = {"expression", "substitution"}
+ACCIDENT_GROUNDINGS = {"文獻偶發", "合理推測", "弱支持"}
+
+
+def validate_accident(acc: dict, index: int) -> None:
+    """Validate one accident entry from [task:enumerate] output."""
+    if not isinstance(acc, dict):
+        raise AltGateContractError(f"accident[{index}] must be dict, got {type(acc).__name__}")
+    if not isinstance(acc.get("pattern"), str) or not acc["pattern"].strip():
+        raise AltGateContractError(f"accident[{index}].pattern must be non-empty str")
+    if len(acc["pattern"]) > 40:
+        raise AltGateContractError(f"accident[{index}].pattern exceeds length limit (<=40)")
+    # F4: quarantine — pattern must not be an empty shell refusal / placeholder
+    if _has_shell_refusal_or_placeholder(acc["pattern"]):
+        raise AltGateContractError(
+            f"accident[{index}].pattern contains placeholder or shell refusal"
+        )
+    if not isinstance(acc.get("instances"), list):
+        raise AltGateContractError(f"accident[{index}].instances must be list")
+    # F3: burst mode requires >= 1 concrete instance
+    if not acc["instances"]:
+        raise AltGateContractError(
+            f"accident[{index}].instances must not be empty (burst mode requires >= 1 concrete instance)"
+        )
+    for j, inst in enumerate(acc["instances"]):
+        if not isinstance(inst, str):
+            raise AltGateContractError(f"accident[{index}].instances[{j}] must be str")
+        # F4: quarantine each instance string
+        if _has_shell_refusal_or_placeholder(inst):
+            raise AltGateContractError(
+                f"accident[{index}].instances[{j}] contains placeholder or shell refusal"
+            )
+    dom = acc.get("domain", "")
+    if dom not in ACCIDENT_DOMAINS:
+        raise AltGateContractError(
+            f"accident[{index}].domain must be one of {sorted(ACCIDENT_DOMAINS)}, got {dom!r}"
+        )
+    src = acc.get("source", "")
+    if src not in ACCIDENT_SOURCES:
+        raise AltGateContractError(
+            f"accident[{index}].source must be one of {sorted(ACCIDENT_SOURCES)}, got {src!r}"
+        )
+    usage = acc.get("usage", "")
+    if usage not in ACCIDENT_USAGES:
+        raise AltGateContractError(
+            f"accident[{index}].usage must be one of {sorted(ACCIDENT_USAGES)}, got {usage!r}"
+        )
+    grd = acc.get("grounding", "")
+    if grd not in ACCIDENT_GROUNDINGS:
+        raise AltGateContractError(
+            f"accident[{index}].grounding must be one of {sorted(ACCIDENT_GROUNDINGS)}, got {grd!r}"
+        )
+    if not isinstance(acc.get("world_development"), str) or not acc["world_development"].strip():
+        raise AltGateContractError(f"accident[{index}].world_development must be non-empty str")
+    # F4: quarantine world_development
+    if _has_shell_refusal_or_placeholder(acc["world_development"]):
+        raise AltGateContractError(
+            f"accident[{index}].world_development contains placeholder or shell refusal"
+        )
+
+
+def alt_gate_enumerate(
+    input_data: dict,
+    *,
+    call_api_fn: Callable | None = None,
+    api_key: str | None = None,
+    model: str = "deepseek-v4-flash",
+    temperature: float = 0.7,
+    max_tokens: int = 4096,
+    **_kwargs: Any,
+) -> dict:
+    """Version B: Historical Accident Enumeration Gate ([task:enumerate]).
+
+    Exhaustively enumerates the accidents possible at the given moment from the
+    situation's social-material structure. Triggered where the spectrum fails
+    (criticality / residual). Output schema:
+        {"accidents": [{"pattern", "instances", "domain", "source", "usage",
+                        "grounding", "world_development"}]}
+
+    Note:
+        Not suitable as a ``gate_fn`` for ``run_ensemble``: this gate returns
+        ``{"accidents": [...]}`` instead of ``{"candidates": [...]}``, so wiring
+        it in as an ensemble gate would silently yield no candidates.
+    """
+    if call_api_fn is None:
+        call_api_fn = _load_ecc_call_api()
+    if api_key is None:
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
+
+    sys_prompt = VERSION_B_SYSTEM_PROMPT
+    user_prompt = (
+        f"{_build_alt_gate_prompt(input_data)}\n"
+        "[task:enumerate] 窮盡列舉此刻可能發生的意外。輸出 JSON："
+        '{"accidents": [{"pattern": "爆發模式", "instances": ["特定實例1", "特定實例2"], '
+        '"domain": "政治|經濟|社會|軍事|自然", "source": "inherited|emergent", '
+        '"usage": "expression|substitution", '
+        '"grounding": "文獻偶發|合理推測|弱支持", "world_development": "這個意外導向的世界發展"}]}'
+    )
+    parsed = None
+    accidents: list = []
+    for attempt in range(2):
+        curr_temp = temperature + (0.15 if attempt == 1 else 0.0)
+        raw = call_api_fn(
+            user_prompt,
+            api_key,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=curr_temp,
+            system_message=sys_prompt,
+            response_format={"type": "json_object"},
+            thinking=False,
+        )
+        try:
+            # F6: the routing-leak scan deliberately runs before parsing — leak
+            # detection keeps precedence over parse errors (a leaked prompt is
+            # the harder failure, so it surfaces first).
+            for lk in ROUTING_LEAK_KEYWORDS:
+                if lk in raw:
+                    raise AltGateContractError(
+                        f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'"
+                    )
+            # F1: normalize AnchorContractError (or any other Exception) raised
+            # by _parse_json_loose into AltGateContractError, mirroring the
+            # except pattern of alt_gate_generate.
+            try:
+                parsed = _parse_json_loose(raw)
+            except Exception as e:
+                raise AltGateContractError(str(e)) from e
+            err = check_routing_leak_or_schema(raw, parsed, "enumerate")
+            if err:
+                raise AltGateContractError(err)
+            accidents = parsed.get("accidents", [])
+            if not isinstance(accidents, list) or not accidents:
+                raise AltGateContractError("task [task:enumerate] returned empty accidents list")
+            for i, acc in enumerate(accidents):
+                validate_accident(acc, i)
+            break
+        except AltGateContractError as e:
+            # F2: model-output failures (parse / schema / contract / validation)
+            # are retryable — retry once with a bumped temperature, then surface.
+            if attempt == 0:
+                continue
+            raise e
+        except Exception as e:
+            # F1: non-contract exceptions are not retryable — normalize and
+            # propagate immediately.
+            raise AltGateContractError(str(e)) from e
+    return {
+        "accidents": accidents,
+        "generated_by": {
+            "gate": "alt_gate_enumerate",
+            "model": model,
+            "temperature": temperature,
+            "n_accidents": len(accidents),
+            "called_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
 
 
