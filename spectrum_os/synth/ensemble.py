@@ -30,8 +30,14 @@ def run_ensemble(
     gate_every: int = 4,
     max_gates: int = 12,
     seed: int = 42,
+    **gate_kwargs: Any,
 ) -> dict:
-    """Run pay-as-you-go branch ensemble simulation.
+    """Run pay-as-you-go branch ensemble simulation with Batch-by-Phase scheduling.
+
+    Phase 1: Pure mechanical simulation (zero API calls, draw Markov state transitions).
+    Phase 2: Batch candidate generation calls ([task:generate] or gate_fn.stage1).
+    Phase 3: Batch adversarial review calls ([task:adversary] or gate_fn.stage2).
+    Backfill: Populate tags_per_step for each branch.
 
     Args:
         initial_vector: Dict containing 'role' or string initial role name (e.g. "crisis").
@@ -46,6 +52,7 @@ def run_ensemble(
         gate_every: Step interval for calling gate_fn (default 4).
         max_gates: Maximum gate calls per branch (default 12).
         seed: Random seed for reproducible trajectory sampling.
+        **gate_kwargs: Additional keyword arguments passed to gate_fn.
 
     Returns:
         Dict containing branches data and meta summary.
@@ -65,8 +72,6 @@ def run_ensemble(
 
     # Resolve rate matrix
     if rate_matrix is None:
-        # Default: uniform over LEGAL exits only — DCA grammar structural zeros
-        # must never be sampleable (forbidden pairs stay exactly 0.0).
         P = estimate_rate_matrix(np.zeros((len(ROLES), len(ROLES))))["matrix"]
     elif isinstance(rate_matrix, dict):
         P = np.asarray(rate_matrix["matrix"], dtype=np.float64)
@@ -83,22 +88,20 @@ def run_ensemble(
     elif isinstance(action, list):
         actions_list = [a for a in action if isinstance(a, dict)]
 
-    total_gate_calls = 0
-    branches: list[dict] = []
+    # --- Phase 1: Pure Mechanical Simulation (Zero API calls) ---
+    branch_records: list[dict] = []
+    gate_points: list[dict] = []
 
     for b_idx in range(n_branches):
         branch_gate_calls = 0
         current_role = initial_role
         branch_roles = [current_role]
-        tags_per_step: dict[int, list[str]] = {}
         interventions: list[dict] = []
-        accumulated_tags: list[str] = []
 
         for t in range(horizon - 1):
             r_idx = ROLES.index(current_role)
             probs = np.copy(P[r_idx])
 
-            # Apply action reweighting at step t if specified
             matching_actions = [act for act in actions_list if act.get("t") == t]
             for act in matching_actions:
                 rw = act.get("reweight", {})
@@ -115,45 +118,100 @@ def run_ensemble(
             else:
                 probs = np.full(len(ROLES), 1.0 / len(ROLES), dtype=np.float64)
 
-            # Mechanical Markov sample
             next_role = str(rng.choice(ROLES, p=probs))
             branch_roles.append(next_role)
 
-            # Check gate call budget (per-branch): a global cap would starve
-            # later branches of any gate calls, making standing_wave "nodes"
-            # vacuously empty by construction.
             if (
                 gate_fn is not None
                 and (t + 1) % gate_every == 0
                 and branch_gate_calls < max_gates
             ):
                 branch_gate_calls += 1
-                total_gate_calls += 1
-                gate_input = {
-                    "state_vector": {"current_role": current_role, "next_role": next_role, "t": t},
-                    "thread_history": branch_roles[:],
-                    "existing_labels": accumulated_tags[:],
-                }
-                gate_res = gate_fn(gate_input)
-                step_tags: list[str] = []
-                for cand in gate_res.get("candidates", []):
-                    step_tags.extend(cand.get("concept_tags", []))
-                tags_per_step[t] = step_tags
-                accumulated_tags.extend(step_tags)
+                gate_points.append(
+                    {
+                        "branch_id": b_idx,
+                        "t": t,
+                        "current_role": current_role,
+                        "next_role": next_role,
+                        "thread_history": branch_roles[:],
+                    }
+                )
 
             current_role = next_role
 
-        branches.append(
+        branch_records.append(
             {
                 "branch_id": b_idx,
                 "roles": branch_roles,
-                "tags_per_step": tags_per_step,
                 "interventions": interventions,
+                "tags_per_step": {},
             }
         )
 
+    total_gate_calls = len(gate_points)
+
+    if gate_fn is None or not gate_points:
+        return {
+            "branches": branch_records,
+            "meta": {
+                "n_branches": n_branches,
+                "horizon": horizon,
+                "total_gate_calls": 0,
+                "seed": seed,
+            },
+        }
+
+    # Check if gate_fn supports 2-stage execution via .stage1 and .stage2
+    has_stages = hasattr(gate_fn, "stage1") and hasattr(gate_fn, "stage2")
+
+    # --- Phase 2: Batch Generation Phase ([task:generate] or Stage 1 / gate_fn) ---
+    branch_gate_map: dict[int, list[dict]] = {}
+    for gp in gate_points:
+        branch_gate_map.setdefault(gp["branch_id"], []).append(gp)
+
+    for b_idx, gps in branch_gate_map.items():
+        accumulated_tags: list[str] = []
+        for gp in gps:
+            gate_input = {
+                "state_vector": {
+                    "current_role": gp["current_role"],
+                    "next_role": gp["next_role"],
+                    "t": gp["t"],
+                },
+                "thread_history": gp["thread_history"],
+                "existing_labels": accumulated_tags[:],
+            }
+            if has_stages:
+                stage1_res = gate_fn.stage1(gate_input, **gate_kwargs)
+                gp["stage1_res"] = stage1_res
+                step_tags = []
+                for cand in stage1_res.get("aggregated_candidates", []):
+                    step_tags.extend(cand.get("concept_tags", []))
+                accumulated_tags.extend(step_tags)
+            else:
+                gate_res = gate_fn(gate_input, **gate_kwargs)
+                gp["gate_res"] = gate_res
+                step_tags = []
+                for cand in gate_res.get("candidates", []):
+                    step_tags.extend(cand.get("concept_tags", []))
+                accumulated_tags.extend(step_tags)
+
+    # --- Phase 3: Batch Adversarial Phase ([task:adversary] or Stage 2) ---
+    for gp in gate_points:
+        b_idx = gp["branch_id"]
+        t = gp["t"]
+        if has_stages and "stage1_res" in gp:
+            final_res = gate_fn.stage2(gp["stage1_res"], **gate_kwargs)
+        else:
+            final_res = gp.get("gate_res", {})
+
+        step_tags: list[str] = []
+        for cand in final_res.get("candidates", []):
+            step_tags.extend(cand.get("concept_tags", []))
+        branch_records[b_idx]["tags_per_step"][t] = step_tags
+
     return {
-        "branches": branches,
+        "branches": branch_records,
         "meta": {
             "n_branches": n_branches,
             "horizon": horizon,
@@ -161,3 +219,4 @@ def run_ensemble(
             "seed": seed,
         },
     }
+

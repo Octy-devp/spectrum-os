@@ -234,6 +234,13 @@ def _write_rate_gate_state_log(result: dict) -> None:
         _verify._append_jsonl(_verify._log_path, entry)
 
 
+from spectrum_os.synth.gate_prompts import (
+    GATE_SYSTEM_PROMPT_UNIFIED,
+    ROUTING_LEAK_KEYWORDS,
+    check_routing_leak_or_schema,
+)
+
+
 def rate_gate(
     input_data: dict,
     *,
@@ -244,6 +251,7 @@ def rate_gate(
     n_samples: int = 3,
     w_prior: float = 5.0,
     max_tokens: int = 2048,
+    unified: bool = False,
 ) -> dict:
     """LLM Rate Estimation Gate with H schema + G2 Bayesian fusion.
 
@@ -259,6 +267,7 @@ def rate_gate(
         n_samples: Number of sampling calls (default 3).
         w_prior: Weight of LLM prior in Bayesian fusion (default 5.0).
         max_tokens: Token limit for completion.
+        unified: If True, use GATE_SYSTEM_PROMPT_UNIFIED with [task:rate] tag.
 
     Returns:
         Dict containing llm_samples, llm_mean_rates, confidence,
@@ -276,26 +285,46 @@ def rate_gate(
     if not legal_exits or not isinstance(legal_exits, list):
         raise ValueError("input_data must specify a non-empty list of legal_exits")
 
-    user_prompt = _build_rate_gate_prompt(input_data)
+    base_prompt = _build_rate_gate_prompt(input_data)
+    user_prompt = f"{base_prompt}\n[task:rate]" if unified else base_prompt
+    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if unified else RATE_GATE_SYSTEM_PROMPT_V1
 
     rate_samples: list[dict[str, float]] = []
     walks: list[dict] = []
     evidences: list[list[str]] = []
 
     for _ in range(n_samples):
-        raw = call_api_fn(
-            user_prompt,
-            api_key,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system_message=RATE_GATE_SYSTEM_PROMPT_V1,
-            response_format={"type": "json_object"},
-            thinking=False,
-        )
-
-        parsed = _parse_json_loose(raw)
-        assert_rate_gate_contract(parsed, legal_exits=legal_exits)
+        parsed = None
+        for attempt in range(2):
+            raw = call_api_fn(
+                user_prompt,
+                api_key,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system_message=sys_prompt,
+                response_format={"type": "json_object"},
+                thinking=False,
+            )
+            try:
+                if unified:
+                    for lk in ROUTING_LEAK_KEYWORDS:
+                        if lk in raw:
+                            raise RateGateContractError(f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'")
+                candidate_parsed = _parse_json_loose(raw)
+                if unified:
+                    leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "rate")
+                    if leak_err:
+                        raise RateGateContractError(leak_err)
+                assert_rate_gate_contract(candidate_parsed, legal_exits=legal_exits)
+                parsed = candidate_parsed
+                break
+            except Exception as e:
+                if attempt == 0:
+                    continue
+                if isinstance(e, RateGateContractError):
+                    raise e
+                raise RateGateContractError(str(e)) from e
 
         # Enforce rates zeroing for non-legal exits & normalize over legal_exits
         raw_rates = parsed["rates"]

@@ -283,7 +283,14 @@ def _write_alt_gate_state_log(result: dict) -> None:
         _verify._append_jsonl(_verify._log_path, entry)
 
 
-def alt_gate(
+from spectrum_os.synth.gate_prompts import (
+    GATE_SYSTEM_PROMPT_UNIFIED,
+    ROUTING_LEAK_KEYWORDS,
+    check_routing_leak_or_schema,
+)
+
+
+def alt_gate_generate(
     input_data: dict,
     *,
     call_api_fn: Callable | None = None,
@@ -292,22 +299,10 @@ def alt_gate(
     temperature: float = 0.6,
     n_samples: int = 3,
     max_tokens: int = 2048,
+    unified: bool = False,
+    **_kwargs: Any,
 ) -> dict:
-    """LLM Alternative Generation Gate with H schema + 2-Stage Adversarial Call.
-
-    Args:
-        input_data: Input dict containing 'state_vector', 'thread_history',
-            'local_texture', and optional 'existing_labels'.
-        call_api_fn: Callable for API invocation (injected for testing/mocking).
-        api_key: DeepSeek API key. Read from DEEPSEEK_API_KEY env var if None.
-        model: Model name. Default 'deepseek-v4-flash'.
-        temperature: Sampling temperature (default 0.6).
-        n_samples: Number of sampling calls for generation (default 3).
-        max_tokens: Token limit for completion.
-
-    Returns:
-        Dict containing walk, candidates, evidence, confidence, generated_by provenance.
-    """
+    """Stage 1: Candidate Generation for LLM Alternative Gate."""
     if call_api_fn is None:
         call_api_fn = _load_ecc_call_api()
     if api_key is None:
@@ -315,28 +310,47 @@ def alt_gate(
     if not api_key:
         raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
 
-    user_prompt = _build_alt_gate_prompt(input_data)
+    base_prompt = _build_alt_gate_prompt(input_data)
+    user_prompt = f"{base_prompt}\n[task:generate]" if unified else base_prompt
+    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if unified else ALT_GATE_SYSTEM_PROMPT_V1
     existing_labels_set = set(input_data.get("existing_labels", []))
 
-    # Stage 1: Candidate Generation Call
     candidate_samples: list[list[dict]] = []
     walks: list[dict] = []
     evidences: list[list[str]] = []
 
     for _ in range(n_samples):
-        raw = call_api_fn(
-            user_prompt,
-            api_key,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system_message=ALT_GATE_SYSTEM_PROMPT_V1,
-            response_format={"type": "json_object"},
-            thinking=False,
-        )
-
-        parsed = _parse_json_loose(raw)
-        assert_alt_gate_contract(parsed)
+        parsed = None
+        for attempt in range(2):
+            raw = call_api_fn(
+                user_prompt,
+                api_key,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system_message=sys_prompt,
+                response_format={"type": "json_object"},
+                thinking=False,
+            )
+            try:
+                if unified:
+                    for lk in ROUTING_LEAK_KEYWORDS:
+                        if lk in raw:
+                            raise AltGateContractError(f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'")
+                candidate_parsed = _parse_json_loose(raw)
+                if unified:
+                    leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "generate")
+                    if leak_err:
+                        raise AltGateContractError(leak_err)
+                assert_alt_gate_contract(candidate_parsed)
+                parsed = candidate_parsed
+                break
+            except Exception as e:
+                if attempt == 0:
+                    continue
+                if isinstance(e, AltGateContractError):
+                    raise e
+                raise AltGateContractError(str(e)) from e
 
         candidate_samples.append(parsed["candidates"])
         walks.append(parsed["walk"])
@@ -349,45 +363,94 @@ def alt_gate(
     for sample in candidate_samples:
         for cand in sample:
             label = cand["label"].strip()
-            # Copy candidate dict to avoid mutating original
             c_dict = dict(cand)
             c_dict["label"] = label
-            # Mechanical deduplication check
             if label in existing_labels_set or label in seen_labels:
                 c_dict["novel"] = False
             else:
                 c_dict["novel"] = True
                 seen_labels.add(label)
 
-            # Prevent duplicate label entries in final candidate list
             if not any(existing["label"] == label for existing in aggregated_candidates):
                 aggregated_candidates.append(c_dict)
 
-    # Mechanical confidence backfill
     confidence = mechanical_confidence_alt_gate(candidate_samples)
 
-    # Stage 2: Independent Adversarial Call (§六․五-5)
+    return {
+        "walks": walks,
+        "evidences": evidences,
+        "aggregated_candidates": aggregated_candidates,
+        "confidence": confidence,
+        "model": model,
+        "n_samples": n_samples,
+        "temperature": temperature,
+    }
+
+
+def alt_gate_adversary(
+    stage1_res: dict,
+    *,
+    call_api_fn: Callable | None = None,
+    api_key: str | None = None,
+    model: str = "deepseek-v4-flash",
+    max_tokens: int = 2048,
+    unified: bool = False,
+    **_kwargs: Any,
+) -> dict:
+    """Stage 2: Adversarial Review for LLM Alternative Gate."""
+    if call_api_fn is None:
+        call_api_fn = _load_ecc_call_api()
+    if api_key is None:
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
+
+    aggregated_candidates = stage1_res["aggregated_candidates"]
+    walks = stage1_res["walks"]
+    evidences = stage1_res["evidences"]
+    confidence = stage1_res["confidence"]
+
     adv_input = {
         "candidate_labels": [c["label"] for c in aggregated_candidates],
         "candidate_tags": [c["concept_tags"] for c in aggregated_candidates],
     }
-    adv_prompt = json.dumps(adv_input, ensure_ascii=False)
+    base_adv_prompt = json.dumps(adv_input, ensure_ascii=False)
+    adv_prompt = f"{base_adv_prompt}\n[task:adversary]" if unified else base_adv_prompt
+    sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if unified else ADVERSARY_SYSTEM_PROMPT_V1
 
-    adv_raw = call_api_fn(
-        adv_prompt,
-        api_key,
-        model=model,
-        max_tokens=max_tokens,
-        temperature=0.0,
-        system_message=ADVERSARY_SYSTEM_PROMPT_V1,
-        response_format={"type": "json_object"},
-        thinking=False,
-    )
+    adv_parsed = None
+    for attempt in range(2):
+        adv_raw = call_api_fn(
+            adv_prompt,
+            api_key,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            system_message=sys_prompt,
+            response_format={"type": "json_object"},
+            thinking=False,
+        )
+        try:
+            if unified:
+                for lk in ROUTING_LEAK_KEYWORDS:
+                    if lk in adv_raw:
+                        raise AltGateContractError(f"ROUTING_LEAK_DETECTED: response contains prompt leak keyword '{lk}'")
+            candidate_adv = _parse_json_loose(adv_raw)
+            if unified:
+                leak_err = check_routing_leak_or_schema(adv_raw, candidate_adv, "adversary")
+                if leak_err:
+                    raise AltGateContractError(leak_err)
+            adv_parsed = candidate_adv
+            break
+        except Exception as e:
+            if attempt == 0:
+                continue
+            if isinstance(e, AltGateContractError):
+                raise e
+            raise AltGateContractError(str(e)) from e
 
-    adv_parsed = _parse_json_loose(adv_raw)
     flagged_set = set(adv_parsed.get("flagged_labels", []))
 
-    # Apply adversarial flags and weight halving
     final_candidates: list[dict] = []
     for cand in aggregated_candidates:
         c_dict = dict(cand)
@@ -400,7 +463,6 @@ def alt_gate(
         c_dict["generated"] = True
         final_candidates.append(c_dict)
 
-    # Aggregate walk and evidence from first sample
     final_walk = walks[0] if walks else {}
     final_evidence = list(dict.fromkeys(sum(evidences, [])))
 
@@ -411,13 +473,64 @@ def alt_gate(
         "confidence": confidence,
         "generated_by": {
             "gate": "synth.alt_gate",
-            "model": model,
-            "n_samples": n_samples,
-            "temperature": temperature,
+            "model": stage1_res.get("model", model),
+            "n_samples": stage1_res.get("n_samples", 3),
+            "temperature": stage1_res.get("temperature", 0.6),
             "called_at": datetime.now(timezone.utc).isoformat(),
         },
     }
 
     _write_alt_gate_state_log(result)
-
     return result
+
+
+def alt_gate(
+    input_data: dict,
+    *,
+    call_api_fn: Callable | None = None,
+    api_key: str | None = None,
+    model: str = "deepseek-v4-flash",
+    temperature: float = 0.6,
+    n_samples: int = 3,
+    max_tokens: int = 2048,
+    unified: bool = False,
+) -> dict:
+    """LLM Alternative Generation Gate with H schema + 2-Stage Adversarial Call.
+
+    Args:
+        input_data: Input dict containing 'state_vector', 'thread_history',
+            'local_texture', and optional 'existing_labels'.
+        call_api_fn: Callable for API invocation (injected for testing/mocking).
+        api_key: DeepSeek API key. Read from DEEPSEEK_API_KEY env var if None.
+        model: Model name. Default 'deepseek-v4-flash'.
+        temperature: Sampling temperature (default 0.6).
+        n_samples: Number of sampling calls for generation (default 3).
+        max_tokens: Token limit for completion.
+        unified: If True, use GATE_SYSTEM_PROMPT_UNIFIED with [task:X] tags.
+
+    Returns:
+        Dict containing walk, candidates, evidence, confidence, generated_by provenance.
+    """
+    stage1_res = alt_gate_generate(
+        input_data,
+        call_api_fn=call_api_fn,
+        api_key=api_key,
+        model=model,
+        temperature=temperature,
+        n_samples=n_samples,
+        max_tokens=max_tokens,
+        unified=unified,
+    )
+    return alt_gate_adversary(
+        stage1_res,
+        call_api_fn=call_api_fn,
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        unified=unified,
+    )
+
+
+alt_gate.stage1 = alt_gate_generate
+alt_gate.stage2 = alt_gate_adversary
+

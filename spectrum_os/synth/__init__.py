@@ -35,9 +35,17 @@ from .alt_gate import (
     mechanical_confidence_alt_gate,
     alt_gate,
 )
+from .gate_prompts import (
+    GATE_SYSTEM_PROMPT_UNIFIED,
+    ROUTING_LEAK_KEYWORDS,
+    check_routing_leak_or_schema,
+)
 from .ensemble import run_ensemble
 
 __all__ = [
+    "GATE_SYSTEM_PROMPT_UNIFIED",
+    "ROUTING_LEAK_KEYWORDS",
+    "check_routing_leak_or_schema",
     "ANCHORS_SYSTEM_PROMPT_V25",
     "CONTRACT_TOP_KEYS",
     "AnchorContractError",
@@ -60,4 +68,5 @@ __all__ = [
     "alt_gate",
     "run_ensemble",
 ]
+
 
