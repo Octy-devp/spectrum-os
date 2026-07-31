@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +32,7 @@ from spectrum_os.kernel import verify
 from spectrum_os.quantum.standing_wave import standing_wave
 from spectrum_os.quantum.vector import StateVector, vector_from_roles
 from spectrum_os.synth.alt_gate import alt_gate
+from spectrum_os.synth.anchors import _load_ecc_call_api
 from spectrum_os.synth.ensemble import run_ensemble
 from feeds.ecc_feeds import register_ecc_sources
 
@@ -111,6 +113,25 @@ def dry_run_gate(gate_input: dict, **_kwargs: Any) -> dict:
     }
 
 
+def dry_run_enumerate_gate(gate_input: dict, **_kwargs: Any) -> dict:
+    """Mock Mode-B enumerate gate for dry-run ensemble simulation (zero LLM)."""
+    t = gate_input.get("state_vector", {}).get("t", 0)
+    return {
+        "accidents": [
+            {
+                "pattern": f"railway_labor_action_t{t}",
+                "instances": [f"iron_workers_walkout_t{t}", f"coal_depot_shutdown_t{t}"],
+                "domain": "社會",
+                "source": "emergent",
+                "usage": "expression",
+                "grounding": "合理推測",
+                "world_development": f"1914-{t}: 鐵路勞工集體行動癱瘓動員節點",
+            }
+        ],
+        "generated_by": {"gate": "dry_run_enumerate", "n_accidents": 1},
+    }
+
+
 def build_sarajevo_initial_vector() -> dict:
     """Construct 1914-06 6D StateVector with explicit provenance."""
     roles_1914_06 = {"crisis": 0.55, "lag": 0.20, "alternative": 0.15, "direction": 0.10}
@@ -131,12 +152,19 @@ def build_sarajevo_initial_vector() -> dict:
 
 
 def build_sarajevo_situation() -> dict:
-    """Construct 1914-07 situation payload for Sarajevo pilot."""
+    """Construct 1914-07 situation payload for Sarajevo pilot.
+
+    ``date`` is the situation's physical-calendar base (1914-07-01). N5's
+    ``residual_key_fn`` advances it by ``RESIDUAL_STEP_DAYS`` per Markov step
+    — a month-key approximation of the pilot's own clock (S6 time-cursor spec
+    is out of scope; no alpha_1 event calendar is injected).
+    """
     init_vec = build_sarajevo_initial_vector()
     return {
         "vector_6d": init_vec["vector"],
         "local_texture": SARAJEVO_1914_LOCAL_TEXTURE,
         "digest": SARAJEVO_1914_DIGEST,
+        "date": "1914-07-01",
     }
 
 
@@ -194,6 +222,70 @@ def evaluate_anchor_comparison(branches: list[dict]) -> dict:
     }
 
 
+# --- N5: residual-trigger wiring (Mode B two-phase, version B) ---
+
+RESIDUAL_STEP_DAYS = 7  # physical-calendar step size (month-key approximation)
+
+
+def _step_to_date(base_date: str, t: int, step_days: int = RESIDUAL_STEP_DAYS) -> str:
+    """Map Markov step ``t`` to a physical-calendar date.
+
+    Each step advances the situation's base date by ``step_days`` calendar
+    days. This is the pilot's own clock (S6 time cursor is out of scope) —
+    deliberately no alpha_1 event calendar.
+    """
+    return (date.fromisoformat(base_date) + timedelta(days=t * step_days)).isoformat()
+
+
+def _filter_sharp_residual_table(residual_table: Any) -> dict:
+    """Run-specific sharpness policy for the Sarajevo pilot.
+
+    Only the date-localized sharp criteria (saturation / decoupling) fire
+    Mode B. ``correlation_flip`` is arc-granularity — 91 continuous months
+    (1913-06..1920-12) covering the ENTIRE pilot window — the same broad-net
+    degeneracy that demoted ``gap`` to amplifier-only in Round-3.5: firing on
+    it would switch every gate point to Mode B and leave the reflect path
+    (standing wave / anchors) structurally empty. ``gap`` is dropped here too
+    (it never fires alone in module logic; the enumerate prompt reads the
+    situation, not the table).
+    """
+    from spectrum_os.synth.residual_trigger import load_residual_table
+
+    table = load_residual_table(residual_table)
+    firing_criteria = {"saturation", "decoupling"}
+    out: dict = {}
+    for key, entry in table.items():
+        if not isinstance(entry, dict):
+            continue
+        firing = [c for c in entry.get("criteria", []) if c in firing_criteria]
+        if firing:
+            out[key] = {"criteria": firing, "detail": entry.get("detail", {})}
+    return out
+
+
+def _build_mode_b_summary(
+    sharp_table: dict, situation_date: str, gate_ts: tuple = (3, 7, 11)
+) -> list[dict]:
+    """Per-gate-point Mode A/B decision (deterministic, zero LLM cost)."""
+    from spectrum_os.synth.residual_trigger import should_enumerate
+
+    summary = []
+    for t in gate_ts:
+        date_key = _step_to_date(situation_date, t)
+        entry = sharp_table.get(date_key, {})
+        criteria = entry.get("criteria", []) if isinstance(entry, dict) else []
+        fired = should_enumerate(sharp_table, date_key)
+        summary.append(
+            {
+                "t": t,
+                "date": date_key,
+                "mode": "enumerate" if fired else "reflect",
+                "criteria": criteria,
+            }
+        )
+    return summary
+
+
 def run_sarajevo_pilot(
     live: bool = False,
     reporter: bool = False,
@@ -202,8 +294,19 @@ def run_sarajevo_pilot(
     seed: int = 42,
     out_path: str = "data/stage3_sarajevo_report.json",
     n_samples: int = 3,
+    residual_table: Any = None,
 ) -> dict:
-    """Run full Sarajevo 1914 pilot pipeline."""
+    """Run full Sarajevo 1914 pilot pipeline.
+
+    N5: when ``residual_table`` (dict or JSON path) is provided, the Mode-B
+    residual trigger is wired into ``run_ensemble`` — gate points whose
+    physical-calendar date (see ``_step_to_date``) hits a sharp residual
+    criterion (saturation / decoupling — see ``_filter_sharp_residual_table``)
+    switch to ``alt_gate_enumerate`` (Mode B) instead of the reflect path.
+    Live cost is tracked through a counting ``call_api_fn`` wrapper.
+    """
+    api_call_count = {"n": 0}
+
     # 1. Register sources & load via registry
     register_ecc_sources()
     substrate = sources.load_source("ecc-knowledge-edges")
@@ -217,13 +320,45 @@ def run_sarajevo_pilot(
     action = {"t": 1, "reweight": {"role": "alternative", "factor": 2.0}}
 
     # 4. Gate selection
+    gate_kwargs: dict[str, Any] = {}
+    enumerate_gate_fn = None  # live: default alt_gate_enumerate
     if live:
         print("[LIVE MODE] Invoking alt_gate LLM gate...")
         estimated_calls = min(12, n_branches * (horizon // 4))
         print(f"Estimated max gate calls: {estimated_calls}")
         gate_fn = alt_gate
+        # N5: count actual API calls through a wrapper (cost tracking).
+        real_call_api = _load_ecc_call_api()
+
+        def counting_call_api(*args: Any, **kwargs: Any) -> str:
+            api_call_count["n"] += 1
+            return real_call_api(*args, **kwargs)
+
+        gate_kwargs["call_api_fn"] = counting_call_api
     else:
         gate_fn = dry_run_gate
+        # N5: Mode B must NOT hit the real API in dry-run — mock enumerate gate.
+        enumerate_gate_fn = dry_run_enumerate_gate
+
+    # N5: residual-trigger wiring (Mode B two-phase)
+    residual_trigger = None
+    residual_key_fn = None
+    mode_b_summary: list[dict] = []
+    if residual_table is not None:
+        sharp_table = _filter_sharp_residual_table(residual_table)
+        situation_date = situation.get("date", "1914-07-01")
+        gate_ts = tuple(t for t in range(horizon - 1) if (t + 1) % 4 == 0)
+        residual_trigger = sharp_table  # Mapping -> auto-wrapped by run_ensemble
+        residual_key_fn = lambda t, ctx: _step_to_date(  # noqa: E731
+            ctx["situation"].get("date", situation_date), t
+        )
+        mode_b_summary = _build_mode_b_summary(sharp_table, situation_date, gate_ts)
+        print(
+            f"[N5] sharp residual table: {len(sharp_table)} keys; gate-point modes: "
+            + ", ".join(
+                f"t={s['t']} {s['date']} {s['mode']}" for s in mode_b_summary
+            )
+        )
 
     # 5. Run ensemble
     ensemble_res = run_ensemble(
@@ -240,6 +375,10 @@ def run_sarajevo_pilot(
         unified=True,
         reporter=reporter,
         n_samples=n_samples,
+        residual_trigger=residual_trigger,
+        residual_key_fn=residual_key_fn,
+        enumerate_gate_fn=enumerate_gate_fn,
+        **gate_kwargs,
     )
 
     # 6. Standing wave decomposition
@@ -279,6 +418,7 @@ def run_sarajevo_pilot(
             "n_branches": ensemble_res["meta"]["n_branches"],
             "horizon": ensemble_res["meta"]["horizon"],
             "total_gate_calls": ensemble_res["meta"]["total_gate_calls"],
+            "total_enumerate_calls": ensemble_res["meta"].get("total_enumerate_calls", 0),
             "seed": ensemble_res["meta"]["seed"],
         },
         # Per-branch tag inventory — makes anchor hits auditable from the artifact
@@ -292,10 +432,31 @@ def run_sarajevo_pilot(
         "anchor_comparison": anchor_comp,
         "gate_calls_and_cost": {
             "total_gate_calls": ensemble_res["meta"]["total_gate_calls"],
+            "total_enumerate_calls": ensemble_res["meta"].get("total_enumerate_calls", 0),
+            "n_reflect_points": ensemble_res["meta"]["total_gate_calls"]
+            - ensemble_res["meta"].get("total_enumerate_calls", 0),
+            "actual_api_calls": api_call_count["n"],
             "mode": "live" if live else "dry-run",
             "estimated_cost_usd": (
-                round(ensemble_res["meta"]["total_gate_calls"] * 0.001, 4) if live else 0.0
+                round(api_call_count["n"] * 0.001, 4) if live else 0.0
             ),
+        },
+        "mode_b_switching": {
+            "policy": (
+                "sharp-only (saturation/decoupling); correlation_flip demoted to "
+                "amplifier for this pilot (arc-granularity 91-month net covers the "
+                "entire window — broad-net degeneracy, Round-3.5 precedent)"
+            ),
+            "step_days": RESIDUAL_STEP_DAYS,
+            "situation_date": situation.get("date"),
+            "gate_points": mode_b_summary,
+        },
+        # Mode-B accident inventory (never flows into tags — F10)
+        "mode_b_accidents": {
+            str(b.get("branch_id", i)): {
+                str(t): accs for t, accs in b.get("accidents_by_step", {}).items()
+            }
+            for i, b in enumerate(ensemble_res["branches"])
         },
         "quarantine_and_adversary_hits": {
             "quarantine_hits": quarantine_hits,
@@ -321,6 +482,12 @@ def main() -> int:
     parser.add_argument("--n-samples", type=int, default=3, help="Number of candidate samples")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--out", type=str, default="data/stage3_sarajevo_report.json", help="Output path")
+    parser.add_argument(
+        "--residual-table",
+        type=str,
+        default=None,
+        help="Residual table JSON path (N5 Mode-B two-phase trigger)",
+    )
 
     args = parser.parse_args()
     run_sarajevo_pilot(
@@ -331,6 +498,7 @@ def main() -> int:
         seed=args.seed,
         out_path=args.out,
         n_samples=args.n_samples,
+        residual_table=args.residual_table,
     )
     return 0
 
