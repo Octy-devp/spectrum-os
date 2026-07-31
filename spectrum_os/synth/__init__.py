@@ -43,6 +43,11 @@ from .gate_prompts import (
     check_routing_leak_or_schema,
 )
 from .ensemble import run_ensemble
+from .residual_trigger import (
+    load_residual_table,
+    make_residual_trigger,
+    should_enumerate,
+)
 
 __all__ = [
     "GATE_SYSTEM_PROMPT_UNIFIED",
@@ -70,6 +75,9 @@ __all__ = [
     "mechanical_confidence_alt_gate",
     "alt_gate",
     "alt_gate_enumerate",
+    "load_residual_table",
+    "make_residual_trigger",
+    "should_enumerate",
     "run_ensemble",
 ]
 
