@@ -107,7 +107,7 @@ class TestAltGateContract:
             "walk": {"crisis": "ok"},
             "candidates": [
                 {
-                    "label": "物資替換點",  # In PROMPT_EXAMPLE_LABELS
+                    "label": "湧現的替代",  # In PROMPT_EXAMPLE_LABELS
                     "concept_tags": ["自訂標籤"],
                     "provenance_hint": "novel",
                     "novel": True,
@@ -123,7 +123,7 @@ class TestAltGateContract:
             "candidates": [
                 {
                     "label": "自訂標籤",
-                    "concept_tags": ["物資網絡"],  # In PROMPT_EXAMPLE_LABELS
+                    "concept_tags": ["繼承的詞彙"],  # In PROMPT_EXAMPLE_LABELS
                     "provenance_hint": "novel",
                     "novel": True,
                 }
