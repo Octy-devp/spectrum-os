@@ -43,12 +43,21 @@ from .gate_prompts import (
     check_routing_leak_or_schema,
 )
 from .ensemble import run_ensemble
+from .probe import (
+    AXIS_A_VALUES,
+    AXIS_B_VALUES,
+    NECESSITY_HINT_KEY,
+    TreeProbeError,
+    assert_tree_gate_contract,
+    probe_select,
+    probe_tree,
+    standing_wave_per_layer,
+)
 from .residual_trigger import (
     load_residual_table,
     make_residual_trigger,
     should_enumerate,
 )
-
 __all__ = [
     "GATE_SYSTEM_PROMPT_UNIFIED",
     "VERSION_B_SYSTEM_PROMPT",
@@ -79,6 +88,12 @@ __all__ = [
     "make_residual_trigger",
     "should_enumerate",
     "run_ensemble",
+    "TREE_GENERATE_SYSTEM_PROMPT",
+    "TreeProbeError",
+    "assert_tree_gate_contract",
+    "standing_wave_per_layer",
+    "probe_tree",
+    "probe_select",
 ]
 
 

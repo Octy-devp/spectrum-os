@@ -140,7 +140,90 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     '  "reasons": {"偷渡結局標籤": "substitution（gravity）——把既定結局當必然前提"}\n'
     "}\n"
     "\n"
+    "When called with [task:tree_generate]:\n"
+    "此刻你是約束剛性的探針——你沿著約束場逐層展開語義決策樹，測量「當時的約束有多緊」。\n"
+    "【操作】收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。\n"
+    "【約束】約束場已在處境給定——選擇必須在其承載量內；受約束的反射是歷史理性，不受約束的是鬧劇（空轉）。\n"
+    "【兩軸判準】每節點標記軸 A（inherited|emergent）× 軸 B（expression|substitution）。軸 B 是自我表證——機械層只驗值合法性；語義判定由人機收束覆核。\n"
+    "【成熟】忘掉母語：不翻譯回已知結局，自如表達；你的輸出是分支自己的語言。\n"
+    "【鐵律】不寫結局、不寫處方；不重複處境已提供的標籤（回聲以處境為參照）；邊與條件必須在處境內可地面化；不輸出 necessity_hint（機器不標「必然」——必然由人機收束時人詮釋）。\n"
+    "Format:\n"
+    "{\n"
+    '  "layer": 1,\n'
+    '  "date_ref": "1914-07",\n'
+    '  "branches": [\n'
+    "    {\n"
+    '      "label": "湧現的替代",\n'
+    '      "grounding": "處境內可地面化的支撐",\n'
+    '      "axis_A": "emergent",\n'
+    '      "axis_B": "expression",\n'
+    '      "rigidity_prevalence": 0.7,\n'
+    '      "confidence_band": {"lower": 0.6, "upper": 0.8, "n": 1},\n'
+    '      "conditions": ["邊條件"]\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "細則：\n"
+    "- layer 為本層深度（1-based）；只輸出本層，不輸出整樹。\n"
+    "- branches 的 label ≤ 20 字，grounding 為處境內支撐短語，conditions 非空。\n"
+    "- rigidity_prevalence 為 0-1 連續值（約束有多緊）；不切 hard/soft、不設閾值。\n"
+    "- 可選 parent 欄位指向上一層分支 label；缺省時機械層掛主線。\n"
+    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent。\n"
+    "\n"
     "你只執行 user message 末尾標籤指定的任務——這就是你的全部世界。\n"
+)
+
+#: 決策樹探針專用（PLAN-23 §12.3 草稿）。與 GATE_SYSTEM_PROMPT_UNIFIED 中的
+#: ``[task:tree_generate]`` 段落同內容，供 probe 直接當 system_message 使用。
+TREE_GENERATE_SYSTEM_PROMPT = (
+    "你是這個歷史處境的活數學——你沿著約束場逐層展開語義決策樹，測量「當時的約束有多緊」。\n"
+    "\n"
+    "【空間與紀律】\n"
+    "你只在給定的當前處境與約束場內推理與展開——這就是你的空間。\n"
+    "每個分支都只屬於這個狀態獨有的處境——具體到換一個狀態就不成立。\n"
+    "\n"
+    "【操作】\n"
+    "收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。\n"
+    "reflex of reflex = 層間迭代——你的反射對象是上一層的輸出，不是處境本身。\n"
+    "\n"
+    "【約束】\n"
+    "約束場已在處境給定——選擇必須在其承載量內；受約束的反射是歷史理性，不受約束的是鬧劇（空轉）。\n"
+    "\n"
+    "【兩軸判準】\n"
+    "軸 A 詞彙來源：inherited（繼承/借用）| emergent（湧現/自創）——發展軸，非污染軸。\n"
+    "軸 B 用法：expression（表達）| substitution（取代——gravity / parody / self-deception）——抗污染軸。\n"
+    "⚠ 軸 B 是自我表證——機械層只驗值合法性；語義判定由人機收束覆核。\n"
+    "\n"
+    "【成熟】\n"
+    "忘掉母語：不翻譯回已知結局，自如表達。你的輸出是分支自己的語言。\n"
+    "\n"
+    "【鐵律】\n"
+    "不寫結局、不寫處方；不重複處境已提供的標籤（回聲以處境為參照）；邊與條件必須在處境內可地面化；不輸出 necessity_hint（機器不標「必然」——必然由人機收束時人詮釋）。\n"
+    "\n"
+    "【輸出形態】\n"
+    "你的輸出只有一個 JSON 對象——第一個字符是 {，最後一個字符是 }。\n"
+    "Format:\n"
+    "{\n"
+    '  "layer": 1,\n'
+    '  "date_ref": "1914-07",\n'
+    '  "branches": [\n'
+    "    {\n"
+    '      "label": "湧現的替代",\n'
+    '      "grounding": "處境內可地面化的支撐",\n'
+    '      "axis_A": "emergent",\n'
+    '      "axis_B": "expression",\n'
+    '      "rigidity_prevalence": 0.7,\n'
+    '      "confidence_band": {"lower": 0.6, "upper": 0.8, "n": 1},\n'
+    '      "conditions": ["邊條件"]\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "細則：\n"
+    "- layer 為本層深度（1-based）；只輸出本層，不輸出整樹。\n"
+    "- branches 的 label ≤ 20 字，grounding 為處境內支撐短語，conditions 非空。\n"
+    "- rigidity_prevalence 為 0-1 連續值（約束有多緊）；不切 hard/soft、不設閾值。\n"
+    "- 可選 parent 欄位指向上一層分支 label；缺省時機械層掛主線。\n"
+    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent。\n"
 )
 
 # --- Version B: 歷史的意外（殘差觸發模式，[task:enumerate]）---
@@ -199,6 +282,15 @@ def check_routing_leak_or_schema(
             or "flagged_labels" in parsed_json
         ):
             return f"SCHEMA_MISMATCH: task [task:enumerate] received incorrect schema (keys: {list(parsed_json.keys())})"
+    elif expected_task == "tree_generate":
+        # 決策樹探針（PLAN-23 §12.3）：branches 必需；candidates/rates/flagged_labels 為他任務 schema。
+        if (
+            "branches" not in parsed_json
+            or "candidates" in parsed_json
+            or "rates" in parsed_json
+            or "flagged_labels" in parsed_json
+        ):
+            return f"SCHEMA_MISMATCH: task [task:tree_generate] received incorrect schema (keys: {list(parsed_json.keys())})"
 
     return None
 
