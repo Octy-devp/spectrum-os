@@ -19,12 +19,17 @@ from spectrum_os.synth.gate_prompts import (
 from spectrum_os.synth.probe import (
     NECESSITY_HINT_KEY,
     TreeProbeError,
+    _mechanical_check_layer,
     _prevalence_band,
     _rigidity_band,
     _semantic_path_similarity,
+    assert_code_compliance,
     assert_tree_gate_contract,
     cluster_archetypes_semantic,
     convergence_view,
+    detect_script,
+    max_len_for_code,
+    max_words_for_code,
     probe_select,
     probe_tree,
     standing_wave_per_layer,
@@ -165,6 +170,11 @@ def valid_branch(label, **overrides):
     }
     b.update(overrides)
     return b
+
+
+def _code_aware_tree(label, **branch_overrides):
+    """語碼感知長度測試用：單層單分支樹輸出（可事後加頂層 ``code`` 欄位）。"""
+    return {"layer": 1, "date_ref": "1914-07", "branches": [valid_branch(label, **branch_overrides)]}
 
 
 @pytest.fixture(autouse=True)
@@ -928,12 +938,27 @@ class TestProbeF1F7Repairs:
         assert g["saturation"] == 0.99
         assert any("③ 不可延期" in c for c in g["conditions"])
 
-    # --- F3：兩軸名詞字首拒收（契約層 fatal）---
-    def test_axis_echo_prefix_rejected_contract(self):
+    # --- F3：兩軸名詞字首（契約層降級：fatal → echo_notes 記錄，決策 1/2）---
+    def test_axis_echo_prefix_nonfatal_recorded_contract(self):
         for label in ["繼承的動員令", "湧現的合作社", "替代方案"]:
             bad = {"layer": 1, "branches": [valid_branch(label)]}
-            with pytest.raises(TreeProbeError, match="axis echo"):
-                assert_tree_gate_contract(bad)
+            notes: list[str] = []
+            assert_tree_gate_contract(bad, echo_notes=notes)  # 不再 raise
+            assert notes and any("axis echo" in n for n in notes)
+
+    # --- 決策 4：example echo 契約層降為記錄（範例只是形狀）---
+    def test_example_echo_nonfatal_recorded_contract(self):
+        from spectrum_os.synth.gate_prompts import PROMPT_EXAMPLE_LABELS
+        from spectrum_os.synth.probe import AXIS_ECHO_PREFIXES
+        # 挑一個不在軸名詞字首集合的範例標籤（避免同時命中 axis echo）
+        example_label = next(
+            lbl for lbl in PROMPT_EXAMPLE_LABELS
+            if not lbl.startswith(AXIS_ECHO_PREFIXES)
+        )
+        bad = {"layer": 1, "branches": [valid_branch(example_label)]}
+        notes: list[str] = []
+        assert_tree_gate_contract(bad, echo_notes=notes)  # 不再 raise
+        assert notes and any("example echo" in n for n in notes)
 
     # --- F3：兩軸名詞字首拒收（管線層 non-fatal → rejected 清單）---
     def test_axis_echo_prefix_nonfatal_pipeline(self):
@@ -1127,20 +1152,28 @@ class TestDcaRoleVector:
             assert_tree_gate_contract(out, parent_branches=self._parent(["crisis"]))
 
     def test_grammar_structural_zero_direction_to_alternative(self):
-        # 方向承諾不可撤銷：direction → alternative 結構性零 → fatal
+        # 方向承諾不可撤銷：direction → alternative 結構性零
+        # 🔴 2026-08-02：降為非致命（CLAD=閱讀文法非世界序列）——記入 echo_notes
         out = {"layer": 2, "branches": [
             valid_branch("子", parent="父", roles=["alternative"]),
         ]}
-        with pytest.raises(TreeProbeError, match="文法轉移|結構性零|validate_alternative"):
-            assert_tree_gate_contract(out, parent_branches=self._parent(["direction"]))
+        notes: list[str] = []
+        assert_tree_gate_contract(
+            out, parent_branches=self._parent(["direction"]), echo_notes=notes
+        )
+        assert any("文法轉移異常" in n for n in notes)
 
     def test_grammar_structural_zero_lag_to_direction(self):
-        # Lag 需經 Alternative 中介：lag → direction 結構性零 → fatal
+        # Lag 需經 Alternative 中介：lag → direction 結構性零
+        # 🔴 2026-08-02：降為非致命——記入 echo_notes
         out = {"layer": 2, "branches": [
             valid_branch("子", parent="父", roles=["direction"]),
         ]}
-        with pytest.raises(TreeProbeError, match="文法轉移|結構性零|validate_alternative"):
-            assert_tree_gate_contract(out, parent_branches=self._parent(["lag"]))
+        notes: list[str] = []
+        assert_tree_gate_contract(
+            out, parent_branches=self._parent(["lag"]), echo_notes=notes
+        )
+        assert any("文法轉移異常" in n for n in notes)
 
     def test_grammar_multi_role_superposition_existential(self):
         # 父叠加 {direction, crisis}——子 alternative 可經 crisis→alternative（存在性）→ 合法
@@ -1150,40 +1183,47 @@ class TestDcaRoleVector:
         assert_tree_gate_contract(out, parent_branches=self._parent(["direction", "crisis"]))
 
     def test_grammar_default_parent_main_line(self):
-        # 無 parent 欄位 → 掛主線（_llm_rigidity 最高者）
+        # 無 parent 欄位 → 掛主線（_llm_rigidity 最高者）——文法異常記 notes 非 raise
         parents = [
             {"label": "低剛性", "roles": ["crisis"], "_llm_rigidity": 0.2},
             {"label": "主線", "roles": ["direction"], "_llm_rigidity": 0.9},
         ]
         out = {"layer": 2, "branches": [valid_branch("子", roles=["alternative"])]}
-        with pytest.raises(TreeProbeError, match="文法轉移|結構性零"):
-            assert_tree_gate_contract(out, parent_branches=parents)
+        notes: list[str] = []
+        assert_tree_gate_contract(out, parent_branches=parents, echo_notes=notes)
+        # 主線是 direction → 子 alternative 是結構性零 → 記入 notes（非 raise）
+        assert any("文法轉移異常" in n for n in notes)
         parents2 = [
             {"label": "主線", "roles": ["crisis"], "_llm_rigidity": 0.9},
             {"label": "次線", "roles": ["direction"], "_llm_rigidity": 0.2},
         ]
-        assert_tree_gate_contract(out, parent_branches=parents2)
+        notes2: list[str] = []
+        assert_tree_gate_contract(out, parent_branches=parents2, echo_notes=notes2)
+        # 主線是 crisis → 子 alternative 合法 → 無異常
+        assert not any("文法轉移異常" in n for n in notes2)
 
     def test_grammar_no_parent_branches_skips(self):
         # 無 parent_branches（世界無關 fallback）→ 不檢查轉移，仍過
         out = {"layer": 2, "branches": [valid_branch("子", roles=["alternative"])]}
         assert_tree_gate_contract(out)
 
-    def test_grammar_violation_via_probe_tree_fatal(self):
-        # 文法結構性零是契約級（fatal）——經 probe_tree 全管線驗證
+    def test_grammar_violation_via_probe_tree_nonfatal(self):
+        # 🔴 2026-08-02：文法結構性零不再 fatal——經 probe_tree 全管線應**通過**
+        #（違反降為記錄，交人機收束），樹仍可展開
         l1 = {"layer": 1, "date_ref": "1914-07", "branches": [
             valid_branch("父", roles=["direction"]),
             valid_branch("支二", roles=["crisis"]),
             valid_branch("支三", roles=["lag"]),
         ]}
         l2 = {"layer": 2, "date_ref": "1914-08", "branches": [
-            valid_branch("子", parent="父", roles=["alternative"]),  # direction→alternative 結構性零
+            valid_branch("子", parent="父", roles=["alternative"]),  # direction→alternative 結構性零（記録）
             valid_branch("續二", parent="支二", roles=["lag"]),
             valid_branch("續三", parent="支三", roles=["crisis"]),
         ]}
         mock_gate, _ = make_mock_gate([l1, l2])
-        with pytest.raises(TreeProbeError, match="文法轉移|結構性零"):
-            probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        # 樹正常展開（文法異常被記錄而非阻斷）
+        assert "trees" in result
 
     # --- rate_matrix 零強度（具體限制的可選輸入） ---
     # ROLES 次序：(crisis, lag, alternative, direction)
@@ -1641,3 +1681,448 @@ class TestBandCalibration:
         band = _rigidity_band([], 0)
         assert band["confidence"] == "UNKNOWN"
         assert band["basis"] == "no_data"
+
+
+# ---------------------------------------------------------------------------
+# 語碼分層（機械層）：system_message 注入 / 語碼感知長度 / detect_script / 合規審計
+# ---------------------------------------------------------------------------
+
+class TestSystemMessageInjection:
+    """任務 1：system_message 注入——預設行為不變、注入替代穿透呼叫鏈。"""
+
+    def test_default_system_message_is_tree_prompt(self):
+        seen: dict = {}
+        _calls = [0]
+
+        def mock_gate(prompt, api_key, **kwargs):
+            seen["system_message"] = kwargs.get("system_message")
+            _calls[0] += 1
+            # 依層號回傳不同 LAYER——層間 echo 攔截（語義中介）拒重複 label
+            return json.dumps(LAYER_1 if _calls[0] == 1 else LAYER_2, ensure_ascii=False)
+
+        probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        assert seen["system_message"] == TREE_GENERATE_SYSTEM_PROMPT
+
+    def test_custom_system_message_reaches_gate_fn(self):
+        custom = "CUSTOM-語碼分層-system-prompt"
+        seen: dict = {}
+        _calls = [0]
+
+        def mock_gate(prompt, api_key, **kwargs):
+            seen["system_message"] = kwargs.get("system_message")
+            _calls[0] += 1
+            return json.dumps(LAYER_1 if _calls[0] == 1 else LAYER_2, ensure_ascii=False)
+
+        probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate,
+                   system_message=custom)
+        assert seen["system_message"] == custom
+
+    def test_custom_system_message_applies_all_layers(self):
+        custom = "CUSTOM-2"
+        seen: list = []
+        _calls = [0]
+
+        def mock_gate(prompt, api_key, **kwargs):
+            seen.append(kwargs.get("system_message"))
+            _calls[0] += 1
+            return json.dumps(LAYER_1 if _calls[0] == 1 else LAYER_2, ensure_ascii=False)
+
+        probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate,
+                   system_message=custom)
+        assert seen == [custom, custom]
+
+
+class TestCodeLengthHelpers:
+    """任務 2 輔助：max_len_for_code / max_words_for_code 語碼→上限映射。"""
+
+    def test_max_len_for_code_mapping(self):
+        assert max_len_for_code("zh") == 20
+        assert max_len_for_code("ja") == 20
+        assert max_len_for_code("ko") == 20
+        assert max_len_for_code("en") == 60
+        assert max_len_for_code("fr") == 60
+        assert max_len_for_code("de") == 60
+        assert max_len_for_code("sr") == 60
+        assert max_len_for_code("ru") == 60
+        assert max_len_for_code(None) == 20       # 無語碼 → 舊行為
+        assert max_len_for_code("xx") == 20      # 未知語碼 → 舊行為
+
+    def test_max_words_for_code_mapping(self):
+        assert max_words_for_code("zh") is None
+        assert max_words_for_code("de") == 8
+        assert max_words_for_code("ru") == 8
+        assert max_words_for_code(None) is None
+        assert max_words_for_code("xx") is None
+
+    def test_field_specific_limits(self):
+        assert max_len_for_code("de", "grounding") == 240
+        assert max_len_for_code("de", "condition") == 120
+        assert max_len_for_code(None, "grounding") == 80
+        assert max_len_for_code(None, "condition") == 40
+
+
+class TestCodeAwareLength:
+    """任務 2：語碼感知長度契約——德語複合詞（拉丁語碼）通過、CJK 維持 20 字符、無 code 舊行為。"""
+
+    # 52 字符、5 詞——> 20 字符會被誤殺；code="de"（60 字符 / 8 詞）通過
+    GERMAN_COMPOUND = "Bewegliche Verteidigung mit getrennten Schwerpunkten"
+
+    def test_german_compound_passes_with_latin_code(self):
+        assert_tree_gate_contract(_code_aware_tree(self.GERMAN_COMPOUND), code="de")
+
+    def test_german_compound_rejected_without_code(self):
+        # 向後相容：無語碼 → 舊 20 字符上限，52 字符被拒
+        with pytest.raises(TreeProbeError, match="label"):
+            assert_tree_gate_contract(_code_aware_tree(self.GERMAN_COMPOUND))
+
+    def test_cjk_label_keeps_20_char_limit_with_code(self):
+        # CJK 語碼（zh）維持 20 字符上限
+        ok = _code_aware_tree("動員令凍結與國際調停介入的複合情境")  # 17 字符
+        assert_tree_gate_contract(ok, code="zh")
+        long_label = "動員令凍結與國際調停介入的複合情境下的多層次張力"  # 24 字符
+        with pytest.raises(TreeProbeError, match="label"):
+            assert_tree_gate_contract(_code_aware_tree(long_label), code="zh")
+
+    def test_no_code_preserves_old_behavior(self):
+        # 無語碼：17 字符通過、24 字符被拒（舊行為不變）
+        assert_tree_gate_contract(_code_aware_tree("動員令凍結與國際調停介入的複合情境"))
+        with pytest.raises(TreeProbeError, match="label"):
+            assert_tree_gate_contract(
+                _code_aware_tree("動員令凍結與國際調停介入的複合情境下的多層次張力")
+            )
+
+    def test_word_limit_rejects_overlong_latin_label(self):
+        # 拉丁語碼：<60 字符但 >8 詞 → 詞數上限拒絕
+        label = "a b c d e f g h i j k l m n"  # 14 詞、27 字符
+        with pytest.raises(TreeProbeError, match="詞數"):
+            assert_tree_gate_contract(_code_aware_tree(label), code="de")
+
+    def test_code_from_output_top_level_field(self):
+        # output 頂層 ``code`` 欄位亦走語碼感知路徑
+        out = _code_aware_tree(self.GERMAN_COMPOUND)
+        out["code"] = "de"
+        assert_tree_gate_contract(out)
+
+    def test_grounding_code_aware(self):
+        # grounding：無語碼 80 字符上限；code="de" 240 字符 / 40 詞
+        long_grounding = "處境內支撐 " * 30  # 90 字符 > 80、< 240
+        with pytest.raises(TreeProbeError, match="grounding"):
+            assert_tree_gate_contract(_code_aware_tree("動員令凍結", grounding=long_grounding))
+        assert_tree_gate_contract(
+            _code_aware_tree("Mobilization freeze", grounding=long_grounding), code="de"
+        )
+
+    def test_condition_length_only_when_code_given(self):
+        # conditions：無語碼不檢查（舊行為）；code 給定時走語碼感知（40 詞 > 24 → 拒）
+        long_cond = " ".join(["condition"] * 40)
+        out = _code_aware_tree("動員令凍結", conditions=[long_cond])
+        assert_tree_gate_contract(out)  # 無語碼 → 不檢查（向後相容）
+        with pytest.raises(TreeProbeError, match="conditions"):
+            assert_tree_gate_contract(out, code="de")
+
+    def test_probe_tree_threads_code_end_to_end(self):
+        _calls = [0]
+
+        def mock_gate(prompt, api_key, **kwargs):
+            _calls[0] += 1
+            # 依層號回傳不同 label + 正確 layer——層間 echo 攔截（語義中介）拒重複 label
+            if _calls[0] == 1:
+                return json.dumps(_code_aware_tree(self.GERMAN_COMPOUND), ensure_ascii=False)
+            return json.dumps(
+                {"layer": 2, "date_ref": "1914-08",
+                 "branches": [valid_branch("Bewegliche Verteidigung")]},
+                ensure_ascii=False,
+            )
+
+        result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, code="de")
+        assert result["meta"]["params"]["code"] == "de"
+
+    def test_probe_tree_without_code_keeps_old_contract(self):
+        def mock_gate(prompt, api_key, **kwargs):
+            return json.dumps(_code_aware_tree(self.GERMAN_COMPOUND), ensure_ascii=False)
+
+        with pytest.raises(TreeProbeError, match="label"):
+            probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+
+
+class TestDetectScript:
+    """任務 3a：detect_script——中文/英文/俄文/混合/未知各回傳正確。"""
+
+    def test_chinese_is_cjk(self):
+        assert detect_script("動員令凍結") == "cjk"
+
+    def test_english_is_latin(self):
+        assert detect_script("Mobilization freeze") == "latin"
+
+    def test_french_accented_is_latin(self):
+        assert detect_script("café déjà vu") == "latin"
+
+    def test_german_compound_is_latin(self):
+        assert detect_script(TestCodeAwareLength.GERMAN_COMPOUND) == "latin"
+
+    def test_russian_is_cyrillic(self):
+        assert detect_script("Мобилизация заморожена") == "cyrillic"
+
+    def test_mixed_scripts(self):
+        assert detect_script("動員令 freeze") == "mixed"
+
+    def test_punctuation_only_unknown(self):
+        assert detect_script("!!! ???") == "unknown"
+        assert detect_script("") == "unknown"
+        assert detect_script("   ") == "unknown"
+
+    def test_non_string_unknown(self):
+        assert detect_script(None) == "unknown"
+
+
+class TestCodeCompliance:
+    """任務 3b：assert_code_compliance——語碼合規審計輔助（不接入管線）。"""
+
+    def test_german_label_complies_with_de(self):
+        assert assert_code_compliance("Bewegliche Verteidigung", ["de"]) is True
+
+    def test_english_label_complies_with_de(self):
+        # de 允許 latin 書寫——英語 label 亦是 latin → 合規（書寫系統層級，非語言層級）
+        assert assert_code_compliance("Mobilization freeze", ["de"]) is True
+
+    def test_cjk_label_violates_de(self):
+        assert assert_code_compliance("動員令凍結", ["de"]) is False
+
+    def test_cyrillic_label_violates_de(self):
+        assert assert_code_compliance("Мобилизация", ["de"]) is False
+
+    def test_cyrillic_label_complies_with_sr_and_ru(self):
+        assert assert_code_compliance("Мобилизация", ["sr"]) is True
+        assert assert_code_compliance("Мобилизация", ["ru"]) is True
+
+    def test_unknown_label_does_not_block(self):
+        assert assert_code_compliance("!!!", ["de"]) is True
+
+    def test_unknown_code_does_not_block(self):
+        assert assert_code_compliance("動員令凍結", ["xx"]) is True
+
+    def test_mixed_label_partial_compliance(self):
+        # mixed：任一成分書寫系統命中允許集合即 True
+        assert assert_code_compliance("動員令 freeze", ["de"]) is True
+        assert assert_code_compliance("動員令 freeze", ["zh"]) is True
+
+
+class TestMechanicalLayerCodeCompliance:
+    """任務 2：語碼合規接入 _mechanical_check_layer——不合語碼 → rejected（非致命）；mixed 寬鬆（決策 3）。"""
+
+    def _layer(self, labels):
+        return {"layer": 1, "branches": [valid_branch(l) for l in labels]}
+
+    def test_cjk_label_rejected_when_code_de(self):
+        passed, rejected = _mechanical_check_layer(
+            self._layer(["動員令凍結", "Bewegliche Verteidigung"]),
+            None, code="de",
+        )
+        assert [r["label"] for r in rejected] == ["動員令凍結"]
+        assert any("書寫系統不合語碼" in " ".join(r["reject_reasons"]) for r in rejected)
+        assert [b["label"] for b in passed] == ["Bewegliche Verteidigung"]
+
+    def test_cyrillic_label_rejected_when_code_de(self):
+        passed, rejected = _mechanical_check_layer(
+            self._layer(["Мобилизация"]), None, code="de",
+        )
+        assert [r["label"] for r in rejected] == ["Мобилизация"]
+        assert len(passed) == 0
+
+    def test_latin_label_passes_when_code_de(self):
+        passed, rejected = _mechanical_check_layer(
+            self._layer(["Bewegliche Verteidigung", "Mobilization freeze"]),
+            None, code="de",
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 2
+
+    def test_sr_latin_cyrillic_dual_script_passes(self):
+        # 決策 3：sr 拉丁/西里爾雙書寫——各自合規
+        passed, rejected = _mechanical_check_layer(
+            self._layer(["Мобилизация заморожена", "Mobilizacija"]),
+            None, code="sr",
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 2
+
+    def test_sr_mixed_script_passes(self):
+        # 決策 3：mixed 寬鬆——任一成分命中 sr 允許集合（latin/cyrillic）即 True
+        passed, rejected = _mechanical_check_layer(
+            self._layer(["Мобилизация freeze"]), None, code="sr",
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_no_code_does_not_check(self):
+        # 向後相容：code=None → 語碼合規不檢查
+        passed, rejected = _mechanical_check_layer(
+            self._layer(["動員令凍結"]), None,
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_probe_tree_code_compliance_rejects_cjk_label(self):
+        """端到端：code="de" 時 CJK label 分支被機械層非致命拒 → rejected 清單；拉丁分支存活。"""
+        l1 = {"layer": 1, "date_ref": "1914-07", "branches": [
+            valid_branch("動員令凍結"),  # CJK → 不合 de 語碼 → rejected
+            valid_branch("Mobilization freeze"),
+            valid_branch("Bewegliche Verteidigung"),
+        ]}
+        l2 = {"layer": 2, "date_ref": "1914-08", "branches": [
+            valid_branch("Continuation one", parent="Mobilization freeze"),
+            valid_branch("Continuation two", parent="Bewegliche Verteidigung"),
+            valid_branch("Continuation three", parent="Bewegliche Verteidigung"),
+        ]}
+        mock_gate, _ = make_mock_gate([l1, l2])
+        result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, code="de")
+        rejected_labels = [r["label"] for r in result["rejected"]]
+        assert "動員令凍結" in rejected_labels
+        assert any(
+            "書寫系統不合語碼" in " ".join(r.get("reject_reasons", []))
+            for r in result["rejected"]
+        )
+        # 拉丁分支存活 → 樹仍建立
+        assert len(result["trees"]) == 1
+        assert all(
+            b["label"] != "動員令凍結"
+            for b in result["trees"][0]["layers"][0]["branches"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. 層間 echo 攔截（T16 語義中介）——判定精化：只拒「label 相同且承義全同」
+# ---------------------------------------------------------------------------
+
+class TestLayerEchoSemanticInterception:
+    """層間 echo 攔截（T16 語義中介，2026-08-02）判定精化。
+
+    - (a) 真 echo：label 相同 **且** 承義欄位（binding/perspective/grounding/
+      conditions）全同/缺失 ＝ 馬可夫原地踏步（轉移矩陣退回恆等）→ 拒。
+    - (b) 假 echo：label 相同但承義欄位開出新路 ＝ 合法結構延續 → 放行，
+      記入 echo_notes（PLAN-23 §12.4 echo 降權非致命）。
+    實證：純 label 精確匹配下 78-81% 層間拒收是假 echo 誤殺（L3 塌單鏈根因）。
+    """
+
+    @staticmethod
+    def _branch(label, binding=None, perspective=None, conditions=None,
+                grounding="處境內支撐"):
+        b = {
+            "label": label,
+            "grounding": grounding,
+            "axis_A": "emergent",
+            "axis_B": "expression",
+            "rigidity_prevalence": 0.6,
+            "conditions": conditions or ["邊條件"],
+        }
+        if binding is not None:
+            b["binding"] = binding
+        if perspective is not None:
+            b["perspective"] = perspective
+        return b
+
+    def _parent(self):
+        return [self._branch("俄國總動員令", binding="簽署的舊束縛", perspective="總參謀部")]
+
+    def test_true_echo_same_label_and_denotation_rejected(self):
+        # (a) label + 承義全同 → 拒（真原地踏步）
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [
+                self._branch("俄國總動員令", binding="簽署的舊束縛", perspective="總參謀部")]},
+            None, parent_branches=self._parent(),
+        )
+        assert len(passed) == 0
+        assert rejected and any(
+            "真原地踏步" in r for r in rejected[0]["reject_reasons"]
+        )
+
+    def test_true_echo_both_lack_denotation_rejected(self):
+        # (a') 兩者皆無 binding/perspective（valid_branch 形狀）→ grounding/conditions 同 → 拒
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [self._branch("俄國總動員令")]},
+            None, parent_branches=[self._branch("俄國總動員令")],
+        )
+        assert len(passed) == 0
+        assert rejected and any(
+            "真原地踏步" in r for r in rejected[0]["reject_reasons"]
+        )
+
+    def test_false_echo_new_binding_released(self):
+        # (b) label 同但 binding 全新 → 放行（誤殺修復核心案例）
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [
+                self._branch("俄國總動員令", binding="以鐵路運力為約束的階段性動員")]},
+            None, parent_branches=self._parent(),
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_false_echo_new_perspective_released(self):
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [
+                self._branch("俄國總動員令", binding="簽署的舊束縛", perspective="倫敦外交部")]},
+            None, parent_branches=self._parent(),
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_false_echo_new_conditions_released(self):
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [
+                self._branch("俄國總動員令", binding="簽署的舊束縛",
+                             perspective="總參謀部", conditions=["波蘭走廊駐軍密度"])]},
+            None, parent_branches=self._parent(),
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_false_echo_recorded_to_echo_notes(self):
+        notes: list[str] = []
+        _mechanical_check_layer(
+            {"layer": 3, "branches": [self._branch("俄國總動員令", binding="新束縛")]},
+            None, parent_branches=self._parent(), echo_notes=notes,
+        )
+        assert any("層間 label 延續" in n for n in notes)
+
+    def test_echo_notes_none_quiet(self):
+        # echo_notes=None → 假 echo 放行但靜默（向後相容）
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [self._branch("俄國總動員令", binding="新束縛")]},
+            None, parent_branches=self._parent(),
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_new_label_always_passes(self):
+        passed, rejected = _mechanical_check_layer(
+            {"layer": 3, "branches": [self._branch("德國海軍北海集結", binding="新束縛")]},
+            None, parent_branches=self._parent(),
+        )
+        assert len(rejected) == 0
+        assert len(passed) == 1
+
+    def test_probe_tree_l3_no_collapse_with_semantic_continuation(self):
+        """端到端：L2 分支在 L3 被「label 延續但承義新」的合法發展 → 全部放行，L3 不塌單鏈。
+
+        舊判據（純 label 精確匹配）下，本測試的 L3 會因 label 重複 L2 而全被拒
+        → L3 塌成單鏈（甚至整層 TreeProbeError）。精化後全部放行。
+        """
+        l1 = {"layer": 1, "date_ref": "1914-07", "branches": [valid_branch("動員令簽署")]}
+        l2 = {"layer": 2, "date_ref": "1914-08", "branches": [
+            valid_branch("俄國總動員令", binding="簽署的舊束縛", perspective="總參謀部"),
+            valid_branch("德國最後通牒", binding="通牒期限", perspective="柏林外交部"),
+        ]}
+        l3 = {"layer": 3, "date_ref": "1914-09", "branches": [
+            valid_branch("俄國總動員令", binding="以鐵路運力為約束的階段性動員",
+                         perspective="沙俄總參謀部"),
+            valid_branch("德國最後通牒", binding="英國調停介入後的軟化",
+                         perspective="倫敦外交部"),
+            valid_branch("奧匈對塞宣戰", binding="貝希托爾德主導", perspective="維也納戰爭部"),
+        ]}
+        mock_gate, _ = make_mock_gate([l1, l2, l3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        tree = result["trees"][0]
+        l3_branches = [b for le in tree["layers"] if le["layer"] == 3 for b in le["branches"]]
+        assert len(l3_branches) == 3  # 全部存活——不塌成單鏈
+        # 假 echo（label 延續）被記錄而非丟棄
+        assert any("層間 label 延續" in n for n in result["echo_notes"])

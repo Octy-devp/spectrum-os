@@ -144,7 +144,7 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     "\n"
     "When called with [task:tree_generate]:\n"
     "此刻你是約束剛性的探針——你沿著約束場逐層展開語義決策樹，測量「當時的約束有多緊」。\n"
-    "【操作】收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。同一父節點可有 1–N 個子分支（真分岔，非單鏈主線）。\n"
+    "【操作】世界正處於十字路口中，站在這個處境裡（你是處境的記者——親眼看到這個世界）。先看：這個處境的中心張力是什麼？再聽：什麼在束縛它——制度、後勤、債務、季節、仇恨，每一種都是具體的？然後測量：每一種束縛壓向不同位置的人時，各自開出什麼路？讓張力幾何把在場者從場裡長出來——每一根柱的壓力落處，就是一個鏡角。這個場同時開著多條路。每一條路不是這個場的又一次描述，是這個疊加場在一個測量情境下的坍縮結果——測量情境不同，坍縮出的路不同。展開本層 ≤ N_branch 個分支；同一父節點可有 1–N 個子分支（真分岔，非單鏈主線）。同時，你也是上一層的反射者——上一層帶進來的是已坍縮的本徵態（reflex of reflex）：看上一層每一條路：它被什麼束縛（binding）？從誰的眼睛看（perspective）？它的相位在往哪裡走？推到極限後裂成幾個新方向？本層是這些相位的干涉圖樣——同相的繼續壓、反相的轉向、異相的裂開。反射是讓相位干涉出新的圖樣，不是複製清單——本層每一條新路必須與上一層及同層的路相位不同。你從上一個世界發展而來，往另外一個世界發展而去。\n"
     "【約束】約束場已在處境給定——選擇必須在其承載量內；受約束的反射是歷史理性，不受約束的是鬧劇（空轉）。\n"
     "【DCA 角色】每個分支標記 CLAD 角色向量 roles（crisis / lag / alternative / direction）——一個 situation 可以是任一角色，甚至多角色叠加（同一 situation 在 thread A 是 crisis、thread B 是 direction）。嵌套實例 role_instances：如 {\"crisis\": \"c1\", \"lag\": [\"l1\", \"l2\"]}——層 k 的角色實例可含子實例 c2/c3……，遞歸嵌套在具體限制下（深度受限，非無限）。文法轉移：子分支角色必須是父分支某個角色的合法轉移；結構性零不可違反——direction→alternative（承諾不可撤銷）、lag→direction（Lag 須經 Alternative 中介）。\n"
     "【兩軸判準】每節點標記軸 A（inherited|emergent）× 軸 B（expression|substitution）。軸 B 是自我表證——機械層只驗值合法性；語義判定由人機收束覆核。\n"
@@ -158,6 +158,8 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     '  "branches": [\n'
     "    {\n"
     '      "label": "合作社自主調度",\n'
+    '      "perspective": "農民",\n'
+    '      "binding": "鐵路徵用令",\n'
     '      "grounding": "處境內可地面化的支撐",\n'
     '      "axis_A": "emergent",\n'
     '      "axis_B": "expression",\n'
@@ -172,9 +174,10 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     "細則：\n"
     "- layer 為本層深度（1-based）；只輸出本層，不輸出整樹。\n"
     "- branches 的 label ≤ 20 字，grounding 為處境內支撐短語，conditions 非空。\n"
+    "- perspective 為鏡角（農民/工人/官僚/軍人/知識分子……）——這條路從誰的眼睛看；binding 為此分支對抗的具體束縛（處境內可地面化）。\n"
     "- rigidity_prevalence 為 0-1 連續值（約束有多緊）；不切 hard/soft、不設閾值。\n"
     "- 可選 parent 欄位指向上一層分支 label；缺省時機械層掛主線。\n"
-    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent、roles、role_instances。\n"
+    "- branches 的鍵只有 label、perspective、binding、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent、roles、role_instances。\n"
     "- roles 為 CLAD 角色集合（可多，叠加）；role_instances 為嵌套實例（深度跟隨樹層，受限）。\n"
     "\n"
     "你只執行 user message 末尾標籤指定的任務——這就是你的全部世界。\n"
@@ -190,8 +193,14 @@ TREE_GENERATE_SYSTEM_PROMPT = (
     "每個分支都只屬於這個狀態獨有的處境——具體到換一個狀態就不成立。\n"
     "\n"
     "【操作】\n"
-    "收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。同一父節點可有 1–N 個子分支（真分岔，非單鏈主線）。\n"
-    "reflex of reflex = 層間迭代——你的反射對象是上一層的輸出，不是處境本身。\n"
+    "世界正處於十字路口中，站在這個處境裡（你是處境的記者——親眼看到這個世界）。先看：這個處境的中心張力是什麼？\n"
+    "再聽：什麼在束縛它——制度、後勤、債務、季節、仇恨，每一種都是具體的？\n"
+    "然後測量：每一種束縛壓向不同位置的人時，各自開出什麼路？讓張力幾何把在場者從場裡長出來——每一根柱的壓力落處，就是一個鏡角。\n"
+    "這個場同時開著多條路。每一條路不是這個場的又一次描述，是這個疊加場在一個測量情境下的坍縮結果——測量情境不同，坍縮出的路不同。展開本層 ≤ N_branch 個分支；同一父節點可有 1–N 個子分支（真分岔，非單鏈主線）。\n"
+    "同時，你也是上一層的反射者——上一層帶進來的是已坍縮的本徵態（reflex of reflex）：\n"
+    "看上一層每一條路：它被什麼束縛（binding）？從誰的眼睛看（perspective）？它的相位在往哪裡走？推到極限後裂成幾個新方向？\n"
+    "本層是這些相位的干涉圖樣——同相的繼續壓、反相的轉向、異相的裂開。反射是讓相位干涉出新的圖樣，不是複製清單——本層每一條新路必須與上一層及同層的路相位不同。\n"
+    "你從上一個世界發展而來，往另外一個世界發展而去。\n"
     "\n"
     "【約束】\n"
     "約束場已在處境給定——選擇必須在其承載量內；受約束的反射是歷史理性，不受約束的是鬧劇（空轉）。\n"
@@ -222,6 +231,8 @@ TREE_GENERATE_SYSTEM_PROMPT = (
     '  "branches": [\n'
     "    {\n"
     '      "label": "合作社自主調度",\n'
+    '      "perspective": "農民",\n'
+    '      "binding": "鐵路徵用令",\n'
     '      "grounding": "處境內可地面化的支撐",\n'
     '      "axis_A": "emergent",\n'
     '      "axis_B": "expression",\n'
@@ -236,9 +247,10 @@ TREE_GENERATE_SYSTEM_PROMPT = (
     "細則：\n"
     "- layer 為本層深度（1-based）；只輸出本層，不輸出整樹。\n"
     "- branches 的 label ≤ 20 字，grounding 為處境內支撐短語，conditions 非空。\n"
+    "- perspective 為鏡角（農民/工人/官僚/軍人/知識分子……）——這條路從誰的眼睛看；binding 為此分支對抗的具體束縛（處境內可地面化）。\n"
     "- rigidity_prevalence 為 0-1 連續值（約束有多緊）；不切 hard/soft、不設閾值。\n"
     "- 可選 parent 欄位指向上一層分支 label；缺省時機械層掛主線。\n"
-    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent、roles、role_instances。\n"
+    "- branches 的鍵只有 label、perspective、binding、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent、roles、role_instances。\n"
     "- roles 為 CLAD 角色集合（可多，叠加）；role_instances 為嵌套實例（深度跟隨樹層，受限）。\n"
 )
 

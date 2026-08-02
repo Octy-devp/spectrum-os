@@ -101,9 +101,16 @@ class AltGateContractError(ValueError):
 
 
 def _has_shell_refusal_or_placeholder(obj: Any) -> bool:
-    """Recursively check for empty shell refusals or placeholder markers."""
+    """Recursively check for empty shell refusals or placeholder markers.
+
+    🔴 2026-08-02 修復（T6 live pilot 發現）：標量 ``None`` **不再**判為空殼——
+    第 1 層分支的 ``parent: null``（無父，語義合法）曾被誤判 → 整層被拒（flaky）。
+    空殼判定只針對**字串內容**（"none"/"?"/"<...>"/拒絕語）的遞迴掃描。
+    ``None`` 值本身是「缺席」（合法）；空 list/dict 由各語義檢查
+    （conditions 非空 / roles 非空 / candidates 檢查）各司其職，不在此判。
+    """
     if obj is None:
-        return True
+        return False  # 標量 None = 缺席（合法），非空殼拒絕
     if isinstance(obj, str):
         s = obj.strip()
         lower = s.lower()
@@ -124,6 +131,8 @@ def _has_shell_refusal_or_placeholder(obj: Any) -> bool:
 def assert_alt_gate_contract(
     output_data: dict,
     situation_labels: list[str] | None = None,
+    *,
+    echo_notes: list[str] | None = None,
 ) -> None:
     """Mechanical contract assertion for alt_gate output.
 
@@ -133,6 +142,10 @@ def assert_alt_gate_contract(
     verbatim-repeat a situation-provided label are rejected (echo rejection is
     referenced by situation, not by a fixed vocabulary). Only LABEL is checked —
     concept_tags may reference situation material (revival / expression is legal).
+
+    **語義中介取代黑名單（決策 1/4）**：``PROMPT_EXAMPLE_LABELS`` 命中**不再 raise**
+    ——改為 append 到 ``echo_notes``（可選，None 時靜默略過，向後相容）。範例只是形狀
+    （決策 4）；**situation echo 仍 fatal**——那是語義判準（以處境為參照，不是黑名單）。
     """
     if not isinstance(output_data, dict):
         raise AltGateContractError(f"output must be dict, got {type(output_data).__name__}")
@@ -206,9 +219,11 @@ def assert_alt_gate_contract(
         if not isinstance(label, str):
             raise AltGateContractError(f"candidate[{i}].label must be str, got {label!r}")
         if label.strip() in PROMPT_EXAMPLE_LABELS:
-            raise AltGateContractError(
-                f"example echo: candidate[{i}].label matches prompt example label '{label.strip()}'"
-            )
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"example echo: candidate[{i}].label matches prompt example label "
+                    f"'{label.strip()}'（降權，非致命——範例只是形狀）"
+                )
         if situation_set is not None and label.strip() in situation_set:
             raise AltGateContractError(
                 f"situation echo: candidate[{i}].label '{label.strip()}' repeats a label already provided by the situation"
@@ -224,9 +239,11 @@ def assert_alt_gate_contract(
             raise AltGateContractError(f"candidate[{i}].concept_tags must be list of str, got {tags!r}")
         for t in tags:
             if t.strip() in PROMPT_EXAMPLE_LABELS:
-                raise AltGateContractError(
-                    f"example echo: candidate[{i}].concept_tag matches prompt example label '{t.strip()}'"
-                )
+                if echo_notes is not None:
+                    echo_notes.append(
+                        f"example echo: candidate[{i}].concept_tag matches prompt example label "
+                        f"'{t.strip()}'（降權，非致命——範例只是形狀）"
+                    )
             clean, matches = mechanical_filter(t)
             if not clean:
                 raise AltGateContractError(f"candidate[{i}].concept_tag '{t}' failed mechanical filter: {matches}")
@@ -388,6 +405,8 @@ def alt_gate_generate(
     sys_prompt = GATE_SYSTEM_PROMPT_UNIFIED if (unified or reporter) else ALT_GATE_SYSTEM_PROMPT_V1
     existing_labels_set = set(input_data.get("existing_labels", []))
     situation_labels = _extract_situation_labels(input_data)
+    # 語義中介取代黑名單（決策 4）：example echo 不再 fatal——記錄到 echo_notes（人機收束檢視）。
+    echo_notes: list[str] = []
 
     candidate_samples: list[list[dict]] = []
     walks: list[dict] = []
@@ -443,24 +462,13 @@ def alt_gate_generate(
                     leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "compress")
                     if leak_err:
                         raise AltGateContractError(leak_err)
-                    assert_alt_gate_contract(candidate_parsed, situation_labels)
+                    assert_alt_gate_contract(candidate_parsed, situation_labels, echo_notes=echo_notes)
                     parsed = candidate_parsed
                     break
                 except Exception as e:
                     if attempt == 0:
                         continue
                     if isinstance(e, AltGateContractError):
-                        if "example echo" in str(e) and 'candidate_parsed' in locals() and isinstance(candidate_parsed, dict):
-                            clean_cands = []
-                            for cand in candidate_parsed.get("candidates", []):
-                                lbl = cand.get("label", "").strip()
-                                c_tags = [t.strip() for t in cand.get("concept_tags", [])]
-                                if lbl in PROMPT_EXAMPLE_LABELS or any(t in PROMPT_EXAMPLE_LABELS for t in c_tags):
-                                    continue
-                                clean_cands.append(cand)
-                            candidate_parsed["candidates"] = clean_cands
-                            parsed = candidate_parsed
-                            break
                         raise e
                     raise AltGateContractError(str(e)) from e
 
@@ -495,24 +503,13 @@ def alt_gate_generate(
                         leak_err = check_routing_leak_or_schema(raw, candidate_parsed, "generate")
                         if leak_err:
                             raise AltGateContractError(leak_err)
-                    assert_alt_gate_contract(candidate_parsed, situation_labels)
+                    assert_alt_gate_contract(candidate_parsed, situation_labels, echo_notes=echo_notes)
                     parsed = candidate_parsed
                     break
                 except Exception as e:
                     if attempt == 0:
                         continue
                     if isinstance(e, AltGateContractError):
-                        if "example echo" in str(e) and 'candidate_parsed' in locals() and isinstance(candidate_parsed, dict):
-                            clean_cands = []
-                            for cand in candidate_parsed.get("candidates", []):
-                                lbl = cand.get("label", "").strip()
-                                c_tags = [t.strip() for t in cand.get("concept_tags", [])]
-                                if lbl in PROMPT_EXAMPLE_LABELS or any(t in PROMPT_EXAMPLE_LABELS for t in c_tags):
-                                    continue
-                                clean_cands.append(cand)
-                            candidate_parsed["candidates"] = clean_cands
-                            parsed = candidate_parsed
-                            break
                         raise e
                     raise AltGateContractError(str(e)) from e
 
@@ -550,6 +547,8 @@ def alt_gate_generate(
         "temperature": temperature,
         "situation": input_data.get("situation"),
     }
+    if echo_notes:
+        res["echo_notes"] = echo_notes
     if reporter and observations:
         res["observations"] = observations
     return res

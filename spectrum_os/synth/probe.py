@@ -40,9 +40,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import unicodedata
 from datetime import datetime, timezone
 from itertools import combinations
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -87,6 +88,155 @@ MAX_LABEL_LEN = 20
 MAX_GROUNDING_LEN = 80
 MAX_CONDITION_LEN = 40
 
+# ---------------------------------------------------------------------------
+# 語碼感知長度契約（混合語言語碼分層，機械層）
+# ---------------------------------------------------------------------------
+
+#: 語碼 → 欄位 → (字符上限, 詞數上限)。
+#: - CJK 語碼（zh/ja/ko）：維持現字符上限（label 20 / grounding 80 / condition 40），
+#:   不設詞數上限（CJK 以字符為天然單位，無空格斷詞）。
+#: - 拉丁語碼（en/fr/de/sr）：放寬字符上限（×3）+ 詞數上限——德語複合詞如
+#:   "Bewegliche Verteidigung mit getrennten Schwerpunkten"（52 字符、5 詞）不誤殺。
+#: - 西里爾語碼（ru；sr 亦可用西里爾書寫）：同拉丁上限。
+#: 向後相容：無語碼/未知語碼 → 舊行為（僅字符上限，無詞數上限）。
+_LANGUAGE_CODE_LIMITS: dict[str, dict[str, tuple[int, int | None]]] = {
+    "zh": {"label": (20, None), "grounding": (80, None), "condition": (40, None)},
+    "ja": {"label": (20, None), "grounding": (80, None), "condition": (40, None)},
+    "ko": {"label": (20, None), "grounding": (80, None), "condition": (40, None)},
+    "en": {"label": (60, 8), "grounding": (240, 40), "condition": (120, 24)},
+    "fr": {"label": (60, 8), "grounding": (240, 40), "condition": (120, 24)},
+    "de": {"label": (60, 8), "grounding": (240, 40), "condition": (120, 24)},
+    "sr": {"label": (60, 8), "grounding": (240, 40), "condition": (120, 24)},
+    "ru": {"label": (60, 8), "grounding": (240, 40), "condition": (120, 24)},
+}
+
+#: 欄位 → 舊字符上限（無語碼/未知語碼回退，向後相容）。
+_DEFAULT_FIELD_LIMITS: dict[str, int] = {
+    "label": MAX_LABEL_LEN,
+    "grounding": MAX_GROUNDING_LEN,
+    "condition": MAX_CONDITION_LEN,
+}
+
+#: 語碼 → 允許書寫系統（語碼合規審計用）。塞爾維亞語為拉丁/西里爾雙書寫。
+_CODE_ALLOWED_SCRIPTS: dict[str, frozenset[str]] = {
+    "zh": frozenset({"cjk"}),
+    "ja": frozenset({"cjk"}),
+    "ko": frozenset({"cjk"}),
+    "en": frozenset({"latin"}),
+    "fr": frozenset({"latin"}),
+    "de": frozenset({"latin"}),
+    "sr": frozenset({"latin", "cyrillic"}),
+    "ru": frozenset({"cyrillic"}),
+}
+
+
+def max_len_for_code(code: str | None, field: str = "label") -> int:
+    """語碼 → 指定欄位字符長度上限（語碼感知長度契約）。
+
+    向後相容：``code`` 為 None / 未知語碼 → 舊字符上限（label 20 / grounding 80 /
+    condition 40）。CJK 語碼（zh/ja/ko）維持現上限；拉丁/西里爾語碼（en/fr/de/sr/ru）
+    放寬至 ×3（label 60 / grounding 240 / condition 120）。
+    """
+    if not code:
+        return _DEFAULT_FIELD_LIMITS.get(field, MAX_LABEL_LEN)
+    limits = _LANGUAGE_CODE_LIMITS.get(code)
+    if limits is None:
+        return _DEFAULT_FIELD_LIMITS.get(field, MAX_LABEL_LEN)
+    return limits[field][0]
+
+
+def max_words_for_code(code: str | None, field: str = "label") -> int | None:
+    """語碼 → 指定欄位詞數上限（拉丁/西里爾語碼用；None/CJK → None = 不設詞數上限）。"""
+    if not code:
+        return None
+    limits = _LANGUAGE_CODE_LIMITS.get(code)
+    if limits is None:
+        return None
+    return limits[field][1]
+
+
+def _count_words(text: str) -> int:
+    """以空白分隔計詞數（拉丁/西里爾語碼的詞數上限用）。"""
+    return sum(1 for tok in text.split() if tok.strip())
+
+
+def _classify_char(ch: str) -> str | None:
+    """單字元 → 書寫系統類別（cjk/latin/cyrillic）；空白/標點/數字/無法歸類 → None。
+
+    優先字符範圍（明確且快，Cyrillic U+0400–U+04FF、CJK U+4E00–U+9FFF 等），
+    ``unicodedata.name()`` 兜底（CJK 擴展 B+、兼容表意文字、諺文等）。
+    """
+    o = ord(ch)
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:  # CJK 統一表意 / 擴展 A
+        return "cjk"
+    if 0xAC00 <= o <= 0xD7AF or 0x3040 <= o <= 0x30FF:  # 諺文 / 假名
+        return "cjk"
+    if 0x0400 <= o <= 0x04FF or 0x0500 <= o <= 0x052F:  # 西里爾 / 西里爾補充
+        return "cyrillic"
+    if 0x0041 <= o <= 0x005A or 0x0061 <= o <= 0x007A:  # 基本拉丁
+        return "latin"
+    if 0x00C0 <= o <= 0x024F or 0x1E00 <= o <= 0x1EFF:  # 拉丁擴充（é/ü/š…）
+        return "latin"
+    try:
+        name = unicodedata.name(ch, "")
+    except ValueError:
+        name = ""
+    if name.startswith("CJK") or name.startswith("HANGUL") or name.startswith("HIRAGANA") \
+            or name.startswith("KATAKANA"):
+        return "cjk"
+    if name.startswith("CYRILLIC"):
+        return "cyrillic"
+    if "LATIN" in name:
+        return "latin"
+    return None
+
+
+def detect_script(text: str) -> str:
+    """偵測文本主要書寫系統（機械層，供語碼合規審計）。
+
+    回傳 ``"cjk"`` / ``"latin"`` / ``"cyrillic"`` / ``"mixed"`` / ``"unknown"``。
+    空白/標點/數字不計入判定；無可歸類字符 → ``"unknown"``；多種書寫系統共存 →
+    ``"mixed"``。純機械判別——不判語義、不做翻譯判斷。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "unknown"
+    counts: dict[str, int] = {}
+    for ch in text:
+        cls = _classify_char(ch)
+        if cls is not None:
+            counts[cls] = counts.get(cls, 0) + 1
+    if not counts:
+        return "unknown"
+    if len(counts) == 1:
+        return next(iter(counts))
+    return "mixed"
+
+
+def assert_code_compliance(label: str, allowed_codes: Sequence[str]) -> bool:
+    """語碼合規概念（審計輔助，**不接入管線**）：label 的偵測書寫系統是否屬於
+    ``allowed_codes`` 任一語碼的允許集合（供未來審計使用）。
+
+    - ``"unknown"``（純標點/空白）→ True（無從判定，不阻斷）。
+    - ``"mixed"`` → 任一成分書寫系統命中允許集合即 True。
+    - 未知語碼（不在 ``_CODE_ALLOWED_SCRIPTS``）→ 視為允許一切（不阻斷）。
+    """
+    detected = detect_script(label)
+    if detected == "unknown":
+        return True
+    allowed: set[str] = set()
+    for code in allowed_codes:
+        allowed |= set(_CODE_ALLOWED_SCRIPTS.get(code, ()))
+    if not allowed:
+        return True
+    if detected == "mixed":
+        scripts: set[str] = set()
+        for ch in label:
+            cls = _classify_char(ch)
+            if cls is not None:
+                scripts.add(cls)
+        return bool(scripts & allowed)
+    return detected in allowed
+
 #: 兩軸詞彙鏡射拒收（F3）：「繼承的/湧現的/替代」是 prompt 教的兩軸名詞——
 #: LLM 把軸名詞鏡射進 label 並自標 substitution，非真偷渡。字首即拒
 #: （echo 類，與 PROMPT_EXAMPLE_LABELS 拒收同構——機械只攔字首，不判語義真偽）。
@@ -103,6 +253,7 @@ _ALLOWED_BRANCH_KEYS: frozenset[str] = frozenset(
         "confidence_band", "conditions", "parent",
         "role", "strength", "period_months",
         "roles", "role_instances",
+        "perspective", "binding",  # T16：鏡角（這條路從誰的眼睛看）＋對抗的束縛
         "contamination", "rejected", "rate_zero",
     }
 )
@@ -388,14 +539,18 @@ def _check_rate_zero(
 
 
 def _check_role_transitions(
-    output_data: dict, parent_branches: list[dict]
+    output_data: dict, parent_branches: list[dict], notes: list[str]
 ) -> None:
-    """文法轉移契約：父節點角色 → 子節點角色的 DCA 文法合法性（含結構性零）。
+    """文法轉移檢查（父 → 子角色，含結構性零）——**非致命**（2026-08-02 修正）。
 
-    世界無關：僅用 ``validate_alternative``（通用文法），不依賴任何世界特定數據。
-    叠加多角色：子分支每個角色須存在至少一個父角色使其轉移合法（存在性）。
-    父 = root（無角色）時跳過（層 1 角色不受約束——處境本身可叠加任一角色）。
-    結構性零（direction→alternative、lag→direction）違反即 TreeProbeError（fatal）。
+    🔴 認識論修正：CLAD 是**閱讀文法**，不是**世界序列**——同一狀態可同時是
+    crisis/lag/alternative/direction（多線程叠加，multigraph）；
+    ``validate_alternative`` 的單向遞歸（crisis→lag→alternative→direction）
+    是**觀察已發生事件**的工具，不是**生成限制**。強制父→子沿 CLAD 單向轉移
+    = 把叠加態強制坍縮成單線序列（破壞量子容器）。
+    因此：違反**不再 raise**（fatal），改為記入 ``notes``（非致命，人機收束
+    ``convergence_view`` 檢視）——可能是真偷渡（structure violation），
+    也可能是新結構（革命性翻轉：alternative→lag 受阻、crisis→direction 直接決裂）。
     """
     layer = output_data["layer"]
     for i, b in enumerate(output_data.get("branches", [])):
@@ -412,16 +567,12 @@ def _check_role_transitions(
             if not any(
                 validate_alternative(pr, cr, depth=layer) for pr in parent_roles
             ):
-                raise TreeProbeError(
-                    f"branch[{i}] 文法轉移非法: 父角色 {parent_roles} → "
+                notes.append(
+                    f"grammar: branch[{i}] 文法轉移異常 父角色 {parent_roles} → "
                     f"子角色 {cr!r}（validate_alternative 拒——含結構性零 "
-                    f"direction→alternative / lag→direction）"
+                    f"direction→alternative / lag→direction；降為記錄，語義由人機收束判斷）"
                 )
 
-
-# ---------------------------------------------------------------------------
-# 機械契約：assert_tree_gate_contract
-# ---------------------------------------------------------------------------
 
 def assert_tree_gate_contract(
     output_data: dict,
@@ -430,6 +581,8 @@ def assert_tree_gate_contract(
     max_branches: int | None = None,
     max_depth: int | None = None,
     parent_branches: list[dict] | None = None,
+    code: str | None = None,
+    echo_notes: list[str] | None = None,
 ) -> None:
     """機械契約檢查（仿 ``assert_alt_gate_contract``，PLAN-23 §12.3）。
 
@@ -456,9 +609,26 @@ def assert_tree_gate_contract(
     ``rejected`` 清單**非致命**處理（一層一個壞分支不該浪費整層 call，
     見 ``_mechanical_check_layer``）——所以 probe_tree 呼叫本契約時不傳
     ``situation_labels``，由 Phase B 逐節點處理。
+
+    **語碼感知長度契約（機械層，混合語言語碼分層）**：``code`` 給定時（keyword
+    參數或 output 頂層 ``code`` 欄位），label/grounding/condition 長度檢查走語碼
+    感知路徑（``max_len_for_code`` / ``max_words_for_code``）——CJK 維持字符上限、
+    拉丁/西里爾放寬字符 + 詞數上限。無語碼 → 舊行為（label ≤ 20 字符、grounding
+    ≤ 80 字符；conditions 舊行為無長度檢查，維持不啟用）。
+
+    **語義中介取代黑名單（決策 1/2/4）**：``PROMPT_EXAMPLE_LABELS`` 與
+    ``AXIS_ECHO_PREFIXES`` 命中**不再 raise**——改為 append 到 ``echo_notes``
+    （可選參數，None 時靜默略過，向後相容）。範例只是形狀（決策 4）、軸名詞鏡射
+    是馬可夫連續轉移的一步（決策 2）——皆由人機收束（``convergence_view``）檢視。
+    **situation echo 仍 fatal**——那是語義判準（以處境為參照，不是黑名單）。
     """
     if not isinstance(output_data, dict):
         raise TreeProbeError(f"output must be dict, got {type(output_data).__name__}")
+
+    # 語碼感知（機械層）：支援 keyword 參數或 output 頂層 ``code`` 欄位——
+    # 皆無 → None（舊行為：字符上限 20/80/40、無詞數上限）。
+    if code is None and isinstance(output_data.get("code"), str):
+        code = output_data["code"]
 
     for key in _FORBIDDEN_SERIES_KEYS:
         if key in output_data:
@@ -533,17 +703,30 @@ def assert_tree_gate_contract(
         if not isinstance(label, str) or not label.strip():
             raise TreeProbeError(f"branch[{i}].label 必須是非空 str，got {label!r}")
         label = label.strip()
-        if len(label) > MAX_LABEL_LEN:
-            raise TreeProbeError(f"branch[{i}].label 超過長度上限 (<= {MAX_LABEL_LEN}): {label!r}")
+        # 語碼感知長度（機械層）：無語碼 → 舊行為（20 字符）；拉丁/西里爾語碼 →
+        # 放寬字符上限 + 詞數上限（德語複合詞不誤殺）。
+        label_char_limit = max_len_for_code(code, "label")
+        label_word_limit = max_words_for_code(code, "label")
+        if len(label) > label_char_limit:
+            raise TreeProbeError(
+                f"branch[{i}].label 超過長度上限 (<= {label_char_limit} 字符): {label!r}"
+            )
+        if label_word_limit is not None and _count_words(label) > label_word_limit:
+            raise TreeProbeError(
+                f"branch[{i}].label 超過詞數上限 (<= {label_word_limit} 詞): {label!r}"
+            )
         if label in PROMPT_EXAMPLE_LABELS:
-            raise TreeProbeError(
-                f"example echo: branch[{i}].label 重複 prompt 範例標籤 '{label}'"
-            )
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"example echo: branch[{i}].label 重複 prompt 範例標籤 '{label}'"
+                    f"（降權，非致命——範例只是形狀）"
+                )
         if label.startswith(AXIS_ECHO_PREFIXES):
-            raise TreeProbeError(
-                f"axis echo: branch[{i}].label '{label}' 以兩軸名詞為字首"
-                f"（F3：鏡射 prompt 教的軸詞彙——繼承的/湧現的/替代）"
-            )
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"axis echo: branch[{i}].label '{label}' 以兩軸名詞為字首"
+                    f"（F3：鏡射 prompt 教的軸詞彙——繼承的/湧現的/替代；降權，非致命）"
+                )
         if situation_set is not None and label in situation_set:
             raise TreeProbeError(
                 f"situation echo: branch[{i}].label '{label}' 重複處境標籤"
@@ -560,8 +743,17 @@ def assert_tree_gate_contract(
         grounding = b["grounding"]
         if not isinstance(grounding, str) or not grounding.strip():
             raise TreeProbeError(f"branch[{i}].grounding 必須是非空 str")
-        if len(grounding) > MAX_GROUNDING_LEN:
-            raise TreeProbeError(f"branch[{i}].grounding 超過長度上限 (<= {MAX_GROUNDING_LEN})")
+        # 語碼感知長度（grounding）：無語碼 → 舊行為（80 字符）。
+        g_char_limit = max_len_for_code(code, "grounding")
+        g_word_limit = max_words_for_code(code, "grounding")
+        if len(grounding) > g_char_limit:
+            raise TreeProbeError(
+                f"branch[{i}].grounding 超過長度上限 (<= {g_char_limit} 字符)"
+            )
+        if g_word_limit is not None and _count_words(grounding) > g_word_limit:
+            raise TreeProbeError(
+                f"branch[{i}].grounding 超過詞數上限 (<= {g_word_limit} 詞)"
+            )
         clean, matches = mechanical_filter(grounding)
         if not clean:
             raise TreeProbeError(f"branch[{i}].grounding 未過 mechanical filter: {matches}")
@@ -585,6 +777,8 @@ def assert_tree_gate_contract(
         conditions = b["conditions"]
         if not isinstance(conditions, list) or not conditions:
             raise TreeProbeError(f"branch[{i}].conditions 必須是非空 list（邊條件非空）")
+        cond_char_limit = max_len_for_code(code, "condition")
+        cond_word_limit = max_words_for_code(code, "condition")
         for j, cond in enumerate(conditions):
             if not isinstance(cond, str) or not cond.strip():
                 raise TreeProbeError(f"branch[{i}].conditions[{j}] 必須是非空 str")
@@ -593,6 +787,17 @@ def assert_tree_gate_contract(
                 raise TreeProbeError(
                     f"branch[{i}].conditions[{j}] 未過 mechanical filter: {matches}"
                 )
+            # 語碼感知長度：conditions 舊行為無長度檢查——只有語碼給定時才啟用
+            # （維持向後相容）。
+            if code:
+                if len(cond) > cond_char_limit:
+                    raise TreeProbeError(
+                        f"branch[{i}].conditions[{j}] 超過長度上限 (<= {cond_char_limit} 字符)"
+                    )
+                if cond_word_limit is not None and _count_words(cond) > cond_word_limit:
+                    raise TreeProbeError(
+                        f"branch[{i}].conditions[{j}] 超過詞數上限 (<= {cond_word_limit} 詞)"
+                    )
 
         # 可選父欄位：指向上一層分支 label
         if "parent" in b and not isinstance(b["parent"], str):
@@ -627,10 +832,16 @@ def assert_tree_gate_contract(
                 context=f"branch[{i}].",
             )
 
-    # W1：文法轉移契約（父 → 子角色，含結構性零）——parent_branches 給定時才檢查
-    # （世界無關：僅 validate_alternative，無世界特定數據）。
+    # W1：文法轉移檢查（父 → 子角色，含結構性零）——parent_branches 給定時才檢查。
+    # 🔴 2026-08-02：降為非致命（CLAD=閱讀文法非世界序列）——違反記入 echo_notes，
+    # 語義由人機收束判斷（可能是真偷渡，也可能是新結構：alternative→lag 受阻、
+    # crisis→direction 直接決裂）。
     if parent_branches:
-        _check_role_transitions(output_data, parent_branches)
+        # 注意：echo_notes 為空 list 時 `or []` 會丟掉原 list（空 list 是 falsy）——
+        # 用 None 判斷。
+        _check_role_transitions(
+            output_data, parent_branches, echo_notes if echo_notes is not None else []
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -787,14 +998,43 @@ def _layer_rigidity_components(
 # Phase B：逐節點機械檢查（quarantine / 回聲 / 兩軸降權）
 # ---------------------------------------------------------------------------
 
+def _same_denotation(child: dict, parent: dict) -> bool:
+    """層間 echo 判定的承義比較：label 相同的候選與父分支，承義欄位是否全同。
+
+    T16 語義中介：承義欄位（binding/perspective/grounding）＋邊條件（conditions）
+    是「義」，label 只是「形」。``_branch_ref`` 特意傳承義欄位給下一層——反射者
+    只要任一承義欄位開出新意（即使 label 沿用父短語），就是真轉移（開出新路），
+    不是 echo。只有**全部承義欄位與父完全相同**（含兩者皆缺承義欄位）＝純形複製
+    ＝馬可夫原地踏步（轉移矩陣退回恆等）。
+
+    機械層只比字串相等，不判語義真偽（F7 原則）——「換句話說但無實質新內容」
+    屬邊界案例，由人機收束（convergence_view）覆核，不在此攔。
+    """
+    for field in ("binding", "perspective", "grounding"):
+        child_val = (child.get(field) or "").strip()
+        parent_val = (parent.get(field) or "").strip()
+        if child_val != parent_val:
+            return False
+    child_conds = [str(c).strip() for c in child.get("conditions", [])]
+    parent_conds = [str(c).strip() for c in parent.get("conditions", [])]
+    return child_conds == parent_conds
+
+
 def _mechanical_check_layer(
     layer_entry: dict,
     situation_labels: list[str] | None,
     *,
     parent_branches: list[dict] | None = None,
     rate_matrix: Any = None,
+    code: str | None = None,
+    echo_notes: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """對一層分支做逐節點機械檢查：quarantine L1 / 回聲 / 空殼 / 兩軸 substitution 降權。
+
+    **語碼合規（決策 3）**：``code`` 給定時，label 書寫系統不合語碼
+    （``assert_code_compliance`` 為 False）→ rejected 清單（非致命）。mixed 寬鬆——
+    ``assert_code_compliance`` 已對 mixed 回 True（sozio-Gestalten 天然混合）。
+    ``code`` 為 None → 不檢查（向後相容）。
 
     **W1**：``rate_matrix``（具體限制的可選輸入）存在時，父→子角色轉移強度為零的
     邊機械**拒**（``rate_zero`` → rejected 清單，人機收束檢視——測量不靜默丟棄）。
@@ -833,11 +1073,37 @@ def _mechanical_check_layer(
                 break
 
         if label in PROMPT_EXAMPLE_LABELS:
-            reasons.append("echo: label 重複 prompt 範例標籤")
+            reasons.append("echo: label 重複 prompt 範例標籤（降權，非致命）")
         if label.startswith(AXIS_ECHO_PREFIXES):
-            reasons.append("echo: label 以兩軸名詞為字首（F3：繼承的/湧現的/替代鏡射）")
+            reasons.append("echo: label 以兩軸名詞為字首（F3：繼承的/湧現的/替代鏡射；降權，非致命）")
         if label in situation_set:
             reasons.append("echo: label 重複處境標籤")
+        # T16 語義中介：層間 echo 攔截（2026-08-02）——LLM 重複上一層 label。
+        # 🔴 判定精化：只有「label 相同 **且** 承義欄位（binding/perspective/
+        # grounding/conditions）全同/缺失」才算真原地踏步（轉移矩陣退回恆等＝自我
+        # 複製）→ 拒。label 相同但承義欄位有新意＝「反射後開出新路」的合法結構延續
+        # （假 echo）→ 放行，記入 echo_notes 供人機收束檢視（PLAN-23 §12.4：
+        # echo 降權非致命——語義判定由收束完成）。實證：純 label 精確匹配下
+        # 78-81% 的層間拒收是假 echo 誤殺（導致 L3 塌成單鏈）。
+        if parent_branches:
+            parent_by_label = {
+                str(p.get("label", "")).strip(): p
+                for p in parent_branches if isinstance(p, dict)
+            }
+            parent = parent_by_label.get(label)
+            if parent is not None:
+                if _same_denotation(b, parent):
+                    reasons.append("echo: label 與承義欄位皆重複上一層（真原地踏步——轉移矩陣退回恆等）")
+                elif echo_notes is not None:
+                    echo_notes.append(
+                        f"層間 label 延續（非 echo，放行）：'{label}' 承義欄位開出新路"
+                        f"（binding={b.get('binding')!r} perspective={b.get('perspective')!r}）"
+                    )
+
+        # 語碼合規（決策 3：mixed 寬鬆——assert_code_compliance 已對 mixed 寬鬆）：
+        # 書寫系統不合語碼 → rejected（非致命，人機收束檢視）。code=None → 不檢查。
+        if code is not None and not assert_code_compliance(label, [code]):
+            reasons.append("code: label 書寫系統不合語碼")
 
         # 兩軸 substitution → contamination 降權（F7：不驗語義真偽，機械只標記）
         if b.get("axis_B") == "substitution":
@@ -1105,7 +1371,13 @@ def standing_wave_per_layer(
 # ---------------------------------------------------------------------------
 
 def _branch_ref(b: dict) -> dict:
-    """上一層分支的反射摘要（給下一層當反射對象）。"""
+    """上一層分支的反射摘要（給下一層當反射對象）。
+
+    T16 語義中介（2026-08-02）：補傳**承義欄位**（perspective/binding/grounding）——
+    下一層反射者若只有 label（形）而無鏡角/束縛/可地面化支撐（義），
+    就只能複製 label，無法「反射出義被推至極限後裂開的新方向」。
+    轉移矩陣要從恆等（自我複製）變成真轉移，反射對象必須含義。
+    """
     return {
         "label": b.get("label"),
         "axis_A": b.get("axis_A"),
@@ -1115,6 +1387,10 @@ def _branch_ref(b: dict) -> dict:
         # W1：DCA 角色向量/嵌套實例——供下一層反射時做文法延續（父→子合法轉移）。
         "roles": b.get("roles"),
         "role_instances": b.get("role_instances"),
+        # T16 語義中介：承義欄位——鏡角（從誰的眼睛看）＋對抗的束縛＋可地面化支撐。
+        "perspective": b.get("perspective"),
+        "binding": b.get("binding"),
+        "grounding": b.get("grounding"),
     }
 
 
@@ -1197,12 +1473,20 @@ def _generate_one_tree(
     model: str,
     max_tokens: int,
     temperature: float,
+    code: str | None = None,
+    system_message: str | None = None,
     situation_labels: list[str] | None,
 ) -> dict:
     """生成單棵決策樹（Phase A + B + C）。每層 1 call，共 depth 次。
 
     W1：從 constraint_field 提取 ``rate_matrix``（具體限制的可選輸入）與 situation
     的 ``6d_vector``（6D 輔助分量）——皆為可選，缺席時行為不變（世界無關）。
+
+    語碼分層（機械層）：
+    - ``code``：語碼（zh/ja/ko/en/fr/de/sr/ru…）——None（預設）→ 長度契約舊行為。
+    - ``system_message``：替代 system prompt——None（預設）→
+      ``TREE_GENERATE_SYSTEM_PROMPT``（prompt 凍結中：本參數只允許呼叫者注入替代，
+      不修改任何 prompt 文本）。
     """
     constraint = constraint_field if isinstance(constraint_field, dict) else {}
     rate_matrix = constraint.get("rate_matrix")
@@ -1218,6 +1502,7 @@ def _generate_one_tree(
     }
     layers: list[dict] = []
     rejected: list[dict] = []
+    echo_notes: list[str] = []
     calls = 0
     reflect_on: list[dict] = []
 
@@ -1233,7 +1518,9 @@ def _generate_one_tree(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
-            system_message=TREE_GENERATE_SYSTEM_PROMPT,
+            system_message=(
+                TREE_GENERATE_SYSTEM_PROMPT if system_message is None else system_message
+            ),
             response_format={"type": "json_object"},
             thinking=False,
         )
@@ -1252,6 +1539,7 @@ def _generate_one_tree(
         passed, layer_rejected = _mechanical_check_layer(
             parsed, situation_labels,
             parent_branches=reflect_on, rate_matrix=rate_matrix,
+            code=code, echo_notes=echo_notes,
         )
         for b in layer_rejected:
             b["layer"] = k
@@ -1268,7 +1556,7 @@ def _generate_one_tree(
         # W1：parent_branches 給定 → 契約做 DCA 文法轉移檢查（含結構性零，fatal）。
         assert_tree_gate_contract(
             surviving, None, max_branches=n_branch, max_depth=depth,
-            parent_branches=reflect_on,
+            parent_branches=reflect_on, code=code,
         )
 
         layer_entry = {
@@ -1372,6 +1660,7 @@ def _generate_one_tree(
         "rigidity_map": rigidity_map,
         "standing_wave": standing_wave,
         "rejected": rejected,
+        "echo_notes": echo_notes,
         "meta": {
             "calls": calls,
             "n_paths": n_paths,
@@ -1998,6 +2287,8 @@ def probe_tree(
     model: str = "deepseek-v4-flash",
     max_tokens: int = 8192,
     temperature: float = 0.6,
+    code: str | None = None,
+    system_message: str | None = None,
 ) -> dict:
     """決策樹探針——約束剛性測量器（PLAN-23 §十二 v1.2）。
 
@@ -2020,6 +2311,10 @@ def probe_tree(
         seed: 保留——目前機械層全確定性，未來隨機子採樣用。
         api_key: DeepSeek API key。僅在走真實 API（gate_fn=None）時需要。
         model / max_tokens / temperature: 傳給 gate_fn。
+        code: 語碼（zh/ja/ko/en/fr/de/sr/ru…）——None（預設）→ 長度契約舊行為
+            （label ≤ 20 字符等）；拉丁/西里爾語碼 → 放寬字符 + 詞數上限。
+        system_message: 替代 system prompt——None（預設）→ ``TREE_GENERATE_SYSTEM_PROMPT``。
+            🔴 prompt 凍結中：本參數只允許呼叫者注入替代，不修改任何 prompt 文本。
 
     Returns:
         dict：
@@ -2031,6 +2326,8 @@ def probe_tree(
         - ``archetypes``: 世界原型（Jaccard 語義距離聚類，非 cluster.run）。
         - ``gate_nodes``: 門節點卡片（① 剛性低谷 ∧ ② sharp 命中；③ saturation heuristics）。
         - ``rejected``: 被拒節點清單（人機收束檢視，不靜默丟棄）。
+        - ``echo_notes``: 層間 label 延續的記錄（假 echo——label 同但承義欄位開出
+          新路，放行並記錄，供人機收束檢視；PLAN-23 §12.4 echo 降權非致命）。
         - ``meta``: params / calls / cost_anchor（= n_sample × depth）/ n_paths /
           truncated（路徑爆炸截斷旗標，F5）/ state_log_path（僅供收束落盤，F8）。
     """
@@ -2071,6 +2368,8 @@ def probe_tree(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            code=code,
+            system_message=system_message,
             situation_labels=situation_labels,
         )
         trees.append(tree)
@@ -2083,6 +2382,7 @@ def probe_tree(
     archetypes, archetype_meta = cluster_archetypes_semantic(all_paths)
     gate_nodes = _find_gate_nodes(rigidity_map, constraint_field)
     rejected = [r for t in trees for r in t["rejected"]]
+    echo_notes = [n for t in trees for n in t.get("echo_notes", [])]
 
     result = {
         "trees": trees,
@@ -2092,6 +2392,7 @@ def probe_tree(
         "archetype_meta": archetype_meta,
         "gate_nodes": gate_nodes,
         "rejected": rejected,
+        "echo_notes": echo_notes,
         "meta": {
             "params": {
                 "n_branch": n_branch,
@@ -2099,6 +2400,7 @@ def probe_tree(
                 "depth": depth,
                 "w": w,
                 "seed": seed,
+                "code": code,
             },
             "calls": total_calls,
             "cost_anchor": n_sample * depth,
@@ -2364,6 +2666,10 @@ __all__ = [
     "convergence_view",
     "probe_tree",
     "probe_select",
+    "detect_script",
+    "assert_code_compliance",
+    "max_len_for_code",
+    "max_words_for_code",
     "_prevalence_band",
     "_label_dispersion",
     "_cluster_archetypes",

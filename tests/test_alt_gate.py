@@ -11,6 +11,7 @@ from spectrum_os.synth.alt_gate import (
     AltGateContractError,
     alt_gate,
     alt_gate_enumerate,
+    alt_gate_generate,
     assert_alt_gate_contract,
     mechanical_confidence_alt_gate,
     validate_accident,
@@ -108,8 +109,8 @@ class TestAltGateContract:
         with pytest.raises(AltGateContractError, match="invalid per DCA grammar"):
             assert_alt_gate_contract(invalid)
 
-    def test_example_echo_rejection_in_contract(self):
-        """assert_alt_gate_contract must raise AltGateContractError('example echo') if label or tag matches prompt example."""
+    def test_example_echo_nonfatal_recorded_in_contract(self):
+        """語義中介取代黑名單（決策 4）：assert_alt_gate_contract 對 example echo 不再 raise——降為 echo_notes 記錄（非致命）。"""
         echo_label_dict = {
             "walk": {"crisis": "ok"},
             "candidates": [
@@ -122,8 +123,12 @@ class TestAltGateContract:
             ],
             "evidence": ["ok"],
         }
-        with pytest.raises(AltGateContractError, match="example echo"):
-            assert_alt_gate_contract(echo_label_dict)
+        # 不傳 echo_notes → 靜默通過（向後相容，不 raise）
+        assert_alt_gate_contract(echo_label_dict)
+        # 傳 echo_notes → 記錄命中（非致命）
+        notes: list[str] = []
+        assert_alt_gate_contract(echo_label_dict, echo_notes=notes)
+        assert notes and any("example echo" in n for n in notes)
 
         echo_tag_dict = {
             "walk": {"crisis": "ok"},
@@ -137,8 +142,9 @@ class TestAltGateContract:
             ],
             "evidence": ["ok"],
         }
-        with pytest.raises(AltGateContractError, match="example echo"):
-            assert_alt_gate_contract(echo_tag_dict)
+        notes2: list[str] = []
+        assert_alt_gate_contract(echo_tag_dict, echo_notes=notes2)
+        assert notes2 and any("example echo" in n for n in notes2)
 
 
 class TestAltGateExecution:
@@ -223,6 +229,41 @@ class TestAltGateExecution:
         assert len(_verify._state_log) > 0
         last_entry = _verify._state_log[-1]
         assert last_entry["gate_type"] == "alt_gate"
+
+    def test_example_echo_no_longer_stripped_or_fatal(self):
+        """語義中介取代黑名單（決策 2/4）：example echo 不再 fatal、不再靜默剝離——候選保留 + echo_notes 記錄，零 retry。"""
+        gen_response = json.dumps({
+            "walk": {"crisis": "補給限制", "lag": "命令延後", "alive_space": "邊界調撥"},
+            "candidates": [
+                {
+                    "label": "湧現的替代",  # In PROMPT_EXAMPLE_LABELS
+                    "concept_tags": ["自訂標籤"],
+                    "provenance_hint": "novel",
+                    "novel": True,
+                },
+                {
+                    "label": "真實出口",
+                    "concept_tags": ["替代通道"],
+                    "provenance_hint": "novel",
+                    "novel": True,
+                },
+            ],
+            "evidence": ["補給線滯後"],
+        })
+        mock_api = MagicMock()
+        mock_api.side_effect = [gen_response]  # 單次成功——無 retry、無剝離
+        res = alt_gate_generate(
+            {"state_vector": {"role": "crisis"}},
+            call_api_fn=mock_api,
+            api_key="mock_key",
+            n_samples=1,
+        )
+        assert mock_api.call_count == 1  # 鏡射詞不觸發 retry（retry=馬可夫原地踏步）
+        labels = [c["label"] for c in res["aggregated_candidates"]]
+        assert "湧現的替代" in labels   # 不再剝離候選
+        assert "真實出口" in labels
+        assert "echo_notes" in res       # 記錄存在
+        assert any("example echo" in n for n in res["echo_notes"])
 
     def test_reporter_two_stage_call_order_and_state_log(self):
         """Reporter mode (reporter=True) must run observe (prose) -> compress (JSON) -> adversary, saving observation in state_log only."""

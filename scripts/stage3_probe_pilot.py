@@ -724,6 +724,7 @@ def run_probe(
     w: float,
     seed: int,
     api_key: str,
+    code: str | None = None,
 ) -> tuple[dict, dict | None]:
     """執行 probe_tree 並回傳 (result, live_gate_state)。live 時 state 含 calls/usage。"""
     if live:
@@ -740,6 +741,7 @@ def run_probe(
             call_api_fn=live_gate,
             api_key=api_key,
             seed=seed,
+            code=code,
         )
         return result, live_state
 
@@ -753,6 +755,7 @@ def run_probe(
         w=w,
         gate_fn=mock_gate,
         seed=seed,
+        code=code,
     )
     return result, None
 
@@ -772,6 +775,7 @@ def run_pilot(
     gap_spectrum_path: str | None = None,
     api_key: str | None = None,
     constraint_window: str | None = None,
+    code: str | None = None,
 ) -> dict:
     """完整 pilot：建處境/約束場 → probe_tree → 五項測量 → 報告 dict。"""
     situation = build_sarajevo_situation()
@@ -795,6 +799,7 @@ def run_pilot(
         situation, constraint,
         live=live, n_branch=n_branch, n_sample=n_sample, depth=depth,
         w=w, seed=seed, api_key=api_key or os.environ.get("DEEPSEEK_API_KEY", ""),
+        code=code,
     )
 
     # state_log 污染檢查（F8：生成不落 log）
@@ -892,6 +897,9 @@ def run_pilot(
             "branch_labels": branch_labels,
         },
         "known_weakness_situation_echo": situation_echo_diag,
+        # 層間 label 延續（假 echo：label 同但承義欄位開出新路）——放行並記錄，
+        # 供人機收束檢視（PLAN-23 §12.4 echo 降權非致命）。
+        "echo_notes": result.get("echo_notes", []),
         "findings": {
             "live_cost_full_constraint": (
                 "live 初測（全量約束場）：3 calls / 348K input tokens / ≈$0.049 —— > $0.01 目標。"
@@ -961,6 +969,7 @@ def main() -> int:
     parser.add_argument("--w", type=float, default=0.5, help="CFG 場強（0-2，僅生成期）")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--accidents-file", default=None, help="v2.9.6 20 意外清單 JSON（list[str]）")
+    parser.add_argument("--code", default=None, help="語碼（如 zh/de/en）——啟用語碼合規驗證（T16 語義中介）；None 不檢查")
     parser.add_argument("--residual-table", default=None, help="既有殘差表 JSON（live 優先使用）")
     parser.add_argument("--anchor-field", default="/home/octy/projects/ECC/index/data/anchor-field.json")
     parser.add_argument("--narrative-spectrum", default="/home/octy/projects/ECC/index/data/narrative-spectrum-v3.1.json")
@@ -991,6 +1000,7 @@ def main() -> int:
         narrative_spectrum_path=args.narrative_spectrum,
         gap_spectrum_path=args.gap_spectrum,
         constraint_window=args.constraint_window,
+        code=args.code,
     )
     out_path = write_report(report, args.out)
     print(f"Report saved: {out_path}")
