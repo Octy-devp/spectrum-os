@@ -18,6 +18,9 @@ PLAN-23 §十二（v1.2）實作。決策樹探針 = §11.3 的操作化：
   （reflex of reflex = 層間迭代）。輸出：樹狀結構（root + branches + conditions）。
 - **Phase B 機械測量/檢查**：§12.4 五項（整樹剛性統計 / quarantine / 回聲 / 兩軸值 / 樹結構）。
   被拒節點 → ``rejected`` 清單（人機收束檢視，不靜默丟棄）。
+- **W1（DCA 基底接回）**：分支節點 ``roles``（CLAD 角色向量，可多叠加）+ ``role_instances``
+  （嵌套實例，深度跟隨樹層）；文法轉移契約（``validate_alternative``，含結構性零）；速率矩陣
+  零強度邊機械拒（具體限制的可選輸入）；6D 向量三進制方向輔助分量（小權重）。
 - **Phase C 連續剛性測量**：樹→路徑枚舉 → 每標籤/每層連續 prevalence（0-1）+ 信賴帶
   （樣本變異）；``prevalence==0`` 或樣本不足 → UNKNOWN（remasking）；不切閾值、不標必然。
 - **Phase D 輸出**：約束剛性地圖（逐層 ``{layer, date_ref, rigidity_prevalence[連續],
@@ -44,8 +47,10 @@ from typing import Any, Callable
 import numpy as np
 
 from spectrum_os.kernel import verify as _verify
+from spectrum_os.quantum.dca_grammar import validate_alternative
 from spectrum_os.quantum.multigraph import ROLES
 from spectrum_os.quantum.quarantine import mechanical_filter
+from spectrum_os.quantum.vector import project_ternary
 from spectrum_os.synth.alt_gate import (
     _extract_situation_labels,
     _FORBIDDEN_PROSE_KEYS,
@@ -82,16 +87,23 @@ MAX_LABEL_LEN = 20
 MAX_GROUNDING_LEN = 80
 MAX_CONDITION_LEN = 40
 
+#: 兩軸詞彙鏡射拒收（F3）：「繼承的/湧現的/替代」是 prompt 教的兩軸名詞——
+#: LLM 把軸名詞鏡射進 label 並自標 substitution，非真偷渡。字首即拒
+#: （echo 類，與 PROMPT_EXAMPLE_LABELS 拒收同構——機械只攔字首，不判語義真偽）。
+AXIS_ECHO_PREFIXES: tuple[str, ...] = ("繼承的", "湧現的", "替代")
+
 #: 分支節點允許鍵（F1：鍵集外即拒——prose 鍵尤其拒收，複用 ``_FORBIDDEN_PROSE_KEYS``）。
 #: 核心 8 契約鍵 + F1 回退可選欄位（role/strength/period_months，出現才驗合法性）
-#: + 機械層內部標記（``contamination``/``rejected`` 由 ``_mechanical_check_layer``
-#: 注入到存活分支，非 LLM 輸出鍵——契約在 Phase B 之後跑，須放行）。
+#: + W1 DCA 角色向量（roles 可多叠加 / role_instances 嵌套）
+#: + 機械層內部標記（``contamination``/``rejected``/``rate_zero`` 由
+#: ``_mechanical_check_layer`` 注入到分支，非 LLM 輸出鍵——契約在 Phase B 之後跑，須放行）。
 _ALLOWED_BRANCH_KEYS: frozenset[str] = frozenset(
     {
         "label", "grounding", "axis_A", "axis_B", "rigidity_prevalence",
         "confidence_band", "conditions", "parent",
         "role", "strength", "period_months",
-        "contamination", "rejected",
+        "roles", "role_instances",
+        "contamination", "rejected", "rate_zero",
     }
 )
 
@@ -104,6 +116,17 @@ _RIGIDITY_BLEND_W = 0.5
 
 #: substitution 節點在剛性聚合中的降權權重（§12.4 #4：contamination 降權，不判語義真偽）。
 _CONTAMINATION_WEIGHT = 0.5
+
+#: W1：DCA 角色向量——roles 建議為強制（DCA 是通用文法），但為向後相容設為**可選**：
+#: 舊 schema（無 roles）仍過；一旦某分支帶 roles，文法轉移 / 6D / 速率輔助即自動啟動。
+ROLES_REQUIRED = False
+
+#: W1：role_instances 嵌套深度上限——遞歸在具體限制下：嵌套深度跟隨樹層
+#: （層 k 最多 k 層實例 c1→c2→…），全局再以本常數封頂（與 probe 深度上界一致）。
+MAX_ROLE_INSTANCE_DEPTH = 4
+
+#: W1：6D 向量在剛性 blend 中的輔助權重（小權重——主代理仍是 label 語義離散，§12.4 #1）。
+_VECTOR_BLEND_W = 0.1
 
 _Z = 1.96  # 95% 信賴帶
 
@@ -149,6 +172,254 @@ def _validate_confidence_band(cb: Any, context: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+# W1：DCA 角色向量 / 文法轉移 / 6D 輔助 helpers
+# ---------------------------------------------------------------------------
+
+def _as_role_list(roles: Any) -> list[str]:
+    """規範角色為 list[str]（容忍單一 str）；非集合回 []。
+
+    不做內容驗證（內容驗證在契約層 ``_normalize_roles``）——此處只防
+    機械層對原始 LLM 輸出（可能 str）逐字元迭代的錯誤。
+    """
+    if isinstance(roles, str):
+        return [roles]
+    if isinstance(roles, (list, tuple, set, frozenset)):
+        return [r for r in roles if isinstance(r, str)]
+    return []
+
+
+def _normalize_roles(roles: Any, context: str = "") -> list[str]:
+    """標準化 + 驗證 ``roles`` 欄位（CLAD 角色集合/向量，可多叠加）。
+
+    接受單一 str（LLM 慣用輸出）或 str 集合；內容必須 ⊆ ``ROLES`` 且非空；
+    回傳去重、按 ROLES 次序排序的列表。非法即 TreeProbeError。
+    """
+    if isinstance(roles, str):
+        roles = [roles]
+    if not isinstance(roles, (list, tuple, set, frozenset)):
+        raise TreeProbeError(
+            f"{context}roles 必須是 CLAD 角色集合/列表（可多，叠加），"
+            f"got {type(roles).__name__}"
+        )
+    out: list[str] = []
+    for r in roles:
+        if not isinstance(r, str) or r not in ROLES:
+            raise TreeProbeError(f"{context}roles 含非法角色 {r!r}（允許 {ROLES}）")
+        if r not in out:
+            out.append(r)
+    if not out:
+        raise TreeProbeError(f"{context}roles 不能為空——空集合無意義（缺省請省略欄位）")
+    out.sort(key=lambda r: ROLES.index(r))
+    return out
+
+
+def _role_instance_depth(value: Any) -> int:
+    """單一實例值的嵌套深度：str/list = 1（如 \"c1\" 或 [\"l1\", \"l2\"]）；
+
+    dict（實例 id → 子實例）= 1 + 子值最大深度（如 {\"c1\": \"c2\"} = 2）。
+    """
+    if isinstance(value, dict):
+        if not value:
+            return 1
+        return 1 + max(_role_instance_depth(v) for v in value.values())
+    return 1
+
+
+def _validate_instance_value(value: Any, *, context: str = "") -> None:
+    """驗證單一角色實例值：str | list[str] | dict(實例 id → 子實例)。"""
+    if isinstance(value, str):
+        if not value.strip():
+            raise TreeProbeError(f"{context}實例 id 不能為空字串")
+        return
+    if isinstance(value, list):
+        if not value:
+            raise TreeProbeError(f"{context}實例列表不能為空")
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise TreeProbeError(
+                    f"{context}實例列表元素必須是非空 str，got {item!r}"
+                )
+        return
+    if isinstance(value, dict):
+        if not value:
+            raise TreeProbeError(f"{context}嵌套實例 dict 不能為空")
+        for k, v in value.items():
+            if not isinstance(k, str) or not k.strip():
+                raise TreeProbeError(f"{context}嵌套實例 id 必須是非空 str，got {k!r}")
+            _validate_instance_value(v, context=f"{context}{k}.")
+        return
+    raise TreeProbeError(
+        f"{context}實例值必須是 str | list[str] | dict（嵌套），got {type(value).__name__}"
+    )
+
+
+def _validate_role_instances(
+    role_instances: Any, *, max_depth: int, context: str = ""
+) -> int:
+    """驗證 ``role_instances`` 結構（角色 → 實例 id / 嵌套實例）+ 嵌套深度。
+
+    嵌套深度跟隨樹層：層 k 的角色實例可含子實例 c2/c3……，但總深度 ≤ 樹層
+    （遞歸在具體限制下，非無限）。回傳嵌套深度。
+    """
+    if not isinstance(role_instances, dict):
+        raise TreeProbeError(
+            f"{context}role_instances 必須是 dict（角色 → 實例 id/嵌套），"
+            f"got {type(role_instances).__name__}"
+        )
+    if not role_instances:
+        raise TreeProbeError(f"{context}role_instances 不能為空 dict")
+    for role, value in role_instances.items():
+        if not isinstance(role, str) or role not in ROLES:
+            raise TreeProbeError(
+                f"{context}role_instances 鍵 {role!r} 非法（允許 {ROLES}）"
+            )
+        _validate_instance_value(value, context=f"{context}role_instances[{role}].")
+    # 嵌套深度：頂層 dict 是容器本身（不計層）——深度 = 各角色實例值深度的最大值。
+    depth = max(_role_instance_depth(v) for v in role_instances.values())
+    if depth > max_depth:
+        raise TreeProbeError(
+            f"{context}role_instances 嵌套深度 {depth} 超過樹層上限 {max_depth}"
+            f"（遞歸在具體限制下，深度跟隨樹層）"
+        )
+    return depth
+
+
+def _extract_situation_vector(situation: Any) -> dict | None:
+    """從 situation 提取 6D 向量 dict（StateVector dict，須含 d1/d2/d3）；無則 None。
+
+    W1：世界無關 fallback——situation 不帶 ``6d_vector`` 時回 None，機械層行為不變。
+    """
+    if not isinstance(situation, dict):
+        return None
+    vec = situation.get("6d_vector")
+    if not isinstance(vec, dict):
+        return None
+    if not all(k in vec for k in ("d1", "d2", "d3")):
+        return None
+    return vec
+
+
+def _role_distribution_from_branches(branches: list[dict]) -> dict[str, float]:
+    """層內分支 ``roles`` 的歸一化分佈（出現次數）；無任何 roles 時回空 dict。"""
+    counts: dict[str, float] = {r: 0.0 for r in ROLES}
+    for b in branches:
+        for r in _as_role_list(b.get("roles")):
+            if r in ROLES:
+                counts[r] += 1.0
+    total = sum(counts.values())
+    if total <= 0:
+        return {}
+    return {r: c / total for r, c in counts.items()}
+
+
+def _ternary_alignment(
+    situation_vector: dict | None, role_dist: dict[str, float]
+) -> float | None:
+    """6D 輔助分量：situation 6D 方向 × 層內角色三進制投影的一致性（0-1）。
+
+    用 ``project_ternary``（quantum/vector.py）把角色分佈投影到 D1-D3，與 situation
+    ``6d_vector`` 的 (d1,d2,d3) 逐位比對——一致位元比例 = alignment。
+    無 6d_vector 或無角色分佈 → None（世界無關 fallback：rigid 行為不變）。
+    """
+    if situation_vector is None:
+        return None
+    if not role_dist:
+        return None
+    d1, d2, d3 = project_ternary(role_dist)
+    ref = (
+        int(situation_vector.get("d1", 0)),
+        int(situation_vector.get("d2", 0)),
+        int(situation_vector.get("d3", 0)),
+    )
+    matches = sum(1 for a, b in zip((d1, d2, d3), ref) if a == b)
+    return matches / 3.0
+
+
+def _as_rate_matrix(rate_matrix: Any):
+    """把 rate_matrix 規範為 4x4 numpy 陣列；形狀非法回 None（世界無關 fallback）。
+
+    兼容兩種形狀：``{"matrix": [[...]]}``（estimate_rate_matrix 輸出）或裸 4x4。
+    """
+    if isinstance(rate_matrix, dict):
+        rate_matrix = rate_matrix.get("matrix", rate_matrix)
+    if rate_matrix is None:
+        return None
+    try:
+        m = np.asarray(rate_matrix, dtype=np.float64)
+    except Exception:
+        return None
+    if m.shape != (len(ROLES), len(ROLES)):
+        return None
+    return m
+
+
+def _check_rate_zero(
+    branch: dict, parent_branches: list[dict], rate_matrix: Any
+) -> bool:
+    """速率矩陣零強度檢查：父角色 → 子角色轉移在 rate_matrix 下全為零 → True。
+
+    具體限制（可選輸入）：rate_matrix 存在才生效。叠加多角色下，子分支任一角色
+    存在任一正強度父→子轉移即視為「活著」（False）。父 = root 或角色缺失時
+    恆 False（世界無關 fallback——不誤傷）。
+    """
+    child_roles = _as_role_list(branch.get("roles"))
+    if not child_roles:
+        return False
+    parent = _resolve_parent(branch, parent_branches)
+    if parent is None:
+        return False
+    parent_roles = _as_role_list(parent.get("roles"))
+    if not parent_roles:
+        return False
+    m = _as_rate_matrix(rate_matrix)
+    if m is None:
+        return False
+    for cr in child_roles:
+        if cr not in ROLES:
+            continue
+        strengths = [
+            float(m[ROLES.index(pr)][ROLES.index(cr)])
+            for pr in parent_roles
+            if pr in ROLES
+        ]
+        if any(s > 0.0 for s in strengths):
+            return False
+    return True
+
+
+def _check_role_transitions(
+    output_data: dict, parent_branches: list[dict]
+) -> None:
+    """文法轉移契約：父節點角色 → 子節點角色的 DCA 文法合法性（含結構性零）。
+
+    世界無關：僅用 ``validate_alternative``（通用文法），不依賴任何世界特定數據。
+    叠加多角色：子分支每個角色須存在至少一個父角色使其轉移合法（存在性）。
+    父 = root（無角色）時跳過（層 1 角色不受約束——處境本身可叠加任一角色）。
+    結構性零（direction→alternative、lag→direction）違反即 TreeProbeError（fatal）。
+    """
+    layer = output_data["layer"]
+    for i, b in enumerate(output_data.get("branches", [])):
+        child_roles = _as_role_list(b.get("roles"))
+        if not child_roles:
+            continue
+        parent = _resolve_parent(b, parent_branches)
+        if parent is None:
+            continue
+        parent_roles = _as_role_list(parent.get("roles"))
+        if not parent_roles:
+            continue
+        for cr in child_roles:
+            if not any(
+                validate_alternative(pr, cr, depth=layer) for pr in parent_roles
+            ):
+                raise TreeProbeError(
+                    f"branch[{i}] 文法轉移非法: 父角色 {parent_roles} → "
+                    f"子角色 {cr!r}（validate_alternative 拒——含結構性零 "
+                    f"direction→alternative / lag→direction）"
+                )
+
+
+# ---------------------------------------------------------------------------
 # 機械契約：assert_tree_gate_contract
 # ---------------------------------------------------------------------------
 
@@ -158,6 +429,7 @@ def assert_tree_gate_contract(
     *,
     max_branches: int | None = None,
     max_depth: int | None = None,
+    parent_branches: list[dict] | None = None,
 ) -> None:
     """機械契約檢查（仿 ``assert_alt_gate_contract``，PLAN-23 §12.3）。
 
@@ -166,6 +438,18 @@ def assert_tree_gate_contract(
     **分支鍵集外即拒**（F1：只允許 ``_ALLOWED_BRANCH_KEYS``，prose 鍵
     narrative/description/explanation/text/summary/prose 尤其拒收，複用
     ``_FORBIDDEN_PROSE_KEYS``）。
+
+    **W1（DCA 基底）**：
+    - ``roles``（可選但建議）：CLAD 角色**集合/向量**（可多，叠加）——值必須 ⊆ ROLES。
+    - ``role_instances``（可選）：角色 → 實例 id / 嵌套實例；嵌套深度跟隨樹層（≤ layer）。
+    - ``parent_branches``（可選）：上一層存活分支——給定時做**文法轉移**契約：
+      子分支每個角色須是父分支某角色的合法轉移（``validate_alternative``，含結構性零
+      direction→alternative / lag→direction）。
+    **roles 為可選欄位（``ROLES_REQUIRED`` = False）是設計決策**：DCA 是通用文法，
+    但為向後相容（舊 schema 無 roles 仍過），不設硬性強制；一旦某分支帶 roles，
+    文法 / 6D / 速率輔助即自動啟動。速率矩陣零強度邊**不在本契約**處理——那是
+    「具體限制」的可選輸入，由 ``_mechanical_check_layer`` 非致命拒（人機收束檢視，
+    不靜默丟棄）。
 
     ⚠️ 與 alt_gate 的差異：echo/quarantine 在此處為**結構性**契約檢查
     （給 ``situation_labels`` 時回聲即拒）；``probe_tree`` 內部改以逐節點
@@ -255,6 +539,11 @@ def assert_tree_gate_contract(
             raise TreeProbeError(
                 f"example echo: branch[{i}].label 重複 prompt 範例標籤 '{label}'"
             )
+        if label.startswith(AXIS_ECHO_PREFIXES):
+            raise TreeProbeError(
+                f"axis echo: branch[{i}].label '{label}' 以兩軸名詞為字首"
+                f"（F3：鏡射 prompt 教的軸詞彙——繼承的/湧現的/替代）"
+            )
         if situation_set is not None and label in situation_set:
             raise TreeProbeError(
                 f"situation echo: branch[{i}].label '{label}' 重複處境標籤"
@@ -324,6 +613,24 @@ def assert_tree_gate_contract(
             raise TreeProbeError(
                 f"branch[{i}].period_months 必須是非負數值，got {b['period_months']!r}"
             )
+
+        # W1：DCA 角色向量（第一公民）——可選，但一旦出現即驗結構 + 標準化。
+        if "roles" in b:
+            b["roles"] = _normalize_roles(b["roles"], f"branch[{i}].")
+        if "role_instances" in b:
+            _validate_role_instances(
+                b["role_instances"],
+                max_depth=min(
+                    layer if isinstance(layer, int) else MAX_ROLE_INSTANCE_DEPTH,
+                    max_depth or MAX_ROLE_INSTANCE_DEPTH,
+                ),
+                context=f"branch[{i}].",
+            )
+
+    # W1：文法轉移契約（父 → 子角色，含結構性零）——parent_branches 給定時才檢查
+    # （世界無關：僅 validate_alternative，無世界特定數據）。
+    if parent_branches:
+        _check_role_transitions(output_data, parent_branches)
 
 
 # ---------------------------------------------------------------------------
@@ -402,11 +709,20 @@ def _period_dispersion(branches: list[dict]) -> float | None:
     return float(np.clip(cv, 0.0, 1.0))
 
 
-def _layer_rigidity_components(branches: list[dict]) -> dict:
+def _layer_rigidity_components(
+    branches: list[dict], *, situation_vector: dict | None = None
+) -> dict:
     """整樹剛性統計（§12.4 #1）：分支間離散度 → 納入 rigidity 分佈。
 
     rigidity = blend_w * LLM 均值 + (1 - blend_w) * 機械離散補數。
     substitution 節點以 ``_CONTAMINATION_WEIGHT`` 降權（§12.4 #4，F7——不判語義真偽）。
+
+    **W1（6D 輔助分量）**：situation 帶 ``6d_vector`` 且層內分支帶 ``roles`` 時，
+    以 ``project_ternary``（quantum/vector.py）的角色方向投影 × situation 方向的
+    一致性（``ternary_alignment``，0-1）以小權重 ``_VECTOR_BLEND_W`` 併入 blend：
+    ``rigidity = (1-w_vec)*base + w_vec*alignment``。無任一輸入 → 行為不變
+    （世界無關 fallback）。``rate_zero`` 分支由 ``_mechanical_check_layer`` 非致命拒，
+    不進本函數（被拒節點不成反射對象）。
 
     F2 判定：**label 語義離散為主代理、role/period 為輔助顯示**——role_dispersion /
     period_dispersion（F1 可選欄位）只進 components，刻意不混入 blend（防過度工程、
@@ -426,13 +742,29 @@ def _layer_rigidity_components(branches: list[dict]) -> dict:
         llm_mean = 0.5
 
     mechanical_rigidity = 1.0 - dispersion
-    rigidity = float(
+    base = float(
         np.clip(
-            _RIGIDITY_BLEND_W * llm_mean + (1.0 - _RIGIDITY_BLEND_W) * mechanical_rigidity,
+            _RIGIDITY_BLEND_W * llm_mean
+            + (1.0 - _RIGIDITY_BLEND_W) * mechanical_rigidity,
             0.0,
             1.0,
         )
     )
+
+    # W1：6D 三進制方向輔助分量（小權重）——主代理仍是 label 語義離散。
+    ternary = _ternary_alignment(
+        situation_vector, _role_distribution_from_branches(branches)
+    )
+    if ternary is not None:
+        rigidity = float(
+            np.clip(
+                (1.0 - _VECTOR_BLEND_W) * base + _VECTOR_BLEND_W * ternary,
+                0.0,
+                1.0,
+            )
+        )
+    else:
+        rigidity = base
 
     return {
         "rigidity_prevalence": round(rigidity, 4),
@@ -442,6 +774,9 @@ def _layer_rigidity_components(branches: list[dict]) -> dict:
             "mechanical_rigidity": round(mechanical_rigidity, 4),
             "role_dispersion": _role_dispersion(branches),
             "period_dispersion": _period_dispersion(branches),
+            "ternary_alignment": round(ternary, 4) if ternary is not None else None,
+            "situation_vector": situation_vector,
+            "vector_blend_w": _VECTOR_BLEND_W if ternary is not None else None,
             "blend_w": _RIGIDITY_BLEND_W,
             "contamination_weight": _CONTAMINATION_WEIGHT,
         },
@@ -455,8 +790,15 @@ def _layer_rigidity_components(branches: list[dict]) -> dict:
 def _mechanical_check_layer(
     layer_entry: dict,
     situation_labels: list[str] | None,
+    *,
+    parent_branches: list[dict] | None = None,
+    rate_matrix: Any = None,
 ) -> tuple[list[dict], list[dict]]:
     """對一層分支做逐節點機械檢查：quarantine L1 / 回聲 / 空殼 / 兩軸 substitution 降權。
+
+    **W1**：``rate_matrix``（具體限制的可選輸入）存在時，父→子角色轉移強度為零的
+    邊機械**拒**（``rate_zero`` → rejected 清單，人機收束檢視——測量不靜默丟棄）。
+    無 rate_matrix 或無父/子角色時不動（世界無關 fallback）。
 
     回傳 ``(passed, rejected)``——rejected 節點進 rejected 清單供人機收束檢視，
     不靜默丟棄（§12.4）。被拒分支不作為下一層的反射對象。
@@ -492,6 +834,8 @@ def _mechanical_check_layer(
 
         if label in PROMPT_EXAMPLE_LABELS:
             reasons.append("echo: label 重複 prompt 範例標籤")
+        if label.startswith(AXIS_ECHO_PREFIXES):
+            reasons.append("echo: label 以兩軸名詞為字首（F3：繼承的/湧現的/替代鏡射）")
         if label in situation_set:
             reasons.append("echo: label 重複處境標籤")
 
@@ -500,6 +844,16 @@ def _mechanical_check_layer(
             b["contamination"] = True
         else:
             b["contamination"] = False
+
+        # W1：rate_matrix 零強度邊機械拒（具體限制的可選輸入——有 rate_matrix 才生效）。
+        # 世界無關 fallback：無 rate_matrix 或無父/子角色時不動（行為不變）。
+        b["rate_zero"] = False
+        if rate_matrix is not None and parent_branches is not None:
+            if _check_rate_zero(b, parent_branches, rate_matrix):
+                b["rate_zero"] = True
+                reasons.append(
+                    "rate_zero: 父→子角色轉移在速率矩陣下強度為零（具體限制，機械拒）"
+                )
 
         if reasons:
             b["rejected"] = True
@@ -734,6 +1088,9 @@ def _branch_ref(b: dict) -> dict:
         "axis_B": b.get("axis_B"),
         "rigidity_prevalence": b.get("rigidity_prevalence"),
         "conditions": b.get("conditions", []),
+        # W1：DCA 角色向量/嵌套實例——供下一層反射時做文法延續（父→子合法轉移）。
+        "roles": b.get("roles"),
+        "role_instances": b.get("role_instances"),
     }
 
 
@@ -818,7 +1175,14 @@ def _generate_one_tree(
     temperature: float,
     situation_labels: list[str] | None,
 ) -> dict:
-    """生成單棵決策樹（Phase A + B + C）。每層 1 call，共 depth 次。"""
+    """生成單棵決策樹（Phase A + B + C）。每層 1 call，共 depth 次。
+
+    W1：從 constraint_field 提取 ``rate_matrix``（具體限制的可選輸入）與 situation
+    的 ``6d_vector``（6D 輔助分量）——皆為可選，缺席時行為不變（世界無關）。
+    """
+    constraint = constraint_field if isinstance(constraint_field, dict) else {}
+    rate_matrix = constraint.get("rate_matrix")
+    situation_vector = _extract_situation_vector(situation)
     root = {
         "label": _root_label(situation),
         "grounding": "處境（root）",
@@ -859,8 +1223,12 @@ def _generate_one_tree(
         if leak_err:
             raise TreeProbeError(leak_err)
 
-        # Phase B：先逐節點機械檢查（quarantine/回聲/空殼/兩軸降權）→ passed / rejected
-        passed, layer_rejected = _mechanical_check_layer(parsed, situation_labels)
+        # Phase B：先逐節點機械檢查（quarantine/回聲/空殼/兩軸降權 + W1 rate_zero）→
+        # passed / rejected。rate_matrix 為「具體限制」可選輸入——缺席時零強度不檢查。
+        passed, layer_rejected = _mechanical_check_layer(
+            parsed, situation_labels,
+            parent_branches=reflect_on, rate_matrix=rate_matrix,
+        )
         for b in layer_rejected:
             b["layer"] = k
         rejected.extend(layer_rejected)
@@ -873,8 +1241,10 @@ def _generate_one_tree(
             )
         surviving = dict(parsed)
         surviving["branches"] = list(passed)
+        # W1：parent_branches 給定 → 契約做 DCA 文法轉移檢查（含結構性零，fatal）。
         assert_tree_gate_contract(
-            surviving, None, max_branches=n_branch, max_depth=depth
+            surviving, None, max_branches=n_branch, max_depth=depth,
+            parent_branches=reflect_on,
         )
 
         layer_entry = {
@@ -938,7 +1308,7 @@ def _generate_one_tree(
     rigidity_map: list[dict] = []
     for layer_entry in layers:
         branches = layer_entry["branches"]
-        comps = _layer_rigidity_components(branches)
+        comps = _layer_rigidity_components(branches, situation_vector=situation_vector)
         # 該層抵達路徑數（reflex 承載的樣本數）
         reached_k = sum(
             1 for p in paths if len(p) > layer_entry["layer"]
@@ -961,6 +1331,15 @@ def _generate_one_tree(
         layers, path_weights=_path_weights_from_paths(layers, paths)
     )
 
+    # F6：低發散警示——每父平均子數（非葉節點）。1.0 = 純單鏈主線（無真分岔，
+    # 每父恰好 1 子）；>1 = 真分岔。供 pilot 對 n_paths 過薄（=n_branch 級）時警示。
+    all_nodes = [root] + [b for le in layers for b in le["branches"]]
+    non_leaf = [n for n in all_nodes if n["children"]]
+    avg_children_per_parent = round(
+        float(np.mean([len(n["children"]) for n in non_leaf])) if non_leaf else 0.0,
+        4,
+    )
+
     return {
         "root": root,
         "layers": layers,
@@ -973,6 +1352,7 @@ def _generate_one_tree(
             "calls": calls,
             "n_paths": n_paths,
             "truncated": paths_truncated,  # F5：路徑爆炸截斷旗標
+            "avg_children_per_parent": avg_children_per_parent,  # F6：低發散警示
             "params": {},
         },
     }
@@ -1158,10 +1538,29 @@ def _local_minima(values: list[float]) -> list[int]:
 
 
 def _sharp_hit(table: dict, date_ref: Any) -> bool:
-    """殘差 sharp 命中（§12.6 ②）：該 date_ref 條目命中 saturation/decoupling。"""
+    """殘差 sharp 命中（§12.6 ②）：該 date_ref 條目命中 saturation/decoupling。
+
+    F2：LLM 可能輸出月級 date_ref（``"1914-07"``）而殘差表是日級鍵
+    （``"1914-07-22"``）——精確匹配不命中。月級 date_ref 掃描該月前綴鍵任一
+    sharp 即命中（仿 residual_trigger 的 day→month fallback，但此處是
+    month→day 掃描，方向相反）。日級 date_ref 維持精確匹配。
+    """
     if not date_ref:
         return False
-    entry = table.get(str(date_ref))
+    key = str(date_ref)
+    parts = key.split("-")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        # 月級（YYYY-MM）：掃描該月前綴鍵，任一 sharp 判據即命中
+        for k, entry in table.items():
+            if not isinstance(entry, dict):
+                continue
+            if not str(k).startswith(key):
+                continue
+            criteria = entry.get("criteria")
+            if isinstance(criteria, list) and any(c in SHARP_CRITERIA for c in criteria):
+                return True
+        return False
+    entry = table.get(key)
     if not isinstance(entry, dict):
         return False
     criteria = entry.get("criteria")
@@ -1189,6 +1588,9 @@ def _saturation_value(
         saturation_map = {}
     if isinstance(saturation_map, dict):
         val = saturation_map.get(str(date_ref)) if date_ref is not None else None
+        # F1：月級聚合 map——日級 date_ref（"1914-07-22"）回退該月前綴（"1914-07"）
+        if val is None and isinstance(date_ref, str) and len(date_ref.split("-")) == 3:
+            val = saturation_map.get(date_ref[:7])
         if val is None:
             val = saturation_map.get(str(layer))
         if val is None:
@@ -1327,7 +1729,11 @@ def probe_tree(
         if not api_key:
             raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
 
-    situation_labels = _extract_situation_labels(situation)
+    # F7：_extract_situation_labels 期待 {"situation": ...} 包裝（alt_gate 輸入形狀）——
+    # 直接傳 bare situation dict 恆回 None → 處境-echo 拒收靜默失效。此處包裝，
+    # 讓 situation_labels 真正帶處境標籤（防禦性：_extract_situation_labels 本身
+    # 也兼容 bare situation 形狀）。
+    situation_labels = _extract_situation_labels({"situation": situation})
 
     trees: list[dict] = []
     for _ in range(n_sample):
@@ -1519,6 +1925,7 @@ def probe_select(
 __all__ = [
     "AXIS_A_VALUES",
     "AXIS_B_VALUES",
+    "AXIS_ECHO_PREFIXES",
     "NECESSITY_HINT_KEY",
     "TreeProbeError",
     "assert_tree_gate_contract",
@@ -1529,4 +1936,7 @@ __all__ = [
     "_label_dispersion",
     "_cluster_archetypes",
     "_find_gate_nodes",
+    "_sharp_hit",
+    "_saturation_value",
+    "_generate_one_tree",
 ]

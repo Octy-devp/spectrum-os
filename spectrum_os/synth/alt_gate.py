@@ -300,10 +300,21 @@ def _extract_situation_labels(input_data: dict) -> list[str] | None:
     digest full text plus local_texture string values become the reference
     labels. Returns None when no situation payload is provided (behavior
     unchanged).
+
+    F7: probe.py 曾直接傳 bare situation dict（非包裝），使 ``input_data["situation"]``
+    恆 None → 處境-echo 拒收靜默失效。此處防禦性兼容兩種形狀：包裝
+    ``{"situation": {...}}``（alt_gate 輸入）與 bare situation dict
+    （自身含 ``digest`` / ``local_texture`` 時視為處境本身）。
     """
     situation = input_data.get("situation")
     if not isinstance(situation, dict):
-        return None
+        # F7：bare situation dict 形狀（probe 直接傳處境）——含處境特徵鍵即當處境。
+        if isinstance(input_data.get("digest"), str) or isinstance(
+            input_data.get("local_texture"), dict
+        ):
+            situation = input_data
+        else:
+            return None
     labels: list[str] = []
     digest = situation.get("digest")
     if isinstance(digest, str) and digest.strip():

@@ -24,6 +24,8 @@ PROMPT_EXAMPLE_LABELS: set[str] = {
     "處境的證據",
     "束縛的證據",
     "矛盾的證據",
+    # F3：決策樹探針範例標籤（中性社會物質詞——避免軸名詞鏡射）
+    "合作社自主調度",
 }
 
 GATE_SYSTEM_PROMPT_UNIFIED = (
@@ -142,21 +144,25 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     "\n"
     "When called with [task:tree_generate]:\n"
     "此刻你是約束剛性的探針——你沿著約束場逐層展開語義決策樹，測量「當時的約束有多緊」。\n"
-    "【操作】收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。\n"
+    "【操作】收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。同一父節點可有 1–N 個子分支（真分岔，非單鏈主線）。\n"
     "【約束】約束場已在處境給定——選擇必須在其承載量內；受約束的反射是歷史理性，不受約束的是鬧劇（空轉）。\n"
+    "【DCA 角色】每個分支標記 CLAD 角色向量 roles（crisis / lag / alternative / direction）——一個 situation 可以是任一角色，甚至多角色叠加（同一 situation 在 thread A 是 crisis、thread B 是 direction）。嵌套實例 role_instances：如 {\"crisis\": \"c1\", \"lag\": [\"l1\", \"l2\"]}——層 k 的角色實例可含子實例 c2/c3……，遞歸嵌套在具體限制下（深度受限，非無限）。文法轉移：子分支角色必須是父分支某個角色的合法轉移；結構性零不可違反——direction→alternative（承諾不可撤銷）、lag→direction（Lag 須經 Alternative 中介）。\n"
     "【兩軸判準】每節點標記軸 A（inherited|emergent）× 軸 B（expression|substitution）。軸 B 是自我表證——機械層只驗值合法性；語義判定由人機收束覆核。\n"
     "【成熟】忘掉母語：不翻譯回已知結局，自如表達；你的輸出是分支自己的語言。\n"
     "【鐵律】不寫結局、不寫處方；不重複處境已提供的標籤（回聲以處境為參照）；邊與條件必須在處境內可地面化；不輸出 necessity_hint（機器不標「必然」——必然由人機收束時人詮釋）。\n"
+    "⚠ 軸 B=substitution 僅在「真把既定結局當必然前提塞入」時標註——鏡射兩軸詞彙（繼承的/湧現的/替代）不算；label 不得以兩軸名詞為字首。\n"
     "Format:\n"
     "{\n"
     '  "layer": 1,\n'
-    '  "date_ref": "1914-07",\n'
+    '  "date_ref": "1914-07-22",\n'
     '  "branches": [\n'
     "    {\n"
-    '      "label": "湧現的替代",\n'
+    '      "label": "合作社自主調度",\n'
     '      "grounding": "處境內可地面化的支撐",\n'
     '      "axis_A": "emergent",\n'
     '      "axis_B": "expression",\n'
+    '      "roles": ["crisis"],\n'
+    '      "role_instances": {"crisis": "c1"},\n'
     '      "rigidity_prevalence": 0.7,\n'
     '      "confidence_band": {"lower": 0.6, "upper": 0.8, "n": 1},\n'
     '      "conditions": ["邊條件"]\n'
@@ -168,7 +174,8 @@ GATE_SYSTEM_PROMPT_UNIFIED = (
     "- branches 的 label ≤ 20 字，grounding 為處境內支撐短語，conditions 非空。\n"
     "- rigidity_prevalence 為 0-1 連續值（約束有多緊）；不切 hard/soft、不設閾值。\n"
     "- 可選 parent 欄位指向上一層分支 label；缺省時機械層掛主線。\n"
-    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent。\n"
+    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent、roles、role_instances。\n"
+    "- roles 為 CLAD 角色集合（可多，叠加）；role_instances 為嵌套實例（深度跟隨樹層，受限）。\n"
     "\n"
     "你只執行 user message 末尾標籤指定的任務——這就是你的全部世界。\n"
 )
@@ -183,11 +190,16 @@ TREE_GENERATE_SYSTEM_PROMPT = (
     "每個分支都只屬於這個狀態獨有的處境——具體到換一個狀態就不成立。\n"
     "\n"
     "【操作】\n"
-    "收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。\n"
+    "收到處境、約束場與上一層已通過機械檢查的分支 → 反射它們（約束場下導向哪裡、壓抑什麼）→ 展開本層 ≤ N_branch 個分支；只輸出本層。同一父節點可有 1–N 個子分支（真分岔，非單鏈主線）。\n"
     "reflex of reflex = 層間迭代——你的反射對象是上一層的輸出，不是處境本身。\n"
     "\n"
     "【約束】\n"
     "約束場已在處境給定——選擇必須在其承載量內；受約束的反射是歷史理性，不受約束的是鬧劇（空轉）。\n"
+    "\n"
+    "【DCA 角色】\n"
+    "每個分支標記 CLAD 角色向量 roles（crisis / lag / alternative / direction）——一個 situation 可以是任一角色，甚至多角色叠加（同一 situation 在 thread A 是 crisis、thread B 是 direction）。\n"
+    "嵌套實例 role_instances：如 {\"crisis\": \"c1\", \"lag\": [\"l1\", \"l2\"]}——層 k 的角色實例可含子實例 c2/c3……，遞歸嵌套在具體限制下（深度受限，非無限）。\n"
+    "文法轉移：子分支角色必須是父分支某個角色的合法轉移；結構性零不可違反——direction→alternative（承諾不可撤銷）、lag→direction（Lag 須經 Alternative 中介）。\n"
     "\n"
     "【兩軸判準】\n"
     "軸 A 詞彙來源：inherited（繼承/借用）| emergent（湧現/自創）——發展軸，非污染軸。\n"
@@ -199,19 +211,22 @@ TREE_GENERATE_SYSTEM_PROMPT = (
     "\n"
     "【鐵律】\n"
     "不寫結局、不寫處方；不重複處境已提供的標籤（回聲以處境為參照）；邊與條件必須在處境內可地面化；不輸出 necessity_hint（機器不標「必然」——必然由人機收束時人詮釋）。\n"
+    "⚠ 軸 B=substitution 僅在「真把既定結局當必然前提塞入」時標註——鏡射兩軸詞彙（繼承的/湧現的/替代）不算；label 不得以兩軸名詞為字首。\n"
     "\n"
     "【輸出形態】\n"
     "你的輸出只有一個 JSON 對象——第一個字符是 {，最後一個字符是 }。\n"
     "Format:\n"
     "{\n"
     '  "layer": 1,\n'
-    '  "date_ref": "1914-07",\n'
+    '  "date_ref": "1914-07-22",\n'
     '  "branches": [\n'
     "    {\n"
-    '      "label": "湧現的替代",\n'
+    '      "label": "合作社自主調度",\n'
     '      "grounding": "處境內可地面化的支撐",\n'
     '      "axis_A": "emergent",\n'
     '      "axis_B": "expression",\n'
+    '      "roles": ["crisis"],\n'
+    '      "role_instances": {"crisis": "c1"},\n'
     '      "rigidity_prevalence": 0.7,\n'
     '      "confidence_band": {"lower": 0.6, "upper": 0.8, "n": 1},\n'
     '      "conditions": ["邊條件"]\n'
@@ -223,7 +238,8 @@ TREE_GENERATE_SYSTEM_PROMPT = (
     "- branches 的 label ≤ 20 字，grounding 為處境內支撐短語，conditions 非空。\n"
     "- rigidity_prevalence 為 0-1 連續值（約束有多緊）；不切 hard/soft、不設閾值。\n"
     "- 可選 parent 欄位指向上一層分支 label；缺省時機械層掛主線。\n"
-    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent。\n"
+    "- branches 的鍵只有 label、grounding、axis_A、axis_B、rigidity_prevalence、confidence_band、conditions、parent、roles、role_instances。\n"
+    "- roles 為 CLAD 角色集合（可多，叠加）；role_instances 為嵌套實例（深度跟隨樹層，受限）。\n"
 )
 
 # --- Version B: 歷史的意外（殘差觸發模式，[task:enumerate]）---
