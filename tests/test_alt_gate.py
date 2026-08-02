@@ -617,3 +617,132 @@ class TestVersionBEnumerate:
             '{}', {"accidents": [], "flagged_labels": []}, "enumerate"
         )
         assert err is not None and "enumerate" in err
+
+
+# ---------------------------------------------------------------------------
+# §12.13：Mode A → Mode B 依賴（後驗初始化接線，純機械部分）
+# ---------------------------------------------------------------------------
+
+class TestModeAPosterior:
+    def test_record_and_load_roundtrip(self, tmp_path):
+        from spectrum_os.synth.alt_gate import (
+            load_mode_a_history,
+            record_mode_a_history,
+        )
+        p = str(tmp_path / "mode_a.jsonl")
+        record_mode_a_history(
+            p, {"ts": "t1", "mode": "markov", "role_sequence": ["crisis", "lag"]}
+        )
+        record_mode_a_history(
+            p, {"ts": "t2", "mode": "spectrum", "labels": ["動員令凍結"]}
+        )
+        hist = load_mode_a_history(p)
+        assert len(hist) == 2
+        assert hist[0]["ts"] == "t1" and hist[1]["ts"] == "t2"
+
+    def test_load_skips_corrupt_lines(self, tmp_path):
+        from spectrum_os.synth.alt_gate import load_mode_a_history
+        p = tmp_path / "mode_a.jsonl"
+        p.write_text('{"ts": "ok"}\nnot-json\n{"ts": "ok2"}\n', encoding="utf-8")
+        hist = load_mode_a_history(str(p))
+        assert [h["ts"] for h in hist] == ["ok", "ok2"]
+
+    def test_load_missing_file_returns_empty(self, tmp_path):
+        from spectrum_os.synth.alt_gate import load_mode_a_history
+        assert load_mode_a_history(str(tmp_path / "nope.jsonl")) == []
+
+    def test_posterior_init_dominant_transitions(self):
+        from spectrum_os.synth.alt_gate import mode_a_posterior_init
+        rate = [
+            [0.0, 0.9, 0.1, 0.0],
+            [0.0, 0.0, 0.8, 0.2],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+        hist = [{"mode": "markov", "rate_matrix": {"matrix": rate},
+                 "role_sequence": ["crisis", "lag"]}]
+        posterior = mode_a_posterior_init(hist)
+        assert posterior["n_entries"] == 1
+        assert posterior["source"] == "mode_a_history"
+        assert posterior["rate_matrix"]["matrix"] == rate
+        dom = posterior["rate_matrix"]["dominant_transitions"]
+        assert dom and dom[0]["rate"] >= 0.8
+        # 角色序列 → 馬可夫轉移計數 4x4
+        assert posterior["role_statistics"]["transition_counts"] is not None
+        assert len(posterior["role_statistics"]["transition_counts"]) == 4
+
+    def test_posterior_init_accumulates_labels(self):
+        from spectrum_os.synth.alt_gate import mode_a_posterior_init
+        hist = [
+            {"labels": ["動員令凍結", "地方調撥自主"]},
+            {"labels": ["動員令凍結", "國際調停介入"]},
+        ]
+        posterior = mode_a_posterior_init(hist)
+        assert posterior["accumulated_labels"] == [
+            "動員令凍結", "地方調撥自主", "國際調停介入",
+        ]
+        assert "PROMPT-DEPENDENT" in posterior["annotation"]
+
+    def test_posterior_init_empty(self):
+        from spectrum_os.synth.alt_gate import mode_a_posterior_init
+        posterior = mode_a_posterior_init([])
+        assert posterior["n_entries"] == 0
+
+    def test_enumerate_injects_mode_a_history_data(self):
+        from spectrum_os.synth.gate_prompts import VERSION_B_SYSTEM_PROMPT
+        mock = MagicMock()
+        mock.return_value = json.dumps({
+            "accidents": [{
+                "pattern": "蒂薩阻止對塞戰爭",
+                "instances": ["蒂薩在匈牙利議會否決戰爭"],
+                "domain": "政治",
+                "source": "inherited",
+                "usage": "expression",
+                "grounding": "文獻偶發",
+                "world_development": "危機降溫",
+            }]
+        }, ensure_ascii=False)
+        hist = [{"mode": "markov",
+                 "rate_matrix": [[0.0, 1.0, 0.0, 0.0]] * 4,
+                 "labels": ["動員令凍結"]}]
+        res = alt_gate_enumerate(
+            {"situation": {"digest": "測試處境"}},
+            call_api_fn=mock, api_key="test-key", mode_a_history=hist,
+        )
+        args = mock.call_args
+        prompt = args.args[0]
+        assert "mode_a_history" in prompt          # 資料層注入（非 prompt 措辭）
+        assert "[task:enumerate]" in prompt        # 既有 prompt 字串保留
+        assert args.kwargs["system_message"] == VERSION_B_SYSTEM_PROMPT  # 未改 prompt
+        assert res["mode_a_posterior"]["n_entries"] == 1
+
+    def test_enumerate_loads_from_log_path(self, tmp_path):
+        from spectrum_os.synth.alt_gate import record_mode_a_history
+        p = str(tmp_path / "mode_a.jsonl")
+        record_mode_a_history(p, {"mode": "spectrum", "labels": ["動員令凍結"]})
+        mock = MagicMock()
+        mock.return_value = json.dumps({
+            "accidents": [{
+                "pattern": "意外甲", "instances": ["實例"], "domain": "政治",
+                "source": "emergent", "usage": "expression",
+                "grounding": "合理推測", "world_development": "發展",
+            }]
+        }, ensure_ascii=False)
+        res = alt_gate_enumerate(
+            {"situation": {}}, call_api_fn=mock, api_key="k",
+            mode_a_log_path=p,
+        )
+        assert res["mode_a_posterior"]["accumulated_labels"] == ["動員令凍結"]
+
+    def test_without_mode_a_backward_compat(self):
+        mock = MagicMock()
+        mock.return_value = json.dumps({
+            "accidents": [{
+                "pattern": "意外甲", "instances": ["實例"], "domain": "自然",
+                "source": "emergent", "usage": "expression",
+                "grounding": "弱支持", "world_development": "發展",
+            }]
+        }, ensure_ascii=False)
+        res = alt_gate_enumerate({"situation": {}}, call_api_fn=mock, api_key="k")
+        assert "mode_a_history" not in mock.call_args.args[0]
+        assert res["mode_a_posterior"] is None

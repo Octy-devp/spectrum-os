@@ -19,7 +19,12 @@ from spectrum_os.synth.gate_prompts import (
 from spectrum_os.synth.probe import (
     NECESSITY_HINT_KEY,
     TreeProbeError,
+    _prevalence_band,
+    _rigidity_band,
+    _semantic_path_similarity,
     assert_tree_gate_contract,
+    cluster_archetypes_semantic,
+    convergence_view,
     probe_select,
     probe_tree,
     standing_wave_per_layer,
@@ -1306,3 +1311,333 @@ class TestDcaRoleVector:
         # 既有子句保留（向後相容）
         for clause in ("【操作】", "【約束】", "【兩軸判準】", "【成熟】", "【鐵律】"):
             assert clause in TREE_GENERATE_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# T7（F3）：standing_wave_per_layer 逐層變體——多層/邊界測試
+# ---------------------------------------------------------------------------
+
+class TestStandingWavePerLayerEdges:
+    def test_multi_layer_grouped_independent(self):
+        # 每層獨立分組——不是既有 standing_wave 的跨步 union
+        layers = [
+            {"layer": 1, "date_ref": "1914-07", "branches": [
+                valid_branch("甲"), valid_branch("甲"), valid_branch("乙"),
+            ]},
+            {"layer": 2, "date_ref": "1914-08", "branches": [
+                valid_branch("丙"), valid_branch("丙"), valid_branch("丙"),
+            ]},
+        ]
+        res = standing_wave_per_layer(layers)
+        assert len(res["per_layer"]) == 2
+        l1, l2 = res["per_layer"]
+        assert l1["layer"] == 1 and l2["layer"] == 2
+        p1 = {t["label"]: t["prevalence"] for t in l1["nodes"] + l1["antinodes"]}
+        assert p1["甲"] == pytest.approx(2 / 3, abs=1e-3)
+        assert p1["乙"] == pytest.approx(1 / 3, abs=1e-3)
+        # layer 2 全同 → 全 nodes（prevalence 1.0）、無 antinodes、剛性 1.0
+        assert [t["label"] for t in l2["nodes"]] == ["丙"]
+        assert l2["antinodes"] == []
+        assert l2["layer_rigidity"] == pytest.approx(1.0, abs=1e-3)
+
+    def test_empty_layers(self):
+        res = standing_wave_per_layer([])
+        assert res["per_layer"] == []
+        assert res["meta"]["total_layers"] == 0
+
+    def test_single_branch_is_node(self):
+        layers = [{"layer": 1, "date_ref": "1914-07", "branches": [valid_branch("唯一")]}]
+        res = standing_wave_per_layer(layers)
+        per = res["per_layer"][0]
+        assert [t["label"] for t in per["nodes"]] == ["唯一"]
+        assert per["antinodes"] == []
+        assert per["layer_rigidity"] == 1.0
+
+    def test_no_weights_equals_equal_weights(self):
+        layers = [{"layer": 1, "branches": [valid_branch("甲"), valid_branch("乙")]}]
+        no_w = standing_wave_per_layer(layers)
+        eq_w = standing_wave_per_layer(layers, path_weights={1: [1, 1]})
+        p_no = {
+            t["label"]: t["prevalence"]
+            for t in no_w["per_layer"][0]["nodes"] + no_w["per_layer"][0]["antinodes"]
+        }
+        p_eq = {
+            t["label"]: t["prevalence"]
+            for t in eq_w["per_layer"][0]["nodes"] + eq_w["per_layer"][0]["antinodes"]
+        }
+        assert p_no == p_eq
+
+    def test_zero_weight_branch_remasked_not_dropped(self):
+        # prevalence==0 的分支不消失——維持叠加交人（remasking，§12.5 步驟 4）
+        layers = [
+            {"layer": 1, "date_ref": "1914-07", "branches": [
+                valid_branch("無路"), valid_branch("有路"),
+            ]},
+        ]
+        res = standing_wave_per_layer(layers, path_weights={1: [0, 1]})
+        per = res["per_layer"][0]
+        labels = [t["label"] for t in per["nodes"] + per["antinodes"] + per["remasked"]]
+        assert "無路" in labels  # 被 remask 而非丟棄
+
+
+# ---------------------------------------------------------------------------
+# T8（F10）：世界原型——語義距離聚類（零 API，樹自身特徵）
+# ---------------------------------------------------------------------------
+
+class TestSemanticArchetypes:
+    def test_near_duplicate_labels_ranked_above_unrelated(self):
+        # 字元 n-gram 捕捉形近標籤——Jaccard 集合層面零重疊、n-gram 層面高相似
+        p_near_a = [valid_branch("動員令凍結", roles=["crisis"])]
+        p_near_b = [valid_branch("動員令解凍", roles=["crisis"])]
+        p_far = [valid_branch("國際調停介入", roles=["alternative"])]
+        sim_near = _semantic_path_similarity(p_near_a, p_near_b)
+        sim_far = _semantic_path_similarity(p_near_a, p_far)
+        assert sim_near > sim_far
+        assert sim_near > 0.5  # 形近 pair 相似度顯著
+
+    def test_role_profile_contributes(self):
+        # 同標籤、不同角色 → 相似度低於同標籤同角色（DCA 文法親和納入）
+        a1 = [valid_branch("開戰", roles=["crisis"])]
+        a2 = [valid_branch("開戰", roles=["crisis"])]
+        b = [valid_branch("開戰", roles=["alternative"])]
+        assert _semantic_path_similarity(a1, a2) > _semantic_path_similarity(a1, b)
+
+    def test_groups_near_duplicate_paths_into_same_cluster(self):
+        # 三組形近 pair——語義聚類把它們各自歸組（Jaccard 集合層面無法分辨）
+        paths = [
+            [valid_branch("動員令凍結", roles=["crisis"])],
+            [valid_branch("動員令解凍", roles=["crisis"])],
+            [valid_branch("國際調停介入", roles=["alternative"])],
+            [valid_branch("國際斡旋介入", roles=["alternative"])],
+            [valid_branch("地方調撥自主", roles=["direction"])],
+            [valid_branch("地方自主調撥", roles=["direction"])],
+        ]
+        archetypes, meta = cluster_archetypes_semantic(paths, n_min=2, n_max=3)
+        assert meta["k"] == 3
+        members = [set(a["member_path_ids"]) for a in archetypes]
+        assert {0, 1} in members
+        assert {2, 3} in members
+        assert {4, 5} in members
+
+    def test_k_selection_within_target_range(self):
+        paths = [[valid_branch(f"路徑{i}")] for i in range(6)]
+        _archetypes, meta = cluster_archetypes_semantic(paths, n_min=5, n_max=8)
+        assert 5 <= meta["k"] <= 8
+        assert meta["fell_back"] is False
+
+    def test_insufficient_paths_falls_back_honestly(self):
+        # 路徑數 < n_min → 誠實回退，不硬湊 5–8
+        paths = [[valid_branch("a")], [valid_branch("b")], [valid_branch("c")]]
+        archetypes, meta = cluster_archetypes_semantic(paths, n_min=5, n_max=8)
+        assert meta["k"] == 3
+        assert meta["fell_back"] is True
+        assert len(archetypes) == 3
+
+    def test_empty_paths(self):
+        archetypes, meta = cluster_archetypes_semantic([])
+        assert archetypes == []
+        assert meta["k"] == 0
+
+    def test_deterministic(self):
+        paths = [
+            [valid_branch("動員令凍結", roles=["crisis"])],
+            [valid_branch("動員令解凍", roles=["crisis"])],
+            [valid_branch("國際調停介入", roles=["alternative"])],
+        ]
+        _a1, m1 = cluster_archetypes_semantic(paths, n_min=2, n_max=3)
+        _a2, m2 = cluster_archetypes_semantic(paths, n_min=2, n_max=3)
+        assert m1["k"] == m2["k"]
+        assert [a["member_path_ids"] for a in _a1] == [a["member_path_ids"] for a in _a2]
+
+    def test_probe_tree_wires_semantic_archetypes(self):
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        assert "archetype_meta" in result
+        assert all(a["method"] == "semantic_hybrid" for a in result["archetypes"])
+        assert result["archetype_meta"]["k"] == len(result["archetypes"])
+        assert result["archetype_meta"]["n_paths"] == len(result["trees"][0]["paths"])
+
+
+# ---------------------------------------------------------------------------
+# T9（F6 程式碼部分）：收束視圖 UX + state_log 迴路
+# ---------------------------------------------------------------------------
+
+class TestConvergenceView:
+    def test_view_sections_and_rigidity_distribution(self):
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        view = convergence_view(result)
+        assert view["sections"] == [
+            "rigidity_distribution", "archetype_cards", "gate_node_cards", "selection",
+        ]
+        assert len(view["rigidity_distribution"]) == 3
+        for e in view["rigidity_distribution"]:
+            assert "confidence_band" in e
+            assert 0.0 <= e["rigidity_prevalence"] <= 1.0
+            # 不切 hard/soft、無「必然」標記
+            assert "necessity" not in json.dumps(e, ensure_ascii=False)
+        assert view["selection"]["selected"] is None
+
+    def test_archetype_cards_include_representative_path(self):
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        view = convergence_view(result)
+        assert view["archetype_cards"]
+        for card in view["archetype_cards"]:
+            assert isinstance(card["representative_path"], list)
+            assert card["representative_path"]  # 非空——root 至少一節點
+            assert card["labels"]
+
+    def test_gate_node_cards_include_branch_labels(self):
+        residuals = {"1914-08": {"criteria": ["saturation", "decoupling"]}}
+        mock_gate, _ = make_mock_gate(
+            [TestGateNodes.L1_HIGH, TestGateNodes.L2_LOW, TestGateNodes.L3_HIGH]
+        )
+        result = probe_tree(
+            SITUATION, constraint_field={"residuals": residuals},
+            n_branch=3, depth=3, gate_fn=mock_gate,
+        )
+        view = convergence_view(result)
+        assert view["gate_node_cards"]
+        g = view["gate_node_cards"][0]
+        assert g["layer"] == 2
+        assert "軍部強行開戰" in g["branch_labels"]
+        assert "動員叫停" in g["branch_labels"]
+
+    def test_selection_reflects_collapse(self):
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        probe_select(
+            result, selected_label="動員令凍結", verdict="selected", re_calibrate=True
+        )
+        view = convergence_view(result)
+        assert view["selection"]["selected"] == "動員令凍結"
+        assert view["selection"]["layer"] == 1
+        assert "地方調撥自主" in view["selection"]["unselected"]
+        assert view["selection"]["verdict"] == "selected"
+        assert view["selection"]["re_calibrate"] is True
+
+    def test_state_log_query_compat(self, tmp_path, monkeypatch):
+        # probe_select 落盤到 data/state_log.jsonl → query_state_log/summarize 可讀
+        monkeypatch.chdir(tmp_path)
+        _verify.init_log("data/state_log.jsonl")
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        probe_select(
+            result, selected_label="動員令凍結", verdict="selected", re_calibrate=True
+        )
+        entries = _verify.query_state_log()
+        assert any(
+            e.get("gate_type") == "probe_tree" and e.get("selected_branch") == "動員令凍結"
+            for e in entries
+        )
+        summary = _verify.summarize_state_log()
+        assert summary["total_entries"] >= 1
+        assert summary["last_entry"]["gate_type"] == "probe_tree"
+
+    def test_verdict_branches_recorded(self):
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        for v in ("selected", "unselected", "human_override"):
+            probe_select(result, selected_label="動員令凍結", verdict=v)
+            entry = result["state_log_entry"]
+            assert entry["verdict"] == v
+            assert entry["gate_type"] == "probe_tree"
+
+    def test_append_atomicity(self, tmp_path):
+        # 多次收束 → 每次恰好一筆 JSONL 行，檔案全程可解析
+        log_path = str(tmp_path / "state_log.jsonl")
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        for _ in range(3):
+            probe_select(
+                result, selected_label="動員令凍結", verdict="selected",
+                state_log_path=log_path,
+            )
+        with open(log_path, encoding="utf-8") as fh:
+            lines = [l for l in fh if l.strip()]
+        assert len(lines) == 3
+        for line in lines:
+            rec = json.loads(line)  # 每行都是完整 JSON
+            assert rec["gate_type"] == "probe_tree"
+
+    def test_failed_select_does_not_append(self, tmp_path):
+        # F7：verdict 驗證在副作用之前——失敗不留殘留、不 append。
+        # 驗證發生在 init_log 之前 → 失敗時檔案根本不建立（零殘留，比空檔更嚴格）。
+        log_path = str(tmp_path / "state_log.jsonl")
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        result = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        with pytest.raises(TreeProbeError):
+            probe_select(
+                result, selected_label="動員令凍結", verdict="invalid",
+                state_log_path=log_path,
+            )
+        assert not os.path.exists(log_path)  # 檔案不存在 = 零殘留
+        assert _verify._state_log == []  # 記憶體緩衝同樣零殘留
+
+
+# ---------------------------------------------------------------------------
+# T11：remasking / 信賴帶校準（Wald→Wilson + 邊界案例）
+# ---------------------------------------------------------------------------
+
+class TestBandCalibration:
+    def test_n1_remasks_unknown_full_band(self):
+        band = _prevalence_band(1, 1)
+        assert band["confidence"] == "UNKNOWN"   # 樣本不足 → remask
+        assert band["basis"] == "wilson_path"
+        assert band["lower"] == 0.0 and band["upper"] == 1.0  # 全寬——不偽裝信心
+
+    def test_n2_measured_but_wide(self):
+        band = _prevalence_band(1, 2)
+        assert band["confidence"] == "measured"  # N=2 ≥ MIN_PATHS_FOR_CONFIDENCE
+        assert band["upper"] - band["lower"] > 0.5  # 寬帶——不偽裝高信心
+
+    def test_all_zero_remasks_unknown(self):
+        band = _prevalence_band(0, 3)
+        assert band["confidence"] == "UNKNOWN"   # prevalence==0 → remask（§12.5 步驟 4）
+
+    def test_boundary_one_not_collapsed(self):
+        # Wald 在 p=1 時零寬度 [1,1]——Wilson 給誠實寬帶（T11 校準）
+        band = _prevalence_band(2, 2)
+        assert band["confidence"] == "measured"
+        assert band["lower"] < 0.5               # 下界不坍縮到 1.0
+        assert band["upper"] == 1.0
+
+    def test_no_paths(self):
+        band = _prevalence_band(0, 0)
+        assert band["confidence"] == "UNKNOWN"
+        assert band["basis"] == "no_paths"
+        assert band["lower"] == 0.0 and band["upper"] == 1.0
+
+    def test_cross_tree_var_basis(self):
+        band = _prevalence_band(3, 6, cross_tree=[0.5, 0.5, 0.5])
+        assert band["basis"] == "cross_tree_var"
+        assert band["confidence"] == "measured"
+
+    def test_cross_tree_boundary_uses_wilson_fallback(self):
+        # 跨樹全一致（std=0，邊界 1.0）→ 退 Wilson，不零寬度
+        band = _prevalence_band(2, 2, cross_tree=[1.0, 1.0])
+        assert band["basis"] == "cross_tree_var"
+        assert band["lower"] < 0.5
+
+    def test_rigidity_band_n1_unknown_full_band(self):
+        band = _rigidity_band([0.5], 1)
+        assert band["confidence"] == "UNKNOWN"
+        assert band["basis"] == "rigidity_wilson_path"
+        assert band["lower"] == 0.0 and band["upper"] == 1.0
+
+    def test_rigidity_band_boundary_not_collapsed(self):
+        band = _rigidity_band([1.0], 3)
+        assert band["confidence"] == "measured"
+        assert band["lower"] < 0.7  # Wilson——非 [1,1]
+        assert band["upper"] == 1.0
+
+    def test_rigidity_band_cross_tree(self):
+        band = _rigidity_band([0.4, 0.6], 6)
+        assert band["basis"] == "rigidity_cross_tree"
+        assert band["confidence"] == "measured"
+
+    def test_rigidity_band_empty(self):
+        band = _rigidity_band([], 0)
+        assert band["confidence"] == "UNKNOWN"
+        assert band["basis"] == "no_data"

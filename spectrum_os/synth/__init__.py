@@ -49,6 +49,8 @@ from .probe import (
     NECESSITY_HINT_KEY,
     TreeProbeError,
     assert_tree_gate_contract,
+    cluster_archetypes_semantic,
+    convergence_view,
     probe_select,
     probe_tree,
     standing_wave_per_layer,
@@ -92,6 +94,8 @@ __all__ = [
     "TreeProbeError",
     "assert_tree_gate_contract",
     "standing_wave_per_layer",
+    "cluster_archetypes_semantic",
+    "convergence_view",
     "probe_tree",
     "probe_select",
 ]

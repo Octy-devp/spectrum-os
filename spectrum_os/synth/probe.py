@@ -869,6 +869,23 @@ def _mechanical_check_layer(
 # Phase C：連續剛性測量（樹→路徑枚舉 → prevalence + 信賴帶 + remasking）
 # ---------------------------------------------------------------------------
 
+def _wilson_interval(p: float, n: int, z: float = _Z) -> tuple[float, float]:
+    """Wilson score interval（95%）——p 在邊界 0/1 時**不坍縮為零寬度**。
+
+    Wald 在 p∈{0,1} 時 SE=0 → 帶寬為 0 → 偽裝高信心（樣本少時尤其嚴重：
+    N=2 全命中 → [1.0, 1.0]）。Wilson 以正態近似倒推，邊界處給出誠實的寬帶
+    （§12.10 #1 ②：信賴帶誠實——樣本不足 → 寬帶/UNKNOWN，不偽裝高信心）。
+    內部 p 值 Wilson ≈ Wald，行為連續。
+    """
+    if n <= 0:
+        return 0.0, 1.0
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    half = z * math.sqrt(max(p * (1.0 - p), 0.0) / n + z2 / (4.0 * n * n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
 def _prevalence_band(
     count: int,
     n: int,
@@ -878,8 +895,9 @@ def _prevalence_band(
 ) -> dict:
     """信賴帶（95%）。
 
-    - ``cross_tree``（n_sample>1）：跨樹樣本變異 → 樣本均數 ± z·SE。
-    - 單樹/匯總：以路徑數 n 的 Wald 區間。
+    - ``cross_tree``（n_sample>1）：跨樹樣本變異 → 樣本均數 ± z·SE；若跨樹
+      std=0（全樹一致，含邊界 0/1）→ 退 Wilson（以總樣本數 n 估，避免零寬度偽信心）。
+    - 單樹/匯總：以路徑數 n 的 **Wilson** 區間（非 Wald——Wald 在邊界坍縮，T11 校準）。
     - remasking：``n < MIN_PATHS_FOR_CONFIDENCE`` 或 ``prevalence==0`` → ``UNKNOWN``
       （維持叠加交人，§12.5 步驟 4——只在門上坍縮，不在機械層提前閉合）。
     """
@@ -896,9 +914,14 @@ def _prevalence_band(
         arr = np.asarray(cross_tree, dtype=np.float64)
         mean_p = float(arr.mean())
         std_p = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
-        se = std_p / math.sqrt(float(len(arr)))
-        lower = max(0.0, mean_p - z * se)
-        upper = min(1.0, mean_p + z * se)
+        if std_p > 0.0:
+            se = std_p / math.sqrt(float(len(arr)))
+            lower = max(0.0, mean_p - z * se)
+            upper = min(1.0, mean_p + z * se)
+        else:
+            # 全樹一致（std=0）——含邊界 0/1：退 Wilson 以總樣本數估，
+            # 避免「全樹一致」被誤當高信心（樣本少時邊界零寬度是偽裝）。
+            lower, upper = _wilson_interval(mean_p, n, z=z)
         confidence = (
             "UNKNOWN" if (mean_p == 0.0 or len(arr) < MIN_SAMPLES) else "measured"
         )
@@ -909,16 +932,17 @@ def _prevalence_band(
             "confidence": confidence,
             "basis": "cross_tree_var",
         }
-    se = math.sqrt(max(p * (1.0 - p), 0.0) / n)
-    lower = max(0.0, p - z * se)
-    upper = min(1.0, p + z * se)
+    lower, upper = _wilson_interval(p, n, z=z)
     confidence = "UNKNOWN" if (p == 0.0 or n < MIN_PATHS_FOR_CONFIDENCE) else "measured"
+    if n < MIN_PATHS_FOR_CONFIDENCE:
+        # 樣本不足（T11）→ 全寬 [0,1]——維持叠加交人，不偽裝任何信心
+        lower, upper = 0.0, 1.0
     return {
         "lower": round(lower, 4),
         "upper": round(upper, 4),
         "n": n,
         "confidence": confidence,
-        "basis": "wald_path",
+        "basis": "wilson_path",
     }
 
 
@@ -1361,8 +1385,9 @@ def _generate_one_tree(
 def _rigidity_band(rigidities: list[float], n_paths: int) -> dict:
     """整樹剛性信賴帶。
 
-    - 跨樹（>1 棵）：跨樹樣本變異 → 樣本均數 ± z·SE，basis ``rigidity_cross_tree``。
-    - 單樹：以該層抵達路徑數 n 的 Wald 區間，basis ``rigidity_wald_path``
+    - 跨樹（>1 棵）：跨樹樣本變異 → 樣本均數 ± z·SE，basis ``rigidity_cross_tree``；
+      std=0（全樹一致，含邊界 0/1）→ 退 Wilson（避免零寬度偽信心，T11 校準）。
+    - 單樹：以該層抵達路徑數 n 的 **Wilson** 區間，basis ``rigidity_wilson_path``
       （估的是**路徑枚舉**的抽樣誤差，不是 LLM 生成變異——後者無跨樹樣本時誠實標 UNKNOWN）。
     - remasking：``mean==0`` 或路徑數不足 → ``UNKNOWN``（維持叠加交人，§12.5 步驟 4）。
     """
@@ -1372,19 +1397,24 @@ def _rigidity_band(rigidities: list[float], n_paths: int) -> dict:
     mean = float(arr.mean())
     if arr.size > 1:
         std = float(arr.std(ddof=1))
-        se = std / math.sqrt(float(arr.size))
+        if std > 0.0:
+            se = std / math.sqrt(float(arr.size))
+            lower = max(0.0, mean - _Z * se)
+            upper = min(1.0, mean + _Z * se)
+        else:
+            lower, upper = _wilson_interval(mean, max(n_paths, 1))
         basis = "rigidity_cross_tree"
     else:
-        std = 0.0
-        se = math.sqrt(max(mean * (1.0 - mean), 0.0) / max(n_paths, 1))
-        basis = "rigidity_wald_path"
-    lower = max(0.0, mean - _Z * se)
-    upper = min(1.0, mean + _Z * se)
+        lower, upper = _wilson_interval(mean, max(n_paths, 1))
+        basis = "rigidity_wilson_path"
     confidence = (
         "UNKNOWN"
         if (mean == 0.0 or n_paths < MIN_PATHS_FOR_CONFIDENCE)
         else "measured"
     )
+    if n_paths < MIN_PATHS_FOR_CONFIDENCE:
+        # 樣本不足（T11）→ 全寬 [0,1]——維持叠加交人，不偽裝任何信心
+        lower, upper = 0.0, 1.0
     return {
         "lower": round(lower, 4),
         "upper": round(upper, 4),
@@ -1524,6 +1554,299 @@ def _cluster_archetypes(
             }
         )
     return archetypes
+
+
+# ---------------------------------------------------------------------------
+# T8（F10）：世界原型——語義距離聚類層（零 API，全樹自身特徵）
+# ---------------------------------------------------------------------------
+
+#: 語義距離相似度權重——label 字元 n-gram 為主、role/兩軸為輔（皆從樹導出，世界無關）。
+_LABEL_SIM_W = 0.6
+_ROLE_SIM_W = 0.25
+_AXIS_SIM_W = 0.15
+
+#: 路徑數超過此值時語義聚類（O(n²) 凝聚 + silhouette）成本過高 → 退 Jaccard 基底
+#: （仍機械、零 API；pilot 路徑數通常 < 100，此為防護上限）。
+MAX_PATHS_FOR_SEMANTIC_CLUSTER = 128
+
+
+def _path_label_ngrams(path: list[dict]) -> set[str]:
+    """路徑所有標籤的字元 n-gram 聯集（T8：軟 Jaccard 用，捕捉形近標籤）。"""
+    out: set[str] = set()
+    for n in path:
+        if (
+            isinstance(n, dict)
+            and isinstance(n.get("label"), str)
+            and n["label"].strip()
+        ):
+            out |= _char_ngrams(n["label"])
+    return out
+
+
+def _path_role_profile(path: list[dict]) -> dict[str, float]:
+    """路徑內所有節點 ``roles``/``role`` 的 ROLES 計數（T8：DCA 文法親和）。"""
+    counts: dict[str, float] = {r: 0.0 for r in ROLES}
+    for n in path:
+        if not isinstance(n, dict):
+            continue
+        roles = _as_role_list(n.get("roles"))
+        single = n.get("role")
+        if single in ROLES:
+            roles = roles + [single]
+        for r in roles:
+            if r in ROLES:
+                counts[r] += 1.0
+    return counts
+
+
+def _path_axis_profile(path: list[dict]) -> dict[str, float]:
+    """路徑內軸 A/B 計數輪廓（T8：inherited/emergent × expression/substitution）。"""
+    prof: dict[str, float] = {
+        "inherited": 0.0, "emergent": 0.0,
+        "expression": 0.0, "substitution": 0.0,
+    }
+    for n in path:
+        if not isinstance(n, dict):
+            continue
+        a = n.get("axis_A")
+        if a in ("inherited", "emergent"):
+            prof[a] += 1.0
+        b = n.get("axis_B")
+        if b in ("expression", "substitution"):
+            prof[b] += 1.0
+    return prof
+
+
+def _cosine_sim(a: dict[str, float], b: dict[str, float]) -> float:
+    """兩個計數輪廓的餘弦相似度（0-1）；皆零向量 → 1.0（無資訊不懲罰）。"""
+    keys = set(a) | set(b)
+    dot = sum(a.get(k, 0.0) * b.get(k, 0.0) for k in keys)
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    if na == 0.0 and nb == 0.0:
+        return 1.0
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _semantic_path_similarity(path_a: list[dict], path_b: list[dict]) -> float:
+    """兩路徑的語義距離相似度（0-1，T8/F10）——混合三特徵：
+
+    ``w_label·softJaccard(字元 n-gram) + w_role·cos(角色輪廓) + w_axis·cos(兩軸輪廓)``。
+
+    🔴 設計取捨：**不依賴 CLADCorpus / clad-gene-pool.jsonl**——那些語料在 ECC 側
+    （feeds/sources_cache），spectrum-os 的零-API 機械層必須獨立可測；字元 n-gram +
+    角色向量 + 兩軸輪廓全從樹自身導出（世界無關）。且比純 Jaccard（集合重疊）更細：
+    形近標籤（「動員令凍結」vs「動員令解凍」）在集合層面零重疊，在 n-gram 層面高相似。
+    """
+    label_sim = _jaccard_sim(
+        _path_label_ngrams(path_a), _path_label_ngrams(path_b)
+    )
+    role_sim = _cosine_sim(_path_role_profile(path_a), _path_role_profile(path_b))
+    axis_sim = _cosine_sim(_path_axis_profile(path_a), _path_axis_profile(path_b))
+    return float(
+        np.clip(
+            _LABEL_SIM_W * label_sim + _ROLE_SIM_W * role_sim + _AXIS_SIM_W * axis_sim,
+            0.0,
+            1.0,
+        )
+    )
+
+
+def _average_linkage_sim(cluster_a: list[int], cluster_b: list[int], sim: np.ndarray) -> float:
+    """凝聚層次聚類的平均連結（平均成對相似度）。"""
+    pairs = [(i, j) for i in cluster_a for j in cluster_b]
+    return float(np.mean([sim[i, j] for i, j in pairs]))
+
+
+def _agglomerative_at_k(sim: np.ndarray, k: int) -> np.ndarray:
+    """凝聚層次聚類（平均連結），在 k 簇時切——回傳每樣本的簇標籤。
+
+    迭代合併平均相似度最高的兩簇，直到簇數 == k；平手時取最小索引對
+    （確定性）。k >= n 時回傳全單例標籤。
+    """
+    n = sim.shape[0]
+    if k >= n:
+        return np.arange(n, dtype=np.intp)
+    clusters: list[list[int]] = [[i] for i in range(n)]
+    while len(clusters) > k:
+        best_pair: tuple[int, int] | None = None
+        best_sim = -1.0
+        for ai in range(len(clusters)):
+            for bi in range(ai + 1, len(clusters)):
+                s = _average_linkage_sim(clusters[ai], clusters[bi], sim)
+                if s > best_sim:
+                    best_sim = s
+                    best_pair = (ai, bi)
+        assert best_pair is not None
+        ai, bi = best_pair
+        merged = clusters[ai] + clusters[bi]
+        clusters = [c for ci, c in enumerate(clusters) if ci not in (ai, bi)]
+        clusters.append(merged)
+    labels = np.zeros(n, dtype=np.intp)
+    for ci, members in enumerate(clusters):
+        for m in members:
+            labels[m] = ci
+    return labels
+
+
+def _silhouette_similarity(labels: np.ndarray, sim: np.ndarray) -> float:
+    """相似度矩陣上的平均 silhouette（-1..1，越高越好）。
+
+    對每個樣本：a = 同簇平均相似度、b = 最大異簇平均相似度；
+    s = (a-b)/max(a,b)；單例簇樣本不計（a 無定義）。
+    """
+    n = sim.shape[0]
+    scores: list[float] = []
+    for i in range(n):
+        ci = labels[i]
+        same = np.where(labels == ci)[0]
+        same = same[same != i]
+        if same.size == 0:
+            continue
+        a = float(np.mean(sim[i, same]))
+        others = np.where(labels != ci)[0]
+        if others.size == 0:
+            continue
+        b_vals: list[float] = []
+        for cj in np.unique(labels[others]):
+            members = others[labels[others] == cj]
+            b_vals.append(float(np.mean(sim[i, members])))
+        b = max(b_vals)
+        denom = max(a, b)
+        scores.append((a - b) / denom if denom > 0 else 0.0)
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
+
+def cluster_archetypes_semantic(
+    paths: list[list[dict]],
+    *,
+    n_min: int = 5,
+    n_max: int = 8,
+    similarity: Callable | None = None,
+) -> tuple[list[dict], dict]:
+    """世界原型——語義距離聚類（T8/F10，§12.6 / §12.10 #5）。
+
+    取代純 Jaccard 貪婪（``_cluster_archetypes``，pilot 僅 4 個原型）：
+    - **全相似度矩陣 + 平均連結凝聚**（非依序貪婪——後者依賴輸入順序、易收斂到
+      少數大簇）。
+    - **k 自動選取**：在 [n_min, n_max]（預設 5–8，§12.10 #5 目標）內取平均
+      silhouette 最高的 k；數據不足（路徑數 < n_min、或無法形成非單例簇）時
+      **誠實回退**——不以假分割硬湊 5–8。
+    - 特徵全從樹自身導出（字元 n-gram / 角色輪廓 / 兩軸輪廓，零 API、世界無關）。
+
+    Returns:
+        ``(archetypes, meta)``——archetypes 與 ``_cluster_archetypes`` 同構
+        （外加 ``mean_sim``，代表路徑 = 簇內平均相似度最高者）；meta 記錄
+        k / silhouette / 權重 / 路徑數 / 是否回退。
+    """
+    if not paths:
+        return (
+            [],
+            {"k": 0, "n_paths": 0, "silhouette": None, "method": "semantic_hybrid"},
+        )
+    n = len(paths)
+    if n > MAX_PATHS_FOR_SEMANTIC_CLUSTER:
+        # O(n²) 凝聚 + silhouette 成本過高 → 退 Jaccard 基底（仍機械、零 API）。
+        base = _cluster_archetypes(paths)
+        return base, {
+            "k": len(base),
+            "n_paths": n,
+            "silhouette": None,
+            "method": "jaccard_fallback",
+            "note": f"n_paths={n} 超過上限 {MAX_PATHS_FOR_SEMANTIC_CLUSTER}，退 Jaccard 基底",
+        }
+
+    sim_fn = similarity if similarity is not None else _semantic_path_similarity
+    sim = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = float(sim_fn(paths[i], paths[j]))
+            sim[i, j] = sim[j, i] = float(np.clip(s, 0.0, 1.0))
+        sim[i, i] = 1.0
+
+    lo = min(n_min, n)
+    hi = min(n_max, n)
+    best_k: int | None = None
+    best_sil = -2.0
+    for k in range(lo, hi + 1):
+        if k == n:
+            continue  # 全單例——silhouette 無定義
+        labels = _agglomerative_at_k(sim, k)
+        if np.max(np.bincount(labels, minlength=n)) < 2:
+            continue  # 無非單例簇——silhouette 無意義
+        sil = _silhouette_similarity(labels, sim)
+        if sil > best_sil:
+            best_sil = sil
+            best_k = k
+    if best_k is None:
+        # 誠實回退：k = min(n_max, n)，不硬湊 5–8。
+        best_k = min(n_max, n)
+        labels = _agglomerative_at_k(sim, best_k)
+        best_sil = None
+        fell_back = True
+    else:
+        labels = _agglomerative_at_k(sim, best_k)
+        fell_back = False
+
+    archetypes: list[dict] = []
+    for ci in range(best_k):
+        members = np.where(labels == ci)[0]
+        cids = [int(m) for m in members]
+        if len(cids) > 1:
+            rep = min(
+                cids,
+                key=lambda i: -float(np.mean([sim[i, j] for j in cids if j != i])),
+            )
+            mean_sim = float(
+                np.mean([sim[i, j] for i in cids for j in cids if j > i])
+            )
+        else:
+            rep = cids[0]
+            mean_sim = 1.0
+        label_set = sorted(
+            {
+                p["label"].strip()
+                for m in cids
+                for p in paths[m]
+                if isinstance(p, dict)
+                and isinstance(p.get("label"), str)
+                and p["label"].strip()
+            }
+        )
+        archetypes.append(
+            {
+                "archetype_id": ci,
+                "labels": label_set,
+                "member_path_ids": cids,
+                "n_members": len(cids),
+                "representative_path_id": rep,
+                "mean_sim": round(mean_sim, 4),
+                "method": "semantic_hybrid",
+                "note": (
+                    "語義距離聚類（字元 n-gram + 角色輪廓 + 兩軸輪廓；"
+                    "平均連結 + silhouette k 選取）；非 kernel/cluster.run（F10）"
+                ),
+            }
+        )
+
+    meta = {
+        "k": best_k,
+        "n_paths": n,
+        "silhouette": round(best_sil, 4) if best_sil is not None else None,
+        "method": "semantic_hybrid",
+        "weights": {
+            "label_ngram": _LABEL_SIM_W,
+            "role": _ROLE_SIM_W,
+            "axis": _AXIS_SIM_W,
+        },
+        "k_range": [lo, hi],
+        "fell_back": fell_back,
+    }
+    return archetypes, meta
 
 
 def _local_minima(values: list[float]) -> list[int]:
@@ -1756,7 +2079,8 @@ def probe_tree(
     prevalence = _aggregate_prevalence(trees)
     rigidity_map = _aggregate_rigidity_map(trees, prevalence)
     all_paths = [p for t in trees for p in t["paths"]]
-    archetypes = _cluster_archetypes(all_paths)
+    # T8（F10）：世界原型——語義距離聚類（取代純 Jaccard 貪婪 `_cluster_archetypes`）。
+    archetypes, archetype_meta = cluster_archetypes_semantic(all_paths)
     gate_nodes = _find_gate_nodes(rigidity_map, constraint_field)
     rejected = [r for t in trees for r in t["rejected"]]
 
@@ -1765,6 +2089,7 @@ def probe_tree(
         "prevalence": prevalence,
         "rigidity_map": rigidity_map,
         "archetypes": archetypes,
+        "archetype_meta": archetype_meta,
         "gate_nodes": gate_nodes,
         "rejected": rejected,
         "meta": {
@@ -1793,8 +2118,112 @@ def probe_tree(
 
 
 # ---------------------------------------------------------------------------
-# Phase E：人機交錯收束——probe_select
+# Phase E：人機交錯收束——收束視圖 + probe_select
 # ---------------------------------------------------------------------------
+
+def convergence_view(result: dict) -> dict:
+    """收束視圖（§12.7）——**可程式化輸出的資料結構**，供人/介面消費。
+
+    三區段（§12.7 (a)(b)(c)）+ 選擇狀態：
+    - ``rigidity_distribution``：約束剛性分佈（逐層 rigidity + 信賴帶，不切 hard/soft）。
+    - ``archetype_cards``：世界原型卡片（標籤集 + 代表路徑標籤序列）。
+    - ``gate_node_cards``：門節點卡片（三條件命中 + 該層分叉清單）。
+    - ``selection``：``probe_select`` 後的坍縮狀態（未選分支標 unselected，不刪除）。
+
+    全部從 ``probe_tree`` 產物機械重組——零 API、零 LLM。**人只在此視圖上決定**
+    「這算必然還是有選擇」（§12.1 / §12.7：必然性由人詮釋，不由機器標）。
+    """
+    trees = result.get("trees") or []
+    rigidity = [
+        {
+            "layer": e["layer"],
+            "date_ref": e.get("date_ref"),
+            "rigidity_prevalence": e["rigidity_prevalence"],
+            "confidence_band": e["confidence_band"],
+            "tags": e.get("tags", []),
+        }
+        for e in result.get("rigidity_map", [])
+    ]
+
+    # 代表路徑：archetype 的 member_path_ids 指向 all_paths（跨樹平鋪索引）。
+    all_paths = [p for t in trees for p in (t.get("paths") or [])]
+    archetype_cards: list[dict] = []
+    for a in result.get("archetypes", []):
+        rep_id = a.get("representative_path_id")
+        rep_path: list[str] = []
+        if isinstance(rep_id, int) and 0 <= rep_id < len(all_paths):
+            rep_path = [
+                n.get("label")
+                for n in all_paths[rep_id]
+                if isinstance(n, dict) and isinstance(n.get("label"), str)
+            ]
+        archetype_cards.append(
+            {
+                "archetype_id": a.get("archetype_id"),
+                "labels": a.get("labels", []),
+                "n_members": a.get("n_members"),
+                "representative_path": rep_path,
+                "method": a.get("method"),
+            }
+        )
+
+    # 門節點卡片 + 該層分叉清單（跨樹去重）。
+    def _layer_branch_labels(layer: int) -> list[str]:
+        seen: list[str] = []
+        for t in trees:
+            for le in t.get("layers", []):
+                if le.get("layer") != layer:
+                    continue
+                for b in le.get("branches", []):
+                    lb = b.get("label")
+                    if lb and lb not in seen:
+                        seen.append(lb)
+        return seen
+
+    gate_cards: list[dict] = []
+    for g in result.get("gate_nodes", []):
+        gate_cards.append(
+            {
+                "layer": g["layer"],
+                "date_ref": g.get("date_ref"),
+                "rigidity_prevalence": g["rigidity_prevalence"],
+                "conditions": g.get("conditions", []),
+                "saturation_heuristic": g.get("saturation_heuristic"),
+                "branch_labels": _layer_branch_labels(g["layer"]),
+            }
+        )
+
+    if "collapse" not in result:
+        selection: dict = {
+            "selected": None,
+            "layer": None,
+            "unselected": [],
+            "verdict": None,
+            "re_calibrate": None,
+        }
+    else:
+        entry = result.get("state_log_entry") or {}
+        selection = {
+            "selected": result["collapse"].get("selected"),
+            "layer": result["collapse"].get("layer"),
+            "unselected": result["collapse"].get("unselected", []),
+            "verdict": entry.get("verdict"),
+            "re_calibrate": entry.get("re_calibrate"),
+        }
+
+    return {
+        "sections": [
+            "rigidity_distribution",
+            "archetype_cards",
+            "gate_node_cards",
+            "selection",
+        ],
+        "rigidity_distribution": rigidity,
+        "archetype_cards": archetype_cards,
+        "gate_node_cards": gate_cards,
+        "selection": selection,
+    }
+
 
 def _find_node(tree: dict, label: str, layer: int | None = None) -> dict | None:
     """在樹中尋找 label（可限 layer）的節點。"""
@@ -1910,12 +2339,13 @@ def probe_select(
         entry[k] = v
 
     # F8：收束才落盤——路徑優先顯式參數，否則退 meta（probe_tree 存入）。
+    # 原子性：先 init_log（啟動檔案模式）再把 entry 入記憶體緩衝——否則 init_log 的
+    # memory→file 過渡 flush 會把「本筆」重複寫入（每次收束恰一筆 JSONL 行）。
     path = state_log_path or result.get("meta", {}).get("state_log_path")
-    _verify._state_log.append(entry)
     if path is not None:
         _verify.init_log(path)
-        _verify._append_jsonl(_verify._log_path, entry)
-    elif _verify._log_path is not None:
+    _verify._state_log.append(entry)
+    if _verify._log_path is not None:
         _verify._append_jsonl(_verify._log_path, entry)
 
     result["state_log_entry"] = entry
@@ -1930,6 +2360,8 @@ __all__ = [
     "TreeProbeError",
     "assert_tree_gate_contract",
     "standing_wave_per_layer",
+    "cluster_archetypes_semantic",
+    "convergence_view",
     "probe_tree",
     "probe_select",
     "_prevalence_band",

@@ -26,12 +26,15 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
 from spectrum_os.kernel import verify as _verify
 from spectrum_os.quantum.dca_grammar import validate_alternative
+from spectrum_os.quantum.markov import count_transitions
+from spectrum_os.quantum.multigraph import ROLES
 from spectrum_os.quantum.quarantine import mechanical_filter
 from spectrum_os.synth.anchors import (
     _FORBIDDEN_SERIES_KEYS,
@@ -782,6 +785,165 @@ def validate_accident(acc: dict, index: int) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Mode A → Mode B 依賴（PLAN-23 §12.13）
+# ---------------------------------------------------------------------------
+
+#: 主導轉移判定的最低速率（> 此值才進 dominant_transitions 摘要）。
+MODE_A_DOMINANT_TRANSITION_MIN = 0.05
+
+
+def record_mode_a_history(path: str | os.PathLike, entry: dict) -> None:
+    """記錄一筆 Mode A 歷史（§12.13 ①，純機械部分）。
+
+    Mode A = Markov 推演 + 頻譜累積——「過去的頻譜 = 發展歷史」。本函式 append
+    一筆 entry 到 JSONL（open/append/close 單行，仿 ``_verify._append_jsonl``）——
+    純資料累積、零 LLM。建議欄位：
+    ``{"ts", "mode": "markov"|"spectrum"|"llm_annotation", "role_sequence": [...],
+    "rate_matrix": {...}, "labels": [...], "spectrum": {...}, "source": str}``。
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_mode_a_history(path: str | os.PathLike | None) -> list[dict]:
+    """讀取 Mode A 歷史（§12.13 ①）——JSONL，跳過損壞行；檔案不存在回 []。"""
+    if path is None:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    out: list[dict] = []
+    with open(p, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+    return out
+
+
+def _as_4x4(rate_matrix: Any):
+    """規範 rate_matrix 為 4x4 numpy；形狀非法回 None（世界無關 fallback）。"""
+    if isinstance(rate_matrix, dict):
+        rate_matrix = rate_matrix.get("matrix", rate_matrix)
+    try:
+        m = np.asarray(rate_matrix, dtype=np.float64)
+    except Exception:
+        return None
+    if m.shape != (len(ROLES), len(ROLES)):
+        return None
+    return m
+
+
+def _dominant_transitions(
+    rate_matrix: Any, *, min_rate: float = MODE_A_DOMINANT_TRANSITION_MIN
+) -> list[dict]:
+    """從速率矩陣抽主導轉移（> min_rate 的非零格），依強度降冪。
+
+    純機械（§12.13 ② 後驗初始化的一部分）——「過去頻譜代表的發展歷史」的
+    Markov 側摘要。無 rate_matrix → []。
+    """
+    m = _as_4x4(rate_matrix)
+    if m is None:
+        return []
+    out: list[dict] = []
+    for i in range(len(ROLES)):
+        for j in range(len(ROLES)):
+            v = float(m[i, j])
+            if v > min_rate:
+                out.append({"from": ROLES[i], "to": ROLES[j], "rate": round(v, 4)})
+    out.sort(key=lambda d: d["rate"], reverse=True)
+    return out
+
+
+def _accumulated_labels(history: list[dict]) -> list[str]:
+    """歷史中累積的標籤（去重、保序）——spectrum/ensemble 側摘要。"""
+    seen: list[str] = []
+    for entry in history:
+        for lab in entry.get("labels", []) or []:
+            if isinstance(lab, str) and lab.strip() and lab not in seen:
+                seen.append(lab.strip())
+    return seen
+
+
+def mode_a_posterior_init(mode_a_history: list[dict]) -> dict:
+    """Mode B 後驗初始化（§12.13 ②，純機械部分）。
+
+    從 Mode A 歷史萃取「過去的頻譜 = 發展歷史」的機械摘要，作為枚舉前初始化：
+    - ``n_entries``：歷史筆數。
+    - ``rate_matrix`` / ``dominant_transitions``：Markov 側（最後一筆有效速率矩陣
+      + 主導轉移）。
+    - ``role_statistics``：歷史角色序列的轉移計數（``count_transitions``）。
+    - ``accumulated_labels``：累積標籤（spectrum/ensemble 側）。
+    - ``spectrum_snapshot``：最後一筆 spectrum 摘要（若有）。
+    - ``annotation``：機械註記——LLM 結構語義標註待 prompt（PROMPT-DEPENDENT），
+      見 ``_annotate_structural_semantics``。
+
+    零 LLM、零 API。Mode B 枚舉前以本摘要為初始化，不再空手起跳（§12.13）。
+    """
+    if not mode_a_history:
+        return {"n_entries": 0, "source": "mode_a_history", "annotation": "no_history"}
+
+    last_rates: Any = None
+    last_spectrum: Any = None
+    role_sequences: list[list[str]] = []
+    for entry in mode_a_history:
+        if "rate_matrix" in entry:
+            last_rates = entry["rate_matrix"]
+        if "spectrum" in entry:
+            last_spectrum = entry["spectrum"]
+        seq = entry.get("role_sequence")
+        if isinstance(seq, list) and seq and all(isinstance(r, str) for r in seq):
+            role_sequences.append(seq)
+
+    counts, anomalies = (
+        count_transitions(role_sequences) if role_sequences else (None, [])
+    )
+    m = _as_4x4(last_rates)
+    rate_summary: dict | None = None
+    if m is not None:
+        rate_summary = {
+            "matrix": [[float(v) for v in row] for row in m.tolist()],
+            "dominant_transitions": _dominant_transitions(m),
+        }
+
+    return {
+        "n_entries": len(mode_a_history),
+        "source": "mode_a_history",
+        "rate_matrix": rate_summary,
+        "role_statistics": {
+            "n_sequences": len(role_sequences),
+            "transition_counts": counts.tolist() if counts is not None else None,
+            "anomalies": anomalies,
+        },
+        "accumulated_labels": _accumulated_labels(mode_a_history),
+        "spectrum_snapshot": last_spectrum,
+        "annotation": (
+            "mechanical posterior init（§12.13 ② 純機械）；"
+            "LLM 結構語義標註待 prompt 設計（PROMPT-DEPENDENT，"
+            "見 _annotate_structural_semantics）"
+        ),
+    }
+
+
+def _annotate_structural_semantics(posterior: dict) -> dict:
+    """LLM 標註結構語義（§12.13 ①）——🔴 **PROMPT-DEPENDENT**。
+
+    需要人類/主 agent 設計「結構語義標註」prompt（把 Mode A 的頻譜摘要轉成
+    結構語義註記）才能實作。目前回傳機械 posterior 不變——Mode B 仍可機械
+    初始化；語義標註待 prompt 定稿後於此接上。**本輪禁止自行改 prompt。**
+    """
+    return posterior
+
+
 def alt_gate_enumerate(
     input_data: dict,
     *,
@@ -790,6 +952,8 @@ def alt_gate_enumerate(
     model: str = "deepseek-v4-flash",
     temperature: float = 0.7,
     max_tokens: int = 4096,
+    mode_a_history: list[dict] | None = None,
+    mode_a_log_path: str | None = None,
     **_kwargs: Any,
 ) -> dict:
     """Version B: Historical Accident Enumeration Gate ([task:enumerate]).
@@ -799,6 +963,14 @@ def alt_gate_enumerate(
     (criticality / residual). Output schema:
         {"accidents": [{"pattern", "instances", "domain", "source", "usage",
                         "grounding", "world_development"}]}
+
+    §12.13（Mode A → Mode B 依賴）：Mode B **不再空手起跳**——先展開 Mode A
+    （Markov 推演 + 頻譜累積 → 發展歷史），枚舉前以 Mode A 成果為**後驗初始化**：
+    - ``mode_a_history``：Mode A 歷史條目清單（直接傳入）。
+    - ``mode_a_log_path``：或指定 JSONL 路徑（``record_mode_a_history`` 寫入）。
+    初始化摘要以資料欄位 ``input_data["mode_a_history"]`` 注入 payload（**資料層**，
+    不改任何 prompt 措辭）；LLM 結構語義標註見 ``_annotate_structural_semantics``
+    （PROMPT-DEPENDENT，本輪凍結）。回傳含 ``mode_a_posterior`` 供追溯。
 
     Note:
         Not suitable as a ``gate_fn`` for ``run_ensemble``: this gate returns
@@ -812,9 +984,19 @@ def alt_gate_enumerate(
     if not api_key:
         raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
 
+    # §12.13：Mode B 後驗初始化（純機械）——注入 payload 資料層，不動 prompt 字串。
+    payload = dict(input_data)
+    posterior: dict | None = None
+    history = mode_a_history
+    if history is None and mode_a_log_path is not None:
+        history = load_mode_a_history(mode_a_log_path)
+    if history:
+        posterior = _annotate_structural_semantics(mode_a_posterior_init(history))
+        payload["mode_a_history"] = posterior
+
     sys_prompt = VERSION_B_SYSTEM_PROMPT
     user_prompt = (
-        f"{_build_alt_gate_prompt(input_data)}\n"
+        f"{_build_alt_gate_prompt(payload)}\n"
         "[task:enumerate] 窮盡列舉此刻可能發生的意外。輸出 JSON："
         '{"accidents": [{"pattern": "爆發模式", "instances": ["特定實例1", "特定實例2"], '
         '"domain": "政治|經濟|社會|軍事|自然", "source": "inherited|emergent", '
@@ -872,6 +1054,7 @@ def alt_gate_enumerate(
             raise AltGateContractError(str(e)) from e
     return {
         "accidents": accidents,
+        "mode_a_posterior": posterior,  # §12.13：Mode B 後驗初始化（無 Mode A 時 None）
         "generated_by": {
             "gate": "alt_gate_enumerate",
             "model": model,
