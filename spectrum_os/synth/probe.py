@@ -14,7 +14,8 @@ PLAN-23 §十二（v1.2）實作。決策樹探針 = §11.3 的操作化：
 設計與 §12.2 / 12.3 / 12.5 / 12.6 / 12.7 對齊：
 
 - **Phase A 逐層生成**：第 k 層 call ``gate_fn``（``[task:tree_generate]``）→ 產出本層
-  ≤ ``n_branch`` 分支；第 k 層接收處境 + 約束場 + 第 k−1 層已過檢查的分支作為反射對象
+  分支（數目提示性——由張力幾何決定；機械層僅在超過 ``MAX_BRANCHES_SAFETY_CAP`` 時拒收）；
+  第 k 層接收處境 + 約束場 + 第 k−1 層已過檢查的分支作為反射對象
   （reflex of reflex = 層間迭代）。輸出：樹狀結構（root + branches + conditions）。
 - **Phase B 機械測量/檢查**：§12.4 五項（整樹剛性統計 / quarantine / 回聲 / 兩軸值 / 樹結構）。
   被拒節點 → ``rejected`` 清單（人機收束檢視，不靜默丟棄）。
@@ -30,6 +31,10 @@ PLAN-23 §十二（v1.2）實作。決策樹探針 = §11.3 的操作化：
 - **Phase E 收束回寫**：``probe_select``——人選定分支 → 樹坍縮；未選分支標 ``unselected``
   （寫回 α₂ 空間，不刪除）；state_log 記錄（仿 ``_write_alt_gate_state_log``，
   ``gate_type: "probe_tree"`` + ``re_calibrate``，§12.7 F6）。
+- **T18 手動逐層**：``probe_tree_manual``（``on_layer`` 回呼 = 人機收束接縫）+ ``probe_expand_layer``
+  （單層原語）+ ``_generate_one_tree_iter``（暫停的生成器）——``reflect_on`` 由「全部 passed」
+  改為「[人選的那條]」，打破 1:1 續鏈（樹寬 1.3636 根因）。自動路徑（``probe_tree``）與
+  手動路徑共用 ``_generate_layer_once`` / ``_finalize_tree`` / ``_assemble_probe_result``。
 
 成本：≤ ``n_sample × depth`` calls（Phase A 每層 1 call，§12.8 錨定——不隨節點數漂移，
 故**無重試**：單層契約失敗即拋錯）。
@@ -258,9 +263,17 @@ _ALLOWED_BRANCH_KEYS: frozenset[str] = frozenset(
     }
 )
 
-#: 單樹路徑數上界（路徑爆炸防護，F5）——n_branch≤8、depth≤4 → 最壞 8^4=4096 葉。
-#: 超過即截斷並記 meta ``truncated: true``（不無限遞迴）。
+#: 單樹路徑數上界（路徑爆炸防護，F5）——depth≤4、每層最多安全網 20 分支時理論葉數可達
+#: 20^4=160000，但真正的爆炸防護是下方截斷（超過即截斷並記 meta ``truncated: true``，
+#: 不無限遞迴）。
 MAX_PATHS_PER_TREE = 4096
+
+#: 單層分支數機械安全網（2026-08-03 提示性解耦）：n_branch 現為**提示性參考**
+#: （prompt 已改為「幾根柱就幾條路」，不再要求「≤ N_branch」）——本常數是**獨立**的
+#: 荒謬輸出濾網：一層超過 20 分支幾乎必然是壞輸出（JSON 黏連/重複/跑飛），對其 raise；
+#: 真正路徑爆炸防護是 MAX_PATHS_PER_TREE 截斷 + max_tokens 封頂。固定值與提示**解耦**
+#: （不隨 n_branch 縮放）——「超過提示值」不再拒，只有「超過安全網」才拒。
+MAX_BRANCHES_SAFETY_CAP = 20
 
 #: 整樹剛性 blend 權重：rigidity = w*LLM 均值 + (1-w)*機械離散補數（§12.4 #1）。
 _RIGIDITY_BLEND_W = 0.5
@@ -616,11 +629,12 @@ def assert_tree_gate_contract(
     拉丁/西里爾放寬字符 + 詞數上限。無語碼 → 舊行為（label ≤ 20 字符、grounding
     ≤ 80 字符；conditions 舊行為無長度檢查，維持不啟用）。
 
-    **語義中介取代黑名單（決策 1/2/4）**：``PROMPT_EXAMPLE_LABELS`` 與
-    ``AXIS_ECHO_PREFIXES`` 命中**不再 raise**——改為 append 到 ``echo_notes``
-    （可選參數，None 時靜默略過，向後相容）。範例只是形狀（決策 4）、軸名詞鏡射
-    是馬可夫連續轉移的一步（決策 2）——皆由人機收束（``convergence_view``）檢視。
-    **situation echo 仍 fatal**——那是語義判準（以處境為參照，不是黑名單）。
+    **語義中介取代黑名單（決策 1/2/4，2026-08-03 全面撤銷 echo 攔截）**：
+    ``PROMPT_EXAMPLE_LABELS``、``AXIS_ECHO_PREFIXES``、situation echo、層間 echo
+    （含承義欄位全同的「候選原地踏步」）**一律不再 raise / reject**——改為 append
+    到 ``echo_notes``（可選參數，None 時靜默略過，向後相容）。A/B 實測證明
+    同相深化（同 action 同 binding 的進一步發展）會被誤判為原地踏步而整層全拒。
+    語義判定完全交給人機收束（``convergence_view``）。
     """
     if not isinstance(output_data, dict):
         raise TreeProbeError(f"output must be dict, got {type(output_data).__name__}")
@@ -719,18 +733,20 @@ def assert_tree_gate_contract(
             if echo_notes is not None:
                 echo_notes.append(
                     f"example echo: branch[{i}].label 重複 prompt 範例標籤 '{label}'"
-                    f"（降權，非致命——範例只是形狀）"
+                    f"（非致命——範例只是形狀，人機收束檢視）"
                 )
         if label.startswith(AXIS_ECHO_PREFIXES):
             if echo_notes is not None:
                 echo_notes.append(
                     f"axis echo: branch[{i}].label '{label}' 以兩軸名詞為字首"
-                    f"（F3：鏡射 prompt 教的軸詞彙——繼承的/湧現的/替代；降權，非致命）"
+                    f"（F3：鏡射 prompt 教的軸詞彙——繼承的/湧現的/替代；非致命，人機收束檢視）"
                 )
         if situation_set is not None and label in situation_set:
-            raise TreeProbeError(
-                f"situation echo: branch[{i}].label '{label}' 重複處境標籤"
-            )
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"situation echo: branch[{i}].label '{label}' 重複處境標籤"
+                    f"（非致命——以處境為參照的合法延續可能是同相干涉，人機收束檢視）"
+                )
         if label in seen_labels:
             raise TreeProbeError(
                 f"duplicate label within layer: branch[{i}].label '{label}' 重複（破壞 parent 匹配/路徑語義）"
@@ -999,16 +1015,14 @@ def _layer_rigidity_components(
 # ---------------------------------------------------------------------------
 
 def _same_denotation(child: dict, parent: dict) -> bool:
-    """層間 echo 判定的承義比較：label 相同的候選與父分支，承義欄位是否全同。
+    """層間 echo 記錄用的承義比較：label 相同的候選與父分支，承義欄位是否全同。
 
-    T16 語義中介：承義欄位（binding/perspective/grounding）＋邊條件（conditions）
-    是「義」，label 只是「形」。``_branch_ref`` 特意傳承義欄位給下一層——反射者
-    只要任一承義欄位開出新意（即使 label 沿用父短語），就是真轉移（開出新路），
-    不是 echo。只有**全部承義欄位與父完全相同**（含兩者皆缺承義欄位）＝純形複製
-    ＝馬可夫原地踏步（轉移矩陣退回恆等）。
+    2026-08-03 起**不再用於攔截**（echo 全面撤銷攔截，見 ``_mechanical_check_layer``）——
+    只用來在 echo_notes 中標記「候選原地踏步」（承義欄位全同）供人機收束檢視。
 
-    機械層只比字串相等，不判語義真偽（F7 原則）——「換句話說但無實質新內容」
-    屬邊界案例，由人機收束（convergence_view）覆核，不在此攔。
+    承義欄位（binding/perspective/grounding）＋邊條件（conditions）是「義」，
+    label 只是「形」。全同＝可能是同相深化（合法干涉）或真複製（原地踏步）——
+    機械層不判，交人機收束。
     """
     for field in ("binding", "perspective", "grounding"):
         child_val = (child.get(field) or "").strip()
@@ -1030,6 +1044,13 @@ def _mechanical_check_layer(
     echo_notes: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """對一層分支做逐節點機械檢查：quarantine L1 / 回聲 / 空殼 / 兩軸 substitution 降權。
+
+    **echo 全面撤銷攔截（2026-08-03）**：example echo / axis echo / situation echo /
+    層間 echo（含承義欄位全同的「候選原地踏步」）一律不再 rejected / raise——全部
+    降為 ``echo_notes`` 記錄，語義判定完全交給人機收束（convergence_view）。
+    A/B 實測（``scripts/ab_prompt_test.py``）證明層間 echo 攔截誤殺「同相深化」
+    （同 action 同 binding 的進一步發展）→ 整層全拒 → 樹崩潰。同相的繼續壓是
+    合法干涉，機械層不假設自己能判「原地踏步」。
 
     **語碼合規（決策 3）**：``code`` 給定時，label 書寫系統不合語碼
     （``assert_code_compliance`` 為 False）→ rejected 清單（非致命）。mixed 寬鬆——
@@ -1073,28 +1094,41 @@ def _mechanical_check_layer(
                 break
 
         if label in PROMPT_EXAMPLE_LABELS:
-            reasons.append("echo: label 重複 prompt 範例標籤（降權，非致命）")
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"example echo: label 重複 prompt 範例標籤 '{label}'"
+                    f"（非致命——範例只是形狀，人機收束檢視）"
+                )
         if label.startswith(AXIS_ECHO_PREFIXES):
-            reasons.append("echo: label 以兩軸名詞為字首（F3：繼承的/湧現的/替代鏡射；降權，非致命）")
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"axis echo: label '{label}' 以兩軸名詞為字首"
+                    f"（F3：鏡射 prompt 教的軸詞彙——繼承的/湧現的/替代；非致命，人機收束檢視）"
+                )
         if label in situation_set:
-            reasons.append("echo: label 重複處境標籤")
-        # T16 語義中介：層間 echo 攔截（2026-08-02）——LLM 重複上一層 label。
-        # 🔴 判定精化：只有「label 相同 **且** 承義欄位（binding/perspective/
-        # grounding/conditions）全同/缺失」才算真原地踏步（轉移矩陣退回恆等＝自我
-        # 複製）→ 拒。label 相同但承義欄位有新意＝「反射後開出新路」的合法結構延續
-        # （假 echo）→ 放行，記入 echo_notes 供人機收束檢視（PLAN-23 §12.4：
-        # echo 降權非致命——語義判定由收束完成）。實證：純 label 精確匹配下
-        # 78-81% 的層間拒收是假 echo 誤殺（導致 L3 塌成單鏈）。
+            if echo_notes is not None:
+                echo_notes.append(
+                    f"situation echo: label '{label}' 重複處境標籤"
+                    f"（非致命——以處境為參照的合法延續可能是同相干涉，人機收束檢視）"
+                )
+        # 層間 echo：2026-08-03 徹底撤掉攔截——label 重複上一層（含承義欄位全同）
+        # 不再拒收。A/B 實測（ab_prompt_test）證明：同相深化（同 action 同 binding 的
+        # 進一步發展）會被誤判為「真原地踏步」而全拒（B 版 2/4 崩潰於 layer 2 全拒）。
+        # 同相的繼續壓是合法干涉，不是自我複製。一律降為 echo_notes 記錄，語義判定
+        # 完全交給人機收束（convergence_view）——機械層不再假設自己能判「原地踏步」。
         if parent_branches:
             parent_by_label = {
                 str(p.get("label", "")).strip(): p
                 for p in parent_branches if isinstance(p, dict)
             }
             parent = parent_by_label.get(label)
-            if parent is not None:
+            if parent is not None and echo_notes is not None:
                 if _same_denotation(b, parent):
-                    reasons.append("echo: label 與承義欄位皆重複上一層（真原地踏步——轉移矩陣退回恆等）")
-                elif echo_notes is not None:
+                    echo_notes.append(
+                        f"層間 label 延續（候選原地踏步，放行）：'{label}' 承義欄位與"
+                        f"上一層全同——可能是同相深化或真複製，由人機收束判定"
+                    )
+                else:
                     echo_notes.append(
                         f"層間 label 延續（非 echo，放行）：'{label}' 承義欄位開出新路"
                         f"（binding={b.get('binding')!r} perspective={b.get('perspective')!r}）"
@@ -1408,11 +1442,20 @@ def _build_layer_payload(
     🔴 邊界必須在 payload 裡（S4 教訓）：處境與約束場全放 user payload，
     LLM 不得自行「想起」約束。``w`` 只在此生成期 prompt 內作用（約束強度），
     不作機械閾值（§12.5 刪 ε(w)）。
+
+    2026-08-03：``n_branch`` 為**提示性參考**（非硬上限）——prompt 已改為
+    「幾根柱就幾條路」，實際分支數由張力幾何決定；機械層僅在超過
+    ``MAX_BRANCHES_SAFETY_CAP`` 時拒收。payload 以 ``n_branch_hint: true``
+    標記此語義（供下游/人類辨識）。
     """
     payload: dict[str, Any] = {
         "task": "tree_generate",
         "layer": layer,
+        # 2026-08-03：n_branch 只是**提示性參考**（prompt 已不再要求「≤ N_branch」，
+        # 改為「幾根柱就幾條路」），不是硬上限——機械安全網是 MAX_BRANCHES_SAFETY_CAP。
+        # 標記供下游/人類辨識這是提示而非約束。
         "n_branch": n_branch,
+        "n_branch_hint": True,
         "w": w,  # CFG 場強（生成期 only）
         "situation": situation,
     }
@@ -1437,6 +1480,12 @@ def _resolve_parent(branch: dict, prev_passed: list[dict]) -> dict | None:
     """解析分支的父節點：優先 ``parent`` 欄位比對；缺省 → 主線（LLM 剛性最高者）。
 
     ``parent`` 指向已拒節點（不在 prev_passed）時退主線。回 None 表示父 = root（第 1 層）。
+
+    2026-08-04：**樹寬 1.3636 根因修正後的 docstring**——1.3636 唯一對應「完美 1:1
+    平行鏈」（11 個父各恰 1 子），這需要 LLM 恆給互不重複的合法 parent label；
+    主線 fallback 只會產生星形 avg=5.0，**不是** 1.3636 的來源（舊註解「大量省略
+    parent→掛主線→1.36」為誤診）。prompt 已撤回「必須標明 parent」強制句，改為
+    「parent 可選、新路可為場的獨立坍縮」——缺省掛主線保留為兜底安全網。
     """
     parent_label = branch.get("parent")
     if parent_label is not None:
@@ -1461,6 +1510,173 @@ def _root_label(situation: Any) -> str:
     return "處境"
 
 
+def _generate_layer_once(
+    situation: Any,
+    constraint_field: Any,
+    reflect_on: list[dict],
+    *,
+    k: int,
+    depth: int,
+    n_branch: int,
+    w: float,
+    gate_fn: Callable,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    code: str | None,
+    system_message: str | None,
+    situation_labels: list[str] | None,
+    rate_matrix: Any,
+    situation_vector: dict | None,
+    root: dict,
+    echo_notes: list[str],
+    timeout: int,
+) -> tuple[list[dict], dict, list[dict], int]:
+    """生成單層（Phase A/B 單層原語，T18 拆解）——payload 組裝 → gate 呼叫 → 解析 →
+    機械檢查 → 結構契約 → 建樹。第 k 層。
+
+    ``reflect_on`` 由外部注入：自動模式 = 上一層 passed（全量回饋）；手動模式 =
+    **[人選的那條]**（T18——打破 1:1 續鏈：一個父可展開 3-4 個子）。
+
+    回傳 ``(passed, layer_entry, layer_rejected, calls)``——``layer_entry["branches"]``
+    即 ``passed``（同一批 dict 物件）；建樹副作用寫入 ``root`` / ``echo_notes``
+    （可變容器，呼叫者持有）。
+    """
+    payload = _build_layer_payload(
+        situation, constraint_field, reflect_on,
+        layer=k, n_branch=n_branch, w=w,
+    )
+    user_prompt = f"{json.dumps(payload, ensure_ascii=False)}\n[task:tree_generate]"
+    raw = gate_fn(
+        user_prompt,
+        api_key,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        system_message=(
+            TREE_GENERATE_SYSTEM_PROMPT if system_message is None else system_message
+        ),
+        response_format={"type": "json_object"},
+        thinking=False,
+        timeout=timeout,
+    )
+
+    parsed = _parse_tree_json(raw)
+    # F6：路由洩漏/結構失配只在 check_routing_leak_or_schema 一處處理（內部已含
+    # ROUTING_LEAK_KEYWORDS 掃描 + 任務 schema 檢查）——不重複手動迴圈。
+    # 注意：洩漏且無法解析的回應會在解析階段先以「無法解析」拒絕（仍是 TreeProbeError）。
+    leak_err = check_routing_leak_or_schema(raw, parsed, "tree_generate")
+    if leak_err:
+        raise TreeProbeError(leak_err)
+
+    # Phase B：先逐節點機械檢查（quarantine/回聲/空殼/兩軸降權 + W1 rate_zero）→
+    # passed / rejected。rate_matrix 為「具體限制」可選輸入——缺席時零強度不檢查。
+    passed, layer_rejected = _mechanical_check_layer(
+        parsed, situation_labels,
+        parent_branches=reflect_on, rate_matrix=rate_matrix,
+        code=code, echo_notes=echo_notes,
+    )
+    for b in layer_rejected:
+        b["layer"] = k
+
+    # 結構性契約：只對「存活分支」驗結構（文法/兩軸/placeholder/necessity/長度）。
+    # quarantine/echo/空殼 已在上一步逐節點非致命處理——不該在契約層炸掉整層。
+    if not passed:
+        raise TreeProbeError(
+            f"layer {k} 全部分支被機械拒——reflex 無法承載下一層（§12.12 #1：不承載即拒）"
+        )
+    surviving = dict(parsed)
+    surviving["branches"] = list(passed)
+    # W1：parent_branches 給定 → 契約做 DCA 文法轉移檢查（含結構性零，fatal）。
+    # 2026-08-03：max_branches 用**獨立安全網**（MAX_BRANCHES_SAFETY_CAP），不再
+    # 用提示值 n_branch——「超過提示值」不拒（張力幾何可能自然給更多），
+    # 只有「超過荒謬上限」才 raise。真正路徑爆炸防護是 MAX_PATHS_PER_TREE。
+    assert_tree_gate_contract(
+        surviving, None, max_branches=MAX_BRANCHES_SAFETY_CAP, max_depth=depth,
+        parent_branches=reflect_on, code=code,
+    )
+
+    layer_entry = {
+        "layer": k,
+        "date_ref": parsed.get("date_ref"),
+        "branches": [],
+    }
+
+    # 建樹：解析父節點連結
+    for b in passed:
+        b["layer"] = k
+        b["_llm_rigidity"] = float(b["rigidity_prevalence"])
+        b["_llm_band"] = b.get("confidence_band")
+        b["children"] = []
+        parent = _resolve_parent(b, reflect_on)
+        if parent is None:
+            b["parent_label"] = root["label"]
+            root["children"].append(b)
+        else:
+            b["parent_label"] = parent["label"]
+            parent["children"].append(b)
+        layer_entry["branches"].append(b)
+
+    return passed, layer_entry, layer_rejected, 1
+
+
+def _new_probe_state(
+    situation: Any,
+    constraint_field: Any,
+    *,
+    n_branch: int,
+    w: float,
+    gate_fn: Callable,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    code: str | None,
+    system_message: str | None,
+    situation_labels: list[str] | None,
+    timeout: int,
+    depth: int,
+) -> dict:
+    """手動逐層會話的累積狀態（T18）——config + 累積輸出，供 probe_expand_layer /
+    _generate_one_tree_iter 跨次呼叫攜帶。SSOT 仍是 YAML/JSON 源——此處只是單次
+    手動會話的工作記憶（世界無關）。
+    """
+    constraint = constraint_field if isinstance(constraint_field, dict) else {}
+    root = {
+        "label": _root_label(situation),
+        "grounding": "處境（root）",
+        "layer": 0,
+        "parent_label": None,
+        "axis_A": "inherited",
+        "axis_B": "expression",
+        "children": [],
+    }
+    return {
+        "situation": situation,
+        "constraint_field": constraint_field,
+        "n_branch": n_branch,
+        "w": w,
+        "gate_fn": gate_fn,
+        "api_key": api_key,
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "code": code,
+        "system_message": system_message,
+        "situation_labels": situation_labels,
+        "timeout": timeout,
+        "depth": depth,
+        "rate_matrix": constraint.get("rate_matrix"),
+        "situation_vector": _extract_situation_vector(situation),
+        "root": root,
+        "layers": [],
+        "rejected": [],
+        "echo_notes": [],
+        "calls": 0,
+    }
+
+
 def _generate_one_tree(
     situation: Any,
     constraint_field: Any,
@@ -1476,6 +1692,7 @@ def _generate_one_tree(
     code: str | None = None,
     system_message: str | None = None,
     situation_labels: list[str] | None,
+    timeout: int = 180,
 ) -> dict:
     """生成單棵決策樹（Phase A + B + C）。每層 1 call，共 depth 次。
 
@@ -1507,82 +1724,40 @@ def _generate_one_tree(
     reflect_on: list[dict] = []
 
     for k in range(1, depth + 1):
-        payload = _build_layer_payload(
+        # T18：單層邏輯已抽為 _generate_layer_once（自動與手動共用）——reflect_on
+        # 由外部注入（自動 = 上一層 passed；手動 = [人選的那條]）。
+        passed, layer_entry, layer_rejected, dcalls = _generate_layer_once(
             situation, constraint_field, reflect_on,
-            layer=k, n_branch=n_branch, w=w,
+            k=k, depth=depth, n_branch=n_branch, w=w,
+            gate_fn=gate_fn, api_key=api_key, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+            code=code, system_message=system_message,
+            situation_labels=situation_labels, rate_matrix=rate_matrix,
+            situation_vector=situation_vector, root=root,
+            echo_notes=echo_notes, timeout=timeout,
         )
-        user_prompt = f"{json.dumps(payload, ensure_ascii=False)}\n[task:tree_generate]"
-        raw = gate_fn(
-            user_prompt,
-            api_key,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system_message=(
-                TREE_GENERATE_SYSTEM_PROMPT if system_message is None else system_message
-            ),
-            response_format={"type": "json_object"},
-            thinking=False,
-        )
-        calls += 1
-
-        parsed = _parse_tree_json(raw)
-        # F6：路由洩漏/結構失配只在 check_routing_leak_or_schema 一處處理（內部已含
-        # ROUTING_LEAK_KEYWORDS 掃描 + 任務 schema 檢查）——不重複手動迴圈。
-        # 注意：洩漏且無法解析的回應會在解析階段先以「無法解析」拒絕（仍是 TreeProbeError）。
-        leak_err = check_routing_leak_or_schema(raw, parsed, "tree_generate")
-        if leak_err:
-            raise TreeProbeError(leak_err)
-
-        # Phase B：先逐節點機械檢查（quarantine/回聲/空殼/兩軸降權 + W1 rate_zero）→
-        # passed / rejected。rate_matrix 為「具體限制」可選輸入——缺席時零強度不檢查。
-        passed, layer_rejected = _mechanical_check_layer(
-            parsed, situation_labels,
-            parent_branches=reflect_on, rate_matrix=rate_matrix,
-            code=code, echo_notes=echo_notes,
-        )
-        for b in layer_rejected:
-            b["layer"] = k
+        calls += dcalls
         rejected.extend(layer_rejected)
-
-        # 結構性契約：只對「存活分支」驗結構（文法/兩軸/placeholder/necessity/長度）。
-        # quarantine/echo/空殼 已在上一步逐節點非致命處理——不該在契約層炸掉整層。
-        if not passed:
-            raise TreeProbeError(
-                f"layer {k} 全部分支被機械拒——reflex 無法承載下一層（§12.12 #1：不承載即拒）"
-            )
-        surviving = dict(parsed)
-        surviving["branches"] = list(passed)
-        # W1：parent_branches 給定 → 契約做 DCA 文法轉移檢查（含結構性零，fatal）。
-        assert_tree_gate_contract(
-            surviving, None, max_branches=n_branch, max_depth=depth,
-            parent_branches=reflect_on, code=code,
-        )
-
-        layer_entry = {
-            "layer": k,
-            "date_ref": parsed.get("date_ref"),
-            "branches": [],
-        }
-
-        # 建樹：解析父節點連結
-        for b in passed:
-            b["layer"] = k
-            b["_llm_rigidity"] = float(b["rigidity_prevalence"])
-            b["_llm_band"] = b.get("confidence_band")
-            b["children"] = []
-            parent = _resolve_parent(b, reflect_on)
-            if parent is None:
-                b["parent_label"] = root["label"]
-                root["children"].append(b)
-            else:
-                b["parent_label"] = parent["label"]
-                parent["children"].append(b)
-            layer_entry["branches"].append(b)
-
         layers.append(layer_entry)
         reflect_on = passed
 
+    return _finalize_tree(
+        root, layers, rejected, echo_notes, calls, situation_vector
+    )
+
+
+def _finalize_tree(
+    root: dict,
+    layers: list[dict],
+    rejected: list[dict],
+    echo_notes: list[str],
+    calls: int,
+    situation_vector: dict | None,
+) -> dict:
+    """Phase C/D 收尾（T18 抽離）——路徑枚舉 → prevalence + 信賴帶 → 剛性圖 →
+    standing wave → 低發散警示 → 組裝樹 dict。自動（_generate_one_tree）與手動
+    （probe_tree_manual / probe_expand_layer）共用同一收尾——自動/手動零分歧。
+    """
     # Phase C：路徑枚舉 → prevalence + 信賴帶
     # 路徑為可變長度（根→葉；無子節點的分支即葉）。每層的分母 = **抵達該層的
     # 路徑數**（條件 prevalence）——與 `standing_wave_per_layer` 的 path 加權一致；
@@ -1669,6 +1844,76 @@ def _generate_one_tree(
             "params": {},
         },
     }
+
+
+def _generate_one_tree_iter(
+    situation: Any,
+    constraint_field: Any,
+    *,
+    n_branch: int,
+    depth: int,
+    w: float,
+    gate_fn: Callable,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    code: str | None = None,
+    system_message: str | None = None,
+    situation_labels: list[str] | None,
+    timeout: int = 180,
+):
+    """逐層生成器（T18「暫停的生成器」）——每生成一層 yield 一次，外部控制流
+    （人機收束）可暫停。
+
+    每次 yield ``(k, layer_entry, state, passed)``：
+    - ``k``：層號；``layer_entry``：本層分支（人從 ``layer_entry["branches"]`` 挑選）；
+    - ``state``：累積狀態快照（root/layers/rejected/echo_notes/calls/situation_vector）——
+      外部 break / close 後以最後的快照 ``_finalize_tree``；
+    - ``passed``：本層存活分支（= 自動模式的下一層反射對象）。
+
+    外部以 ``gen.send(next_reflect_on)`` 注入下一層 reflect_on：
+    - ``[branch]``（人選的那條）→ 下一層 reflect_on = [branch]（打破 1:1 續鏈）；
+    - ``None`` → 下一層 reflect_on = passed（自動續接全部，向後相容）。
+
+    生成器本身不做 Phase C 收尾——收尾職責在外部控制流（``_finalize_tree``）。
+    """
+    state = _new_probe_state(
+        situation, constraint_field,
+        n_branch=n_branch, w=w, gate_fn=gate_fn, api_key=api_key,
+        model=model, max_tokens=max_tokens, temperature=temperature,
+        code=code, system_message=system_message,
+        situation_labels=situation_labels, timeout=timeout, depth=depth,
+    )
+    reflect_on: list[dict] = []
+
+    for k in range(1, depth + 1):
+        passed, layer_entry, layer_rejected, dcalls = _generate_layer_once(
+            state["situation"], state["constraint_field"], reflect_on,
+            k=k, depth=state["depth"], n_branch=state["n_branch"], w=state["w"],
+            gate_fn=state["gate_fn"], api_key=state["api_key"], model=state["model"],
+            max_tokens=state["max_tokens"], temperature=state["temperature"],
+            code=state["code"], system_message=state["system_message"],
+            situation_labels=state["situation_labels"], rate_matrix=state["rate_matrix"],
+            situation_vector=state["situation_vector"], root=state["root"],
+            echo_notes=state["echo_notes"], timeout=state["timeout"],
+        )
+        state["calls"] += dcalls
+        state["rejected"].extend(layer_rejected)
+        state["layers"].append(layer_entry)
+        snapshot = {
+            "root": state["root"],
+            "layers": state["layers"],
+            "rejected": state["rejected"],
+            "echo_notes": state["echo_notes"],
+            "calls": state["calls"],
+            "situation_vector": state["situation_vector"],
+        }
+        next_reflect_on = yield k, layer_entry, snapshot, passed
+        if next_reflect_on is not None:
+            reflect_on = list(next_reflect_on)
+        else:
+            reflect_on = passed
 
 
 def _rigidity_band(rigidities: list[float], n_paths: int) -> dict:
@@ -2289,6 +2534,7 @@ def probe_tree(
     temperature: float = 0.6,
     code: str | None = None,
     system_message: str | None = None,
+    timeout: int = 180,
 ) -> dict:
     """決策樹探針——約束剛性測量器（PLAN-23 §十二 v1.2）。
 
@@ -2296,7 +2542,9 @@ def probe_tree(
         situation: 社會物質結構 digest + local_texture + 6D 向量（§12.2 處境）。
         constraint_field: 約束場（承載量）——速率矩陣 + 頻譜數據 + 殘差表 sharp 信號
             （``{"rate_matrix":..., "residuals":..., "saturation":...}``，§12.2）。
-        n_branch: 每層分支數（3–8，pilot 5）。
+        n_branch: 每層分支數**提示**（1–20，pilot 5）——提示性參考：實際分支數由
+            張力幾何決定（prompt「幾根柱就幾條路」），機械層只在超過
+            ``MAX_BRANCHES_SAFETY_CAP``（20）時拒收。
         n_sample: 採樣次數（≥1，pilot 1）——成本 = n_sample × depth calls（§12.8）。
         depth: 深度（2–4，pilot 3）——每層 1 call。
         w: CFG 場強（0–2，pilot 0.5–1.0）——**只在生成期 prompt 內作用**（約束強度），
@@ -2331,8 +2579,8 @@ def probe_tree(
         - ``meta``: params / calls / cost_anchor（= n_sample × depth）/ n_paths /
           truncated（路徑爆炸截斷旗標，F5）/ state_log_path（僅供收束落盤，F8）。
     """
-    if n_branch < 3 or n_branch > 8:
-        raise ValueError(f"n_branch must be in [3, 8], got {n_branch}")
+    if n_branch < 1 or n_branch > 20:
+        raise ValueError(f"n_branch must be in [1, 20] (hint only, not a cap), got {n_branch}")
     if depth < 2 or depth > 4:
         raise ValueError(f"depth must be in [2, 4], got {depth}")
     if n_sample < 1:
@@ -2371,9 +2619,37 @@ def probe_tree(
             code=code,
             system_message=system_message,
             situation_labels=situation_labels,
+            timeout=timeout,
         )
         trees.append(tree)
 
+    return _assemble_probe_result(
+        trees, constraint_field,
+        n_branch=n_branch, n_sample=n_sample, depth=depth, w=w,
+        seed=seed, code=code, model=model, state_log_path=state_log_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase E：人機交錯收束——收束視圖 + probe_select
+# ---------------------------------------------------------------------------
+
+def _assemble_probe_result(
+    trees: list[dict],
+    constraint_field: Any,
+    *,
+    n_branch: int,
+    n_sample: int,
+    depth: int,
+    w: float,
+    seed: int,
+    code: str | None,
+    model: str,
+    state_log_path: str | None,
+) -> dict:
+    """把一或多棵樹組裝為 probe 結果 dict（prevalence / rigidity_map / archetypes /
+    gate_nodes / meta）。自動（probe_tree）與手動（probe_tree_manual）共用。
+    """
     total_calls = sum(int(t["meta"]["calls"]) for t in trees)
     prevalence = _aggregate_prevalence(trees)
     rigidity_map = _aggregate_rigidity_map(trees, prevalence)
@@ -2419,9 +2695,245 @@ def probe_tree(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Phase E：人機交錯收束——收束視圖 + probe_select
-# ---------------------------------------------------------------------------
+def probe_tree_manual(
+    situation: Any,
+    constraint_field: Any = None,
+    *,
+    n_branch: int = 5,
+    depth: int = 3,
+    w: float = 0.5,
+    gate_fn: Callable | None = None,
+    call_api_fn: Callable | None = None,
+    state_log_path: str | None = None,
+    seed: int = 42,
+    api_key: str | None = None,
+    model: str = "deepseek-v4-flash",
+    max_tokens: int = 8192,
+    temperature: float = 0.6,
+    code: str | None = None,
+    system_message: str | None = None,
+    timeout: int = 180,
+    on_layer: Callable | None = None,
+) -> dict:
+    """手動逐層觸發（T18）——生成器逐層暫停，``on_layer`` 回呼是人機收束的接縫。
+
+    ``on_layer(layer_entry, ctx)`` → 回傳 **[選定的 branch dict]**（從
+    ``layer_entry["branches"]`` 挑一個）作為下一層 reflect_on（打破 1:1 續鏈：
+    一個父可展開多子）；回傳 **None** → 中止（樹停在該層）。
+    ``ctx = {"k", "passed", "rejected", "echo_notes"}``。
+    ``on_layer=None``（預設）→ 自動續接全部 passed（模擬 probe_tree 單樹行為，
+    向後相容）。
+
+    🔴 世界無關：不引入任何世界特定詞；與 probe_tree 共用 _generate_layer_once /
+    _finalize_tree / _assemble_probe_result——自動與手動路徑的單層邏輯零分歧。
+
+    場狀態壓縮注入（PLAN §12.14「reflect_on = [人選那條] + 場狀態」）留待後續——
+    本實作先做最小可行：只注入 [人選那條]（經 _build_layer_payload 的
+    reflection.passed_branches）。
+    """
+    if n_branch < 1 or n_branch > 20:
+        raise ValueError(f"n_branch must be in [1, 20] (hint only, not a cap), got {n_branch}")
+    if depth < 2 or depth > 4:
+        raise ValueError(f"depth must be in [2, 4], got {depth}")
+    if not (0.0 <= w <= 2.0):
+        raise ValueError(f"w must be in [0, 2], got {w}")
+
+    if gate_fn is None:
+        if call_api_fn is None:
+            call_api_fn = _load_ecc_call_api()
+        gate_fn = call_api_fn
+        if api_key is None:
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
+
+    # F7：同 probe_tree——包裝 situation 讓 situation_labels 真正帶處境標籤。
+    situation_labels = _extract_situation_labels({"situation": situation})
+
+    gen = _generate_one_tree_iter(
+        situation, constraint_field,
+        n_branch=n_branch, depth=depth, w=w,
+        gate_fn=gate_fn, api_key=api_key or "", model=model,
+        max_tokens=max_tokens, temperature=temperature,
+        code=code, system_message=system_message,
+        situation_labels=situation_labels, timeout=timeout,
+    )
+    state: dict | None = None
+    stopped_at: int | None = None
+    # 🔴 手動驅動生成器（不能用 `for ... in gen`）：``gen.send()`` 本身會消耗下一次
+    # yield——與 for 迴圈組合會雙重推進、跳過一層（T18 實測）。
+    try:
+        k, layer_entry, gen_state, passed = next(gen)
+    except StopIteration:
+        raise TreeProbeError("生成器未產出任何層——depth 必須 ≥ 2（已校驗）") from None
+    while True:
+        state = gen_state
+        if on_layer is None:
+            # 自動模式：續接全部 passed（向後相容——模擬 probe_tree 單樹行為）。
+            try:
+                k, layer_entry, gen_state, passed = gen.send(None)
+            except StopIteration:
+                break
+            continue
+        chosen = on_layer(layer_entry, {
+            "k": k,
+            "passed": passed,
+            "rejected": gen_state["rejected"],
+            "echo_notes": gen_state["echo_notes"],
+        })
+        if chosen is None:
+            # 中止：樹停在該層。
+            stopped_at = k
+            gen.close()
+            break
+        # 防禦：人選的必須是本層分支之一（T18——reflect_on 只能是「人選的那條」）。
+        if not isinstance(chosen, dict) or not any(
+            chosen is b or chosen.get("label") == b.get("label") for b in passed
+        ):
+            raise TreeProbeError(
+                f"on_layer 回傳的分支不在 layer {k} 的 branches 中——"
+                f"必須從 layer_entry['branches'] 挑一個（回傳 None = 中止）"
+            )
+        try:
+            k, layer_entry, gen_state, passed = gen.send([chosen])
+        except StopIteration:
+            break
+
+    assert state is not None, "生成器未產出任何層——depth 必須 ≥ 2（已校驗）"
+    tree = _finalize_tree(
+        state["root"], state["layers"], state["rejected"],
+        state["echo_notes"], state["calls"], state["situation_vector"],
+    )
+    result = _assemble_probe_result(
+        [tree], constraint_field,
+        n_branch=n_branch, n_sample=1, depth=depth, w=w,
+        seed=seed, code=code, model=model, state_log_path=state_log_path,
+    )
+    if on_layer is not None:
+        result["meta"]["manual"] = True
+    if stopped_at is not None:
+        result["meta"]["stopped_at_layer"] = stopped_at
+    return result
+
+
+def probe_expand_layer(
+    situation: Any,
+    constraint_field: Any = None,
+    *,
+    state: dict | None = None,
+    reflect_on: list[dict] | None = None,
+    n_branch: int = 5,
+    depth: int = 3,
+    w: float = 0.5,
+    gate_fn: Callable | None = None,
+    call_api_fn: Callable | None = None,
+    seed: int = 42,
+    api_key: str | None = None,
+    model: str = "deepseek-v4-flash",
+    max_tokens: int = 8192,
+    temperature: float = 0.6,
+    code: str | None = None,
+    system_message: str | None = None,
+    timeout: int = 180,
+) -> dict:
+    """生成單層（T18 手動逐層觸發原語）——``reflect_on`` = [人選的那條]，回傳該層結果。
+
+    ``state``：手動會話累積狀態（首次呼叫 None → 自動初始化；後續傳回上回的 state，
+    state 一旦建立即為權威——後續的 n_branch/w/gate_fn/model 等參數被忽略）。
+    ``reflect_on``：下一層反射對象——[人選的那條 branch]；首次（None）→ []
+    （從處境展開，同現行第一層）。``depth``：契約 max_depth（須 ≥ 已生成層數 + 1）。
+
+    回傳 ``{"layer_entry", "passed", "state", "tree", "result", "calls"}``——
+    ``tree`` 為截至該層的已 finalize 工作樹（供 convergence_view / probe_select
+    人看）；``result`` 為 probe_select 可消費的最小 result 形狀（trees=[tree]）。
+
+    人機流程（T19 收束 UX）：看 tree → probe_select(result, selected_label=...) →
+    取 collapse.selected 對應的 branch → 下一層 reflect_on=[該 branch]。
+    """
+    if n_branch < 1 or n_branch > 20:
+        raise ValueError(f"n_branch must be in [1, 20] (hint only, not a cap), got {n_branch}")
+    if not (0.0 <= w <= 2.0):
+        raise ValueError(f"w must be in [0, 2], got {w}")
+
+    if state is None:
+        if gate_fn is None:
+            if call_api_fn is None:
+                call_api_fn = _load_ecc_call_api()
+            gate_fn = call_api_fn
+            if api_key is None:
+                api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            if not api_key:
+                raise ValueError("API key required: pass api_key or set DEEPSEEK_API_KEY")
+        situation_labels = _extract_situation_labels({"situation": situation})
+        state = _new_probe_state(
+            situation, constraint_field,
+            n_branch=n_branch, w=w, gate_fn=gate_fn, api_key=api_key or "",
+            model=model, max_tokens=max_tokens, temperature=temperature,
+            code=code, system_message=system_message,
+            situation_labels=situation_labels, timeout=timeout, depth=depth,
+        )
+
+    k = len(state["layers"]) + 1
+    if k > state["depth"]:
+        raise TreeProbeError(
+            f"已達 max depth（{state['depth']}）——無法再展開第 {k} 層"
+        )
+    # 🔴 防禦（T18）：reflect_on（若有）必須全部屬於上一層的 passed（label 集合，
+    # 與 _resolve_parent 比對方式一致）。違反 → payload 對 LLM 是語義謊言
+    # （reflection.layer=k-1 但分支來自別層），且 _resolve_parent fallback 會把
+    # 本層子掛到上一層父 → depth-jump。
+    if reflect_on:
+        prev_labels = (
+            {b["label"] for b in state["layers"][-1]["branches"]}
+            if state["layers"] else set()
+        )
+        if not prev_labels:
+            raise TreeProbeError(
+                "reflect_on 分支不屬於上一層——首次呼叫（k=1）沒有上一層，"
+                "reflect_on 必須為 None/空（首層從處境展開，不能有「父」）"
+            )
+        foreign = [
+            (b.get("label") if isinstance(b, dict) else repr(b))
+            for b in reflect_on
+            if not (isinstance(b, dict) and b.get("label") in prev_labels)
+        ]
+        if foreign:
+            raise TreeProbeError(
+                f"reflect_on 分支不屬於上一層——{foreign} 不在 layer {k - 1} 的 "
+                f"branches（上一層 passed）中；reflect_on 必須從上一層 branches 挑選"
+            )
+    passed, layer_entry, layer_rejected, dcalls = _generate_layer_once(
+        state["situation"], state["constraint_field"], reflect_on or [],
+        k=k, depth=state["depth"], n_branch=state["n_branch"], w=state["w"],
+        gate_fn=state["gate_fn"], api_key=state["api_key"], model=state["model"],
+        max_tokens=state["max_tokens"], temperature=state["temperature"],
+        code=state["code"], system_message=state["system_message"],
+        situation_labels=state["situation_labels"], rate_matrix=state["rate_matrix"],
+        situation_vector=state["situation_vector"], root=state["root"],
+        echo_notes=state["echo_notes"], timeout=state["timeout"],
+    )
+    state["calls"] += dcalls
+    state["rejected"].extend(layer_rejected)
+    state["layers"].append(layer_entry)
+    tree = _finalize_tree(
+        state["root"], state["layers"], state["rejected"],
+        state["echo_notes"], state["calls"], state["situation_vector"],
+    )
+    return {
+        "layer_entry": layer_entry,
+        "passed": passed,
+        "state": state,
+        "tree": tree,
+        "result": {
+            "trees": [tree],
+            "meta": {
+                "state_log_path": None,
+                "params": {"n_branch": state["n_branch"]},
+            },
+        },
+        "calls": dcalls,
+    }
+
 
 def convergence_view(result: dict) -> dict:
     """收束視圖（§12.7）——**可程式化輸出的資料結構**，供人/介面消費。
@@ -2665,6 +3177,8 @@ __all__ = [
     "cluster_archetypes_semantic",
     "convergence_view",
     "probe_tree",
+    "probe_tree_manual",
+    "probe_expand_layer",
     "probe_select",
     "detect_script",
     "assert_code_compliance",
@@ -2677,4 +3191,5 @@ __all__ = [
     "_sharp_hit",
     "_saturation_value",
     "_generate_one_tree",
+    "_generate_one_tree_iter",
 ]

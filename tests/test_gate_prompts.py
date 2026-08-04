@@ -8,6 +8,7 @@ import pytest
 from spectrum_os.synth.gate_prompts import (
     GATE_SYSTEM_PROMPT_UNIFIED,
     ROUTING_LEAK_KEYWORDS,
+    TREE_GENERATE_SYSTEM_PROMPT,
     check_routing_leak_or_schema,
 )
 from spectrum_os.synth.rate_gate import (
@@ -173,3 +174,11 @@ class TestGatePrompts:
             rate_gate(sample_input, call_api_fn=leaky_call_api, api_key="test", n_samples=1, unified=True)
 
         assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 2026-08-04：TestTreeGeneratePromptHintSemantics 已刪除——那是調 prompt 過程
+# 生成的「文本快照測試」（鎖死 prompt 措辭，不測行為）。prompt 措辭不該被測試
+# 綁架；prompt 品質由 ab_prompt_test.py（樹寬/echo/質量）實測。
+# 行為測試（routing leak/retry/batch）保留於 TestGatePrompts。

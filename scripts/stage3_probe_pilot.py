@@ -963,7 +963,7 @@ def _print_summary(report: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="走真實 API gate（需 DEEPSEEK_API_KEY）")
-    parser.add_argument("--n-branch", type=int, default=5, help="每層分支數（3-8）")
+    parser.add_argument("--n-branch", type=int, default=5, help="每層分支數提示（1-20，提示性非上限；機械安全網 20）")
     parser.add_argument("--n-sample", type=int, default=1, help="採樣次數")
     parser.add_argument("--depth", type=int, default=3, help="深度（2-4）")
     parser.add_argument("--w", type=float, default=0.5, help="CFG 場強（0-2，僅生成期）")

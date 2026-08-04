@@ -17,8 +17,11 @@ from spectrum_os.synth.gate_prompts import (
     check_routing_leak_or_schema,
 )
 from spectrum_os.synth.probe import (
+    MAX_BRANCHES_SAFETY_CAP,
     NECESSITY_HINT_KEY,
     TreeProbeError,
+    _build_layer_payload,
+    _generate_one_tree_iter,
     _mechanical_check_layer,
     _prevalence_band,
     _rigidity_band,
@@ -30,8 +33,10 @@ from spectrum_os.synth.probe import (
     detect_script,
     max_len_for_code,
     max_words_for_code,
+    probe_expand_layer,
     probe_select,
     probe_tree,
+    probe_tree_manual,
     standing_wave_per_layer,
 )
 
@@ -316,6 +321,96 @@ class TestProbeTreeGeneration:
 
 
 # ---------------------------------------------------------------------------
+# 1.5  n_branch 提示性語義（2026-08-03：分支數限制兩層解耦）
+# ---------------------------------------------------------------------------
+
+class TestNBranchHintSemantics:
+    """n_branch 由「硬性上限」改為「提示性 + 機械安全網」後的語義。
+
+    動機（追源）：舊 prompt「≤ N_branch」把機械安全上限誤當 LLM 必須遵守的指令
+    ——LLM 恆輸出 5 分支且多數不填 parent → 樹塌成 5 條平行鏈 → 樹寬 1.36 結構常數。
+    新語義：prompt 改為「幾根柱就幾條路」（提示性）+「每一條分支必須標明 parent」；
+    機械層只在超過 MAX_BRANCHES_SAFETY_CAP（荒謬濾網）時 raise。
+    """
+
+    def test_n_branch_hint_range_accepted(self):
+        # 提示性範圍 [1,20]——不再是硬性 [3,8]
+        for nb in (1, 2, 5, 20):
+            mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2])
+            result = probe_tree(SITUATION, n_branch=nb, depth=2, gate_fn=mock_gate)
+            assert result["meta"]["params"]["n_branch"] == nb
+
+    def test_n_branch_absurd_value_rejected(self):
+        # 超出提示性範圍仍拒（0 / 負 / 21+）——範圍本身只是提示參考，仍須是正整數；
+        # 校驗在 gate_fn/API 檢查之前就拋錯，不需 mock
+        for nb in (0, -1, 21, 100):
+            with pytest.raises(ValueError, match="n_branch"):
+                probe_tree(SITUATION, n_branch=nb, depth=2)
+
+    def test_branches_exceeding_hint_not_rejected(self):
+        # 提示性核心：超過 n_branch 提示值（3→5）不再拒——張力幾何可自然給更多
+        l1 = {"layer": 1, "date_ref": "1914-07",
+              "branches": [valid_branch(f"路{i}") for i in range(5)]}
+        l2 = {"layer": 2, "date_ref": "1914-08",
+              "branches": [valid_branch(f"續{i}", parent=f"路{i}") for i in range(5)]}
+        mock_gate, _ = make_mock_gate([l1, l2])
+        result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        tree = result["trees"][0]
+        assert len(tree["layers"][0]["branches"]) == 5
+        assert len(tree["layers"][1]["branches"]) == 5
+        assert tree["meta"]["n_paths"] == 5
+
+    def test_branches_exceeding_safety_cap_rejected(self):
+        # 機械安全網：超過 MAX_BRANCHES_SAFETY_CAP（20）的荒謬輸出才拒
+        bad = {"layer": 1, "date_ref": "1914-07",
+               "branches": [valid_branch(f"路{i}") for i in range(25)]}
+        mock_gate, _ = make_mock_gate([bad])
+        with pytest.raises(TreeProbeError, match="max_branches"):
+            probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+
+    def test_safety_cap_boundary(self):
+        # 邊界：恰 20 過、21 拒
+        ok = {"layer": 1, "date_ref": "1914-07",
+              "branches": [valid_branch(f"路{i}") for i in range(20)]}
+        ok2 = {"layer": 2, "date_ref": "1914-08",
+               "branches": [valid_branch(f"續{i}", parent=f"路{i}") for i in range(20)]}
+        mock_gate, _ = make_mock_gate([ok, ok2])
+        result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        assert len(result["trees"][0]["layers"][0]["branches"]) == 20
+
+        bad = {"layer": 1, "date_ref": "1914-07",
+               "branches": [valid_branch(f"路{i}") for i in range(21)]}
+        mock_gate2, _ = make_mock_gate([bad])
+        with pytest.raises(TreeProbeError, match="max_branches"):
+            probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate2)
+
+    def test_layer_payload_marks_n_branch_as_hint(self):
+        # payload 保留 n_branch 數字（提示性參考）+ n_branch_hint 標記
+        payload = _build_layer_payload(SITUATION, None, [], layer=1, n_branch=3, w=0.5)
+        assert payload["n_branch"] == 3
+        assert payload["n_branch_hint"] is True
+        # 帶反射對象時仍標記，且 reflection 結構不變
+        payload2 = _build_layer_payload(
+            SITUATION, None, [{"label": "父"}], layer=2, n_branch=5, w=0.5
+        )
+        assert payload2["n_branch"] == 5
+        assert payload2["n_branch_hint"] is True
+        assert payload2["reflection"]["layer"] == 1
+
+    def test_contract_still_enforces_explicit_max_branches(self):
+        # 契約函數本身行為不變：呼叫者顯式給 max_branches 時仍拒超過值
+        bad = {"layer": 1, "branches": [valid_branch(f"分支{i}") for i in range(4)]}
+        with pytest.raises(TreeProbeError, match="max_branches"):
+            assert_tree_gate_contract(bad, max_branches=3)
+        # 但同一輸出超過「提示值 3」、未超過顯式安全網 20 → 過
+        assert_tree_gate_contract(bad, max_branches=20)
+
+    def test_safety_cap_is_constant_decoupled_from_hint(self):
+        # 兩層解耦：安全網是固定常數，不隨提示值縮放
+        assert MAX_BRANCHES_SAFETY_CAP == 20
+
+
+# ---------------------------------------------------------------------------
 # 2. assert_tree_gate_contract 負面案例
 # ---------------------------------------------------------------------------
 
@@ -377,10 +472,14 @@ class TestTreeGateContract:
         with pytest.raises(TreeProbeError, match="forbidden key 'series'"):
             assert_tree_gate_contract(bad)
 
-    def test_situation_echo_rejected_when_labels_given(self):
-        bad = {"layer": 1, "branches": [valid_branch("巴爾幹")]}
-        with pytest.raises(TreeProbeError, match="situation echo"):
-            assert_tree_gate_contract(bad, ["巴爾幹"])
+    def test_situation_echo_recorded_not_rejected_when_labels_given(self):
+        # 2026-08-03 起：situation echo 全面撤銷攔截——記錄供人機收束，不 raise
+        notes: list[str] = []
+        assert_tree_gate_contract(
+            {"layer": 1, "branches": [valid_branch("巴爾幹")]},
+            ["巴爾幹"], echo_notes=notes,
+        )
+        assert any("situation echo" in n for n in notes)
 
     def test_duplicate_label_in_layer_rejected(self):
         bad = {"layer": 1, "branches": [valid_branch("同一"), valid_branch("同一")]}
@@ -960,7 +1059,7 @@ class TestProbeF1F7Repairs:
         assert_tree_gate_contract(bad, echo_notes=notes)  # 不再 raise
         assert notes and any("example echo" in n for n in notes)
 
-    # --- F3：兩軸名詞字首拒收（管線層 non-fatal → rejected 清單）---
+    # --- F3：兩軸名詞字首（2026-08-03 全面撤銷攔截：記錄不拒）---
     def test_axis_echo_prefix_nonfatal_pipeline(self):
         l1 = {
             "layer": 1, "date_ref": "1914-07",
@@ -976,10 +1075,12 @@ class TestProbeF1F7Repairs:
         }
         mock_gate, _ = make_mock_gate([l1, l2])
         result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        # axis echo 不再進 rejected——全部放行，記入 echo_notes 供人機收束
         rejected_labels = [r["label"] for r in result["rejected"]]
-        assert "繼承的動員令" in rejected_labels
-        assert any("軸名詞" in " ".join(r.get("reject_reasons", [])) for r in result["rejected"])
-        # 乾淨分支存活 → 樹仍建立
+        assert "繼承的動員令" not in rejected_labels
+        echo_text = "\n".join(result.get("echo_notes", []))
+        assert "axis echo" in echo_text
+        # 分支存活 → 樹正常建立
         assert len(result["trees"]) == 1
 
     # --- F6：每父平均子數記錄 + 低發散警示判據 ---
@@ -1008,8 +1109,8 @@ class TestProbeF1F7Repairs:
         # root 1 子 + a 2 子 → (1 + 2) / 2 = 1.5 > 純鏈 1.2857
         assert abs(avg - 1.5) < 1e-4
 
-    # --- F7：probe_tree 包裝 situation → 處境-echo 拒收真的生效 ---
-    def test_situation_echo_rejected_via_probe_tree(self):
+    # --- F7：probe_tree 包裝 situation → 處境-echo 2026-08-03 起記錄不拒 ---
+    def test_situation_echo_recorded_not_rejected_via_probe_tree(self):
         echo_layer = {
             "layer": 1, "date_ref": "1914-07",
             "branches": [
@@ -1025,11 +1126,9 @@ class TestProbeF1F7Repairs:
         mock_gate, _ = make_mock_gate([echo_layer, l2])
         result = probe_tree(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
         rejected_labels = [r["label"] for r in result["rejected"]]
-        assert "巴爾幹" in rejected_labels
-        assert any(
-            "處境標籤" in " ".join(r.get("reject_reasons", []))
-            for r in result["rejected"]
-        )
+        assert "巴爾幹" not in rejected_labels
+        echo_text = "\n".join(result.get("echo_notes", []))
+        assert "situation echo" in echo_text
 
     def test_extract_situation_labels_accepts_bare_situation(self):
         # F7：_extract_situation_labels 兼容 bare situation dict（防禦性）
@@ -2024,28 +2123,28 @@ class TestLayerEchoSemanticInterception:
     def _parent(self):
         return [self._branch("俄國總動員令", binding="簽署的舊束縛", perspective="總參謀部")]
 
-    def test_true_echo_same_label_and_denotation_rejected(self):
-        # (a) label + 承義全同 → 拒（真原地踏步）
+    def test_true_echo_same_label_and_denotation_recorded_not_rejected(self):
+        # (a) label + 承義全同 → 2026-08-03 起不拒（echo 全面撤銷攔截）——記錄供人機收束
+        notes: list[str] = []
         passed, rejected = _mechanical_check_layer(
             {"layer": 3, "branches": [
                 self._branch("俄國總動員令", binding="簽署的舊束縛", perspective="總參謀部")]},
-            None, parent_branches=self._parent(),
+            None, parent_branches=self._parent(), echo_notes=notes,
         )
-        assert len(passed) == 0
-        assert rejected and any(
-            "真原地踏步" in r for r in rejected[0]["reject_reasons"]
-        )
+        assert len(passed) == 1
+        assert len(rejected) == 0
+        assert any("候選原地踏步" in n for n in notes)
 
-    def test_true_echo_both_lack_denotation_rejected(self):
-        # (a') 兩者皆無 binding/perspective（valid_branch 形狀）→ grounding/conditions 同 → 拒
+    def test_true_echo_both_lack_denotation_recorded_not_rejected(self):
+        # (a') 兩者皆無 binding/perspective → 2026-08-03 起不拒——記錄供人機收束
+        notes: list[str] = []
         passed, rejected = _mechanical_check_layer(
             {"layer": 3, "branches": [self._branch("俄國總動員令")]},
-            None, parent_branches=[self._branch("俄國總動員令")],
+            None, parent_branches=[self._branch("俄國總動員令")], echo_notes=notes,
         )
-        assert len(passed) == 0
-        assert rejected and any(
-            "真原地踏步" in r for r in rejected[0]["reject_reasons"]
-        )
+        assert len(passed) == 1
+        assert len(rejected) == 0
+        assert any("候選原地踏步" in n for n in notes)
 
     def test_false_echo_new_binding_released(self):
         # (b) label 同但 binding 全新 → 放行（誤殺修復核心案例）
@@ -2126,3 +2225,261 @@ class TestLayerEchoSemanticInterception:
         assert len(l3_branches) == 3  # 全部存活——不塌成單鏈
         # 假 echo（label 延續）被記錄而非丟棄
         assert any("層間 label 延續" in n for n in result["echo_notes"])
+
+
+# ---------------------------------------------------------------------------
+# 13. T18 手動逐層觸發（probe_tree_manual / probe_expand_layer / 生成器）
+# ---------------------------------------------------------------------------
+
+class TestProbeTreeManual:
+    def test_manual_basic_two_layers(self):
+        # 兩層、on_layer 每次選第一條 → 樹能建、層數正確
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+        seen = []
+
+        def on_layer(layer_entry, ctx):
+            seen.append(layer_entry["layer"])
+            return layer_entry["branches"][0]
+
+        result = probe_tree_manual(
+            SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, on_layer=on_layer
+        )
+        assert seen == [1, 2]
+        assert len(calls) == 2  # 每層 1 call（成本錨定）
+        assert result["meta"]["calls"] == 2
+        assert result["meta"]["manual"] is True
+        assert "stopped_at_layer" not in result["meta"]
+        tree = result["trees"][0]
+        assert len(tree["layers"]) == 2
+        assert all(len(le["branches"]) == 3 for le in tree["layers"])
+        # 單父反射下，未選的 L1 分支成為葉 → 路徑 = 3（L2 子）+ 2（L1 葉）= 5
+        assert len(tree["paths"]) == 5
+
+    def test_manual_reflect_on_single_parent(self):
+        # 人選方向後，下一層 payload 的 reflection 只有 1 個父（打破 1:1 續鏈）
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+
+        def on_layer(layer_entry, ctx):
+            return layer_entry["branches"][0]  # 「動員令凍結」
+
+        result = probe_tree_manual(
+            SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, on_layer=on_layer
+        )
+        payload2 = json.loads(calls[1].split("\n[task:tree_generate]")[0])
+        refs = payload2["reflection"]["passed_branches"]
+        assert len(refs) == 1  # 不是全部 passed——只有人選的那 1 條
+        assert refs[0]["label"] == "動員令凍結"
+        assert payload2["reflection"]["layer"] == 1
+        # 一個父展開多子：3 個 L2 分支全掛在「動員令凍結」下 → avg_children > 1
+        tree = result["trees"][0]
+        l1 = {b["label"]: b for b in tree["layers"][0]["branches"]}
+        assert len(l1["動員令凍結"]["children"]) == 3
+        assert tree["meta"]["avg_children_per_parent"] == pytest.approx(3.0, abs=1e-3)
+
+    def test_manual_select_different_branch_injected(self):
+        # 選不同分支 → 下一層 payload 的反射對象不同（驗證注入機制）
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+
+        def on_layer(layer_entry, ctx):
+            return layer_entry["branches"][1]  # 「地方調撥自主」
+
+        probe_tree_manual(
+            SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, on_layer=on_layer
+        )
+        payload2 = json.loads(calls[1].split("\n[task:tree_generate]")[0])
+        assert [b["label"] for b in payload2["reflection"]["passed_branches"]] == [
+            "地方調撥自主"
+        ]
+
+    def test_manual_stop_early(self):
+        # on_layer 回傳 None → 樹停在該層
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+
+        def on_layer(layer_entry, ctx):
+            return None
+
+        result = probe_tree_manual(
+            SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, on_layer=on_layer
+        )
+        assert len(calls) == 1  # 只呼叫了第一層
+        assert result["meta"]["stopped_at_layer"] == 1
+        assert result["meta"]["calls"] == 1
+        tree = result["trees"][0]
+        assert len(tree["layers"]) == 1
+        assert tree["meta"]["calls"] == 1
+
+    def test_manual_invalid_chosen_raises(self):
+        # on_layer 回傳不在本層的分支 → TreeProbeError
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2])
+
+        def on_layer(layer_entry, ctx):
+            return {"label": "不存在的分支"}
+
+        with pytest.raises(TreeProbeError):
+            probe_tree_manual(
+                SITUATION, n_branch=3, depth=2, gate_fn=mock_gate, on_layer=on_layer
+            )
+
+    def test_manual_auto_mode_equals_probe_tree(self):
+        # 向後相容：on_layer=None（自動）與 probe_tree 單樹結果等價
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        auto = probe_tree(SITUATION, n_branch=3, depth=3, gate_fn=mock_gate)
+        mock_gate2, _ = make_mock_gate([LAYER_1, LAYER_2, LAYER_3])
+        manual = probe_tree_manual(
+            SITUATION, n_branch=3, depth=3, gate_fn=mock_gate2
+        )
+        assert auto["trees"][0] == manual["trees"][0]
+        assert auto["prevalence"] == manual["prevalence"]
+        assert auto["rigidity_map"] == manual["rigidity_map"]
+        assert "manual" not in manual["meta"]
+
+    def test_manual_validation(self):
+        # 校驗與 probe_tree 相同
+        mock_gate, _ = make_mock_gate([LAYER_1])
+        with pytest.raises(ValueError):
+            probe_tree_manual(SITUATION, n_branch=0, depth=2, gate_fn=mock_gate)
+        with pytest.raises(ValueError):
+            probe_tree_manual(SITUATION, n_branch=3, depth=5, gate_fn=mock_gate)
+        with pytest.raises(ValueError):
+            probe_tree_manual(SITUATION, n_branch=3, depth=2, w=3.0, gate_fn=mock_gate)
+
+
+class TestGenerateOneTreeIter:
+    def test_generator_direct_yield_and_send(self):
+        # 直接驅動生成器：yield 層序正確；send([人選]) 注入下一層 reflect_on
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+        gen = _generate_one_tree_iter(
+            SITUATION, None, n_branch=3, depth=2, w=0.5, gate_fn=mock_gate,
+            api_key="", model="m", max_tokens=100, temperature=0.6,
+            situation_labels=None,
+        )
+        k1, le1, state1, passed1 = next(gen)
+        assert k1 == 1
+        assert [b["label"] for b in le1["branches"]] == [
+            "動員令凍結", "地方調撥自主", "國際調停介入",
+        ]
+        assert state1["calls"] == 1
+        # 注入 [人選那條] = 「動員令凍結」
+        chosen = next(b for b in passed1 if b["label"] == "動員令凍結")
+        k2, le2, state2, passed2 = gen.send([chosen])
+        assert k2 == 2
+        assert state2["calls"] == 2
+        assert state2["layers"] == [le1, le2]
+        payload2 = json.loads(calls[1].split("\n[task:tree_generate]")[0])
+        assert [b["label"] for b in payload2["reflection"]["passed_branches"]] == [
+            "動員令凍結"
+        ]
+        # 耗盡
+        with pytest.raises(StopIteration):
+            gen.send(None)
+
+    def test_generator_send_none_auto(self):
+        # send(None) → 自動續接全部 passed（向後相容模擬）
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+        gen = _generate_one_tree_iter(
+            SITUATION, None, n_branch=3, depth=2, w=0.5, gate_fn=mock_gate,
+            api_key="", model="m", max_tokens=100, temperature=0.6,
+            situation_labels=None,
+        )
+        next(gen)
+        gen.send(None)  # 自動模式：下一層 reflect_on = passed（3 父）
+        payload2 = json.loads(calls[1].split("\n[task:tree_generate]")[0])
+        assert len(payload2["reflection"]["passed_branches"]) == 3
+
+
+class TestProbeExpandLayer:
+    def test_expand_layer_stepwise(self):
+        # 首次 → layer 1；帶 state + reflect_on=[人選那條] → layer 2；每步恰 1 call
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+        r1 = probe_expand_layer(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        assert r1["layer_entry"]["layer"] == 1
+        assert len(r1["state"]["layers"]) == 1
+        assert r1["calls"] == 1
+        assert len(calls) == 1
+        # 無反射對象 → 第一層 payload 無 reflection
+        payload1 = json.loads(calls[0].split("\n[task:tree_generate]")[0])
+        assert "reflection" not in payload1
+
+        chosen = r1["layer_entry"]["branches"][0]  # 「動員令凍結」
+        r2 = probe_expand_layer(
+            SITUATION, state=r1["state"], reflect_on=[chosen], gate_fn=mock_gate
+        )
+        assert r2["layer_entry"]["layer"] == 2
+        assert len(r2["state"]["layers"]) == 2
+        assert r2["calls"] == 1
+        assert len(calls) == 2
+        tree = r2["tree"]
+        assert len(tree["layers"]) == 2
+        # 下一層 payload 的 reflection 只有 1 個父
+        payload2 = json.loads(calls[1].split("\n[task:tree_generate]")[0])
+        assert [b["label"] for b in payload2["reflection"]["passed_branches"]] == [
+            "動員令凍結"
+        ]
+
+    def test_expand_layer_result_consumable_by_probe_select(self):
+        # expand 的 result 可被 probe_select 消費（T19 收束接縫）
+        mock_gate, _ = make_mock_gate([LAYER_1])
+        r1 = probe_expand_layer(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        sel = probe_select(r1["result"], selected_label="動員令凍結", verdict="selected")
+        assert sel["collapse"]["selected"] == "動員令凍結"
+        assert set(sel["collapse"]["unselected"]) == {"地方調撥自主", "國際調停介入"}
+
+    def test_expand_layer_beyond_depth_raises(self):
+        # 已達 max depth 後再展開 → TreeProbeError
+        mock_gate, _ = make_mock_gate([LAYER_1, LAYER_2])
+        r1 = probe_expand_layer(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        r2 = probe_expand_layer(
+            SITUATION, state=r1["state"],
+            reflect_on=[r1["layer_entry"]["branches"][0]], gate_fn=mock_gate,
+        )
+        with pytest.raises(TreeProbeError):
+            probe_expand_layer(
+                SITUATION, state=r2["state"],
+                reflect_on=[r2["layer_entry"]["branches"][0]], gate_fn=mock_gate,
+            )
+
+    def test_expand_layer_reflect_on_foreign_branch_raises(self):
+        # reflect_on 含非上一層分支 → TreeProbeError（T18 防禦，gate 呼叫前攔截）
+        mock_gate, calls = make_mock_gate([LAYER_1])
+        r1 = probe_expand_layer(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        foreign = valid_branch("不存在於上一層的分支")
+        with pytest.raises(TreeProbeError, match="reflect_on 分支不屬於上一層"):
+            probe_expand_layer(
+                SITUATION, state=r1["state"],
+                reflect_on=[foreign], gate_fn=mock_gate,
+            )
+        assert len(calls) == 1  # 防禦在第二層 gate 呼叫前攔截，mock 未被消費
+
+    def test_expand_layer_reflect_on_from_prev_layer_ok(self):
+        # reflect_on 全屬上一層 → 正常展開（多父可並存）
+        mock_gate, calls = make_mock_gate([LAYER_1, LAYER_2])
+        r1 = probe_expand_layer(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        parents = r1["layer_entry"]["branches"][:2]  # 上一層兩條 passed
+        r2 = probe_expand_layer(
+            SITUATION, state=r1["state"], reflect_on=parents, gate_fn=mock_gate,
+        )
+        assert r2["layer_entry"]["layer"] == 2
+        assert len(calls) == 2
+        payload2 = json.loads(calls[1].split("\n[task:tree_generate]")[0])
+        assert [b["label"] for b in payload2["reflection"]["passed_branches"]] == [
+            b["label"] for b in parents
+        ]
+
+    def test_expand_layer_first_call_with_reflect_on_raises(self):
+        # 首次呼叫（無上一層）帶非空 reflect_on → TreeProbeError（不能有「父」）
+        mock_gate, calls = make_mock_gate([])
+        with pytest.raises(TreeProbeError, match="reflect_on 分支不屬於上一層"):
+            probe_expand_layer(
+                SITUATION, n_branch=3, depth=2,
+                reflect_on=[valid_branch("任意分支")], gate_fn=mock_gate,
+            )
+        assert len(calls) == 0  # 防禦攔截，gate 從未被呼叫
+
+    def test_expand_layer_first_call_no_reflect_on_ok(self):
+        # 首次呼叫 reflect_on=None → 正常（首層從處境展開）
+        mock_gate, calls = make_mock_gate([LAYER_1])
+        r1 = probe_expand_layer(SITUATION, n_branch=3, depth=2, gate_fn=mock_gate)
+        assert r1["layer_entry"]["layer"] == 1
+        assert len(calls) == 1
+        payload1 = json.loads(calls[0].split("\n[task:tree_generate]")[0])
+        assert "reflection" not in payload1
