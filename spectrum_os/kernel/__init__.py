@@ -32,6 +32,11 @@ class OSC:
         return verify
 
     @property
+    def forces(self):
+        from . import forces
+        return forces
+
+    @property
     def quantum(self):
         from .. import quantum
         return quantum

@@ -185,6 +185,13 @@ class ActorCard:
     field_coordinates: dict
     internal_tensions: list[dict]
     temporal_states: dict
+    # Optional R/C initial force ratio seeds (force-model-social-dynamics.md §7.2).
+    # None = unset (backward compatible); when set they must be non-negative.
+    revolutionary_force: float | None = None
+    conservative_force: float | None = None
+    # Optional latent (potential) revolutionary force P_R,₀ seed (§2.2b reservoir).
+    # None = unset ≡ 0 (backward compatible); when set must be non-negative.
+    latent_force: float | None = None
     meta: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -192,6 +199,13 @@ class ActorCard:
             raise ValueError("ActorCard actor_id cannot be empty")
         if not self.internal_tensions:
             raise ValueError("ActorCard internal_tensions cannot be empty")
+        for label, val in (
+            ("revolutionary_force", self.revolutionary_force),
+            ("conservative_force", self.conservative_force),
+            ("latent_force", self.latent_force),
+        ):
+            if val is not None and val < 0:
+                raise ValueError(f"ActorCard {label} must be non-negative, got {val}")
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict; nested values (internal_tensions etc.) pass through."""
@@ -202,6 +216,9 @@ class ActorCard:
             "field_coordinates": self.field_coordinates,
             "internal_tensions": self.internal_tensions,
             "temporal_states": self.temporal_states,
+            "revolutionary_force": self.revolutionary_force,
+            "conservative_force": self.conservative_force,
+            "latent_force": self.latent_force,
             "meta": self.meta,
         }
 
