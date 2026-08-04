@@ -448,6 +448,27 @@ class ForceFieldDynamics:
         mod_b = np.array([max(float(fn(tt)), 0.0) for fn in self._mod_beta], dtype=np.float64)
         return self._alpha0 * mod_a, self._beta0 * mod_b
 
+    def set_modulation(
+        self,
+        mod_alpha: Callable | list[Callable] | None = None,
+        mod_beta: Callable | list[Callable] | None = None,
+    ) -> "ForceFieldDynamics":
+        """公開設定外部場調製器（取代現行 mod）；None 保持現值。
+
+        契約同建構子：``callable(t)`` 或 length-``n`` callable 清單。供編排器
+        （如 ``synth.round_loop``）經公開接口注入人選決策——不需訪問私有屬性。
+        α_eff = α⁰·mod_α(t)、β_eff = β⁰·mod_β(t)。回傳 self 以便鏈式呼叫。
+        """
+        if mod_alpha is not None:
+            self._mod_alpha = self._resolve_mods(mod_alpha, self._n, "mod_alpha")
+        if mod_beta is not None:
+            self._mod_beta = self._resolve_mods(mod_beta, self._n, "mod_beta")
+        return self
+
+    def current_modulation(self) -> tuple[list[Callable], list[Callable]]:
+        """回傳現行外部場調製器（length-``n`` callable 清單副本，供查詢/編排）。"""
+        return list(self._mod_alpha), list(self._mod_beta)
+
     # ------------------------------------------------------------------
     # Core observables
     # ------------------------------------------------------------------
