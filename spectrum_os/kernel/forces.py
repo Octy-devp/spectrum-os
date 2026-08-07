@@ -9,7 +9,7 @@ revolution), run to its deterministic end.
 Core equations (§2.2 + §2.2b — the equations are the SSOT, see sign convention):
 
     dR_i/dt = a_i·R_i − β_i·C_i + λ_i·P_R,i − μ_i·R_i   (+ coupling, §2.6)
-    dP_R,i/dt = μ_i·R_i − λ_i·P_R,i − ρ_i·P_R,i
+    dP_R,i/dt = β_i·C_i + μ_i·R_i − λ_i·P_R,i − ρ_i·P_R,i
     dC_i/dt = c_i·C_i − α_i·R_i                         (+ coupling, §2.6)
 
     S_i(t) = R_i / (R_i + C_i) ∈ [0, 1]   (social content = resultant, §2.3)
@@ -162,6 +162,15 @@ class ForceFieldDynamics:
     ``T = R + P_R`` is the total transformative capacity (conservation H₀);
     ``tension = f(R·C)`` is the conflict intensity.
 
+    v1.6: C's suppression compresses R into the reservoir (βC → P_R) rather
+    than destroying it — total capacity T = R + P_R is conserved under pressure,
+    so a suppressed transformative force can revive (1905→1917 shape). Growth
+    and release rates may be substrate-supplied feedbacks of the universal
+    observables: ``a(S,T)`` / ``c(S,T)`` (bandwagon/desertion + fatigue,
+    §2.3b/§2.4b) and ``λ(T)`` (tension-gated reservoir opening, §2.4b). All
+    world-agnostic — the *form* is supplied by the substrate, the structure is
+    universal.
+
     Parameters
     ----------
     revolutionary_force, conservative_force
@@ -174,10 +183,14 @@ class ForceFieldDynamics:
         Base suppression efficiencies α⁰ᵢ (R against C) and β⁰ᵢ (C against R).
         Non-negative. These are the values the external field modulates.
     mu, lam, rho
-        P_R reservoir rates (§2.2b) — compression μ (kinetic R → latent P_R),
-        release λ (P_R → R under external-field modulation / C-cracks), decay ρ
-        (genuinely forgotten history). Scalar or length-``n``; default 0
-        (reservoir disabled ⇒ v1.0 behaviour, backward compatible).
+        P_R reservoir rates (§2.2b) — compression μ (spontaneous kinetic R →
+        latent P_R), release λ (P_R → R under external-field modulation /
+        C-cracks / high tension), decay ρ (genuinely forgotten history).
+        Scalar or length-``n``; default 0 (reservoir disabled ⇒ v1.0 behaviour,
+        backward compatible). When the reservoir is active (any of μ/λ/ρ or
+        latent_force non-zero), C's suppression also compresses R into P_R
+        (βC → P_R, v1.6) — suppression transfers rather than destroys, so
+        total capacity T = R + P_R is conserved under pressure.
     latent_force
         Initial latent potential P_R,₀ — scalar or length-``n``; ``None`` ≡ 0.
         Default 0 (reservoir off).
@@ -200,6 +213,18 @@ class ForceFieldDynamics:
         node) or a length-``n`` list of callables. Default None ≡ identity
         (``mod ≡ 1``). Effective rates are ``α⁰·mod_α(t)``, ``β⁰·mod_beta(t)``,
         clamped to non-negative (a suppression efficiency cannot go negative).
+    growth_r_fn, growth_c_fn
+        Optional substrate-supplied growth-rate feedbacks (§2.3b/§2.4b):
+        ``fn(S, T) -> per-node multiplier`` on the base rates a, c — the
+        bandwagon/desertion and fatigue channels. World-agnostic: the *form*
+        (monotonic in S, etc.) is a historical proposition supplied by the
+        substrate; None (default) ≡ constant base rate. Multipliers clamped
+        non-negative.
+    release_fn
+        Optional substrate-supplied release-rate feedback (§2.4b):
+        ``fn(T) -> per-node multiplier`` on the base release rate λ — the
+        tension-gated opening of the P_R reservoir (high tension → latent force
+        activates). None (default) ≡ constant λ.
     tension_fn
         ``f`` for §2.4 ``tension = f(R·C)``; default ``numpy.sqrt``
         (geometric-mean intensity, monotonic in the product). Must map
@@ -237,6 +262,9 @@ class ForceFieldDynamics:
         panic_exponent: float = 0.0,
         mod_alpha: Callable | list[Callable] | None = None,
         mod_beta: Callable | list[Callable] | None = None,
+        growth_r_fn: Callable | None = None,
+        growth_c_fn: Callable | None = None,
+        release_fn: Callable | None = None,
         tension_fn: Callable | None = None,
         method: str = "rk4",
         dt: float = 1.0,
@@ -265,6 +293,8 @@ class ForceFieldDynamics:
 
         self._a = _broadcast(growth_r, n, "growth_r")
         self._c = _broadcast(growth_c, n, "growth_c")
+        self._a_fn = growth_r_fn
+        self._c_fn = growth_c_fn
         self._alpha0 = _broadcast(alpha, n, "alpha")
         self._beta0 = _broadcast(beta, n, "beta")
 
@@ -287,6 +317,14 @@ class ForceFieldDynamics:
             raise ValueError(
                 f"latent_force must be non-negative, got {self._P0.tolist()}"
             )
+        self._lam_fn = release_fn
+        # v1.6: the βC → P_R compression channel is active only when the
+        # reservoir is in use (any compression/release/decay rate or initial
+        # latent force set). Reservoir off ⇒ v1.0 behaviour (P inert).
+        self._reservoir_active = bool(
+            np.any(self._mu) or np.any(self._lam) or np.any(self._rho)
+            or np.any(self._P0)
+        )
 
         kappas = self._resolve_kappa(kappa, n)
         self._kappa_RR = kappas["RR"]
@@ -534,7 +572,7 @@ class ForceFieldDynamics:
         into α/β at time ``t``:
 
             dR = a·R − β_eff·C + λ·P − μ·R + κ_RR(R_j−R_i) + κ_CR(C_j−C_i)
-            dP = μ·R − λ·P − ρ·P
+            dP = β_eff·C + μ·R − λ·P − ρ·P
             dC = c·C − α_eff·R + κ_CC(C_j−C_i) + κ_RC(R_j−R_i)·R_j^p
 
         where ``p = panic_exponent`` (0 ⇒ the κ_RC term is linear). Defaults to
@@ -545,9 +583,32 @@ class ForceFieldDynamics:
         P_arr = self._P if P is None else _as_float_array(P, "P")
         alpha_eff, beta_eff = self.effective_rates(t)
 
-        dR = self._a * R_arr - beta_eff * C_arr + self._lam * P_arr - self._mu * R_arr
-        dC = self._c * C_arr - alpha_eff * R_arr
-        dP = self._mu * R_arr - (self._lam + self._rho) * P_arr
+        # v1.6 substrate-supplied feedbacks (§2.3b/§2.4b), expressed purely in
+        # the universal observables: a(S,T), c(S,T) (bandwagon/desertion +
+        # fatigue) and λ(T) (tension-gated reservoir opening). None ≡ constant.
+        S_arr = self.s(R_arr, C_arr)
+        T_arr = self.tension(R_arr, C_arr)
+
+        def _mult(fn: Callable | None, *args: np.ndarray) -> np.ndarray:
+            if fn is None:
+                return np.ones_like(args[0])
+            m = np.asarray(fn(*args), dtype=np.float64)
+            if m.ndim == 0:
+                m = np.full(args[0].shape, float(m))
+            return np.maximum(np.broadcast_to(m, args[0].shape), 0.0)
+
+        a_eff = self._a * _mult(self._a_fn, S_arr, T_arr)
+        c_eff = self._c * _mult(self._c_fn, S_arr, T_arr)
+        lam_eff = self._lam * _mult(self._lam_fn, T_arr)
+
+        dR = a_eff * R_arr - beta_eff * C_arr + lam_eff * P_arr - self._mu * R_arr
+        dC = c_eff * C_arr - alpha_eff * R_arr
+        # v1.6: C's suppression compresses R into P_R (βC → P_R) instead of
+        # destroying it — total capacity T = R + P_R conserved under pressure
+        # (§2.2b). Applies only when the reservoir is active.
+        dP = self._mu * R_arr - (lam_eff + self._rho) * P_arr
+        if self._reservoir_active:
+            dP = dP + beta_eff * C_arr
 
         # Same-force diffusion: solidarity (RR) and coordination (CC).
         if np.any(self._kappa_RR):

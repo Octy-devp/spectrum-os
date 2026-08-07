@@ -172,10 +172,13 @@ class TestRevival1905To1917:
         r_trough = float(np.min(R[: i1 + 1]))
 
         # release signature: immediately after the field change P falls while R
-        # rises (P_R is being converted back into kinetic R).
+        # rises (P_R is being converted back into kinetic R). v1.6 conservation
+        # keeps R smouldering during the crush (capacity stored in P_R), so the
+        # trough is higher than v1.3's pure-destruction trough — the revival
+        # threshold is relaxed to 1.5× (R roughly doubles across the release).
         i2 = np.argmin(np.abs(t - 40.0))
         assert P[i2] < P[i1]
-        assert R[i2] > R[i1] * 2.0
+        assert R[i2] > R[i1] * 1.5
 
         # R revives to a clearly positive level well above the trough
         assert R[-1] > 2.0 * r_trough
@@ -183,19 +186,23 @@ class TestRevival1905To1917:
         # and the resultant flips back toward the revolutionary side
         assert S[-1] > 0.8
 
-    def test_persistent_repression_without_field_change_stays_dead(self):
-        """No external-field modulation ⇒ no λ release ⇒ R stays dead.
+    def test_persistent_repression_no_spontaneous_revolution(self):
+        """No external-field modulation ⇒ no *completed* revolution.
 
-        This is the counterfactual that makes the claim precise: the reservoir
-        preserves capacity across repression, but the *release* is triggered by
-        the external field (1917). Without the field change the revolution does
-        not spontaneously revive — so "not permanently killed" is a conditional
-        truth, not an automatic one.
+        v1.6 conservation: C's suppression compresses R into P_R — capacity
+        T = R + P_R is preserved, not destroyed — so R *smoulders* (kinetic
+        capacity persists) rather than dying to zero. But without the field
+        change the resultant S stays C-dominated (< 0.5): the revolution does
+        not spontaneously complete. "Not permanently killed" is conditional on
+        the world (external field / 1917), not automatic — the 一國社會主義
+        boundary discipline.
         """
         eng = _revival_engine(field_change=False)
         traj = eng.run(200.0)
-        assert float(traj.R[-1, 0]) < 0.01
-        assert float(traj.S[-1, 0]) < 0.05
+        # capacity preserved under repression (not destroyed by βC)
+        assert traj.T[-1, 0] > 5.0
+        # ...but no spontaneous revolution: C dominates at the end
+        assert traj.S[-1, 0] < 0.5
 
     def test_revival_requires_reservoir(self):
         """Without μ/λ/ρ the same field change never produces the crush→memory
