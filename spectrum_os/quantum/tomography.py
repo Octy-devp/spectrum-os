@@ -52,6 +52,39 @@ def kl_divergence(p: dict[str, float], q: dict[str, float],
     return float(np.sum(pv * np.log(pv / qv)))
 
 
+def distribution_shift(p: dict[str, float], q: dict[str, float],
+                       eps: float = 1e-12) -> dict:
+    """Per-component shift contributions between two arbitrary distributions.
+
+    Role-agnostic counterpart of :func:`kl_divergence` (which is typed over
+    the DCA ``ROLES`` support and silently mismatches arbitrary keys — keys
+    outside ``roles`` are floored to ``eps``, yielding a spurious near-zero
+    divergence).  Accepts any key→weight mappings and reports the
+    direction-aware breakdown of a distributional migration: for each key,
+    ``p·ln(p/q)`` with the new state measured against the old baseline.
+
+    Returns
+    -------
+    dict with keys ``contributions`` (per-key signed p·ln(p/q)),
+    ``total_forward`` (KL(p‖q) in nats), ``total_reverse`` (KL(q‖p)), and
+    ``jeffreys`` (forward + reverse — the symmetric migration magnitude).
+    Zero-probability entries are floored at ``eps``.
+    """
+    keys = sorted(set(p) | set(q))
+    contributions = {}
+    total_reverse = 0.0
+    for k in keys:
+        pv = max(float(p.get(k, 0.0)), eps)
+        qv = max(float(q.get(k, 0.0)), eps)
+        contributions[k] = float(pv * np.log(pv / qv))
+        total_reverse += float(qv * np.log(qv / pv))
+    total_forward = float(sum(contributions.values()))
+    return {"contributions": contributions,
+            "total_forward": total_forward,
+            "total_reverse": total_reverse,
+            "jeffreys": total_forward + total_reverse}
+
+
 def role_entropy(distribution: dict[str, float]) -> tuple[float, float]:
     """Shannon entropy (nats) of a role distribution, and its [0, 1] normalisation."""
     p = np.array([distribution.get(r, 0.0) for r in ROLES], dtype=np.float64)

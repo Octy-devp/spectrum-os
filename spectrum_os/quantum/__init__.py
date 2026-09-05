@@ -13,7 +13,7 @@ from .multigraph import (
     load_knowledge_edges,
     load_warfare_tree,
 )
-from .tomography import kl_divergence, role_entropy, tomography
+from .tomography import distribution_shift, kl_divergence, role_entropy, tomography
 from .decoherence import decoherence_watch
 from .entangle import entangle, intervene
 from .vector import (
@@ -87,5 +87,6 @@ __all__ = [
     "entropy_rate",
     "spectral_gap",
     "summarize_samples",
+    "distribution_shift",
 ]
 
