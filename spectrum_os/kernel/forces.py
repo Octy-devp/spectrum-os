@@ -1,6 +1,7 @@
 """Spectrum OS Kernel — R/C counterforce field engine (social dynamics first theorem).
 
-Methodology: ECC ``docs/method/force-model-social-dynamics.md`` (v1.3, 2026-08-04).
+Methodology: the project's force-model note
+``docs/method/force-model-social-dynamics.md`` (v1.3, 2026-08-04).
 Constitutional-level, worldline-agnostic spec: any society's "content" is not a
 statistically pre-measurable label — it is the resultant vector S(t) of its
 internal transformative force R (revolution) vs inertial force C (counter-
@@ -89,17 +90,23 @@ _FAST_T_EPS = 1e-9       # time tolerance for seasonal operator-split boundaries
 _PHI_MIN = 0.0           # Φ is a conductance share ∈ [0, 1]
 _PHI_MAX = 1.0
 
-# Provenance tags for every fast-channel parameter (v5.0 ECC discipline — a
-# parameter without a tag is a fabricated number). See THEORY-LEDGER §「完整
-# 動態方程組」 (2026-09-08 agy):
+# Provenance tags for every fast-channel parameter (a parameter without a tag is
+# a fabricated number — the discipline is world-agnostic; the *world* decides
+# which tag its own numbers deserve):
 #   CALIBRATED       — anchored to measured / canon data
 #   EXPERIMENTAL     — declared target value, awaiting falsification
 #   DERIVED_PROXY    — derived from other quantities; no direct measurement
 #   SCENARIO         — a documented scenario choice, not a measurement
+#   SUBSTRATE        — supplied by the world as a callable; not a kernel number
 _FAST_PROVENANCE: dict[str, str] = {
     "phi0": "SCENARIO",
-    "co_share": "MEASURED",
-    "debt_stress": "DERIVED_PROXY",
+    "phi_drive": "SUBSTRATE_INPUT",      # world supplies intensity (scalar/array/callable)
+    "phi_suppress": "SUBSTRATE_INPUT",   # world supplies back-pressure intensity
+    "phi_drive_fn": "SUBSTRATE",
+    "phi_suppress_fn": "SUBSTRATE",
+    "k_inflow_fn": "SUBSTRATE",
+    "k_decay_fn": "SUBSTRATE",
+    "c_source_fn": "SUBSTRATE",
     "kappa_phi": "EXPERIMENTAL",
     "zeta_phi": "DERIVED_PROXY",
     "delta": "DERIVED_PROXY",
@@ -111,7 +118,7 @@ _FAST_PROVENANCE: dict[str, str] = {
     "kappa_c": "DERIVED_PROXY",
     "gamma_c": "DERIVED_PROXY",
     "alpha_rc": "[THEORY-LEDGER minimal patch 2026-09-10, UNCALIBRATED]",
-    "sigma_soviet": "SCENARIO",
+    "sigma_admin": "SCENARIO",
     "k0": "SCENARIO",
     "gamma_k": "DERIVED_PROXY",
     "clamp_spring": "EXPERIMENTAL",
@@ -134,6 +141,28 @@ _FAST_PROVENANCE: dict[str, str] = {
     "p_pool0": "[MORPHOLOGY 2026-09-10, SCENARIO]",
     "p_dist0": "[MORPHOLOGY 2026-09-10, SCENARIO]",
 }
+
+
+def _driver_value(slot: Any, fn: Callable | None, t: float, ctx: dict,
+                  like: np.ndarray, name: str) -> np.ndarray:
+    """Resolve a substrate driver slot to a per-node array.
+
+    ``fn`` (when given) takes precedence over ``slot``. A callable is called as
+    ``fn(t, ctx)`` where ``ctx`` carries the universal observables
+    (``R, C, P, Phi, K, S, T``) — the world supplies *intensity*, the kernel owns
+    the structure. Scalars are broadcast; results are clamped non-negative
+    (all four driver slots are magnitudes).
+    """
+    value = fn if fn is not None else slot
+    if callable(value):
+        value = value(t, ctx)
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = np.full(like.shape, float(arr))
+    arr = np.broadcast_to(arr, like.shape)
+    if np.any(arr < 0):
+        raise ValueError(f"substrate driver {name} returned a negative value")
+    return arr
 
 
 def _as_float_array(value: Any, name: str) -> np.ndarray:
@@ -257,47 +286,74 @@ class ForceTrajectory:
 class FastChannelConfig:
     """Opt-in parameters for the 5-D fast/slow state vector.
 
-    Source of truth: ECC THEORY-LEDGER §「完整動態方程組」 (2026-09-08 agy 裁定). This is NOT a redesign — it is the
-    ledger's ODE system, operationalised. The state vector becomes
+    World-agnostic. The kernel owns the *structure* of the fast channel; the
+    world supplies its *form* through the substrate inputs below — exactly the
+    v1.6 convention (``growth_r_fn`` / ``release_fn`` / ``tension_fn``) extended
+    to the fast variables. The state vector becomes
 
         x(t) = (R, C, P_R, Φ, K) ∈ ℝ⁵
 
-    with the ledger's ODE block (2/3-D is exactly the legacy engine; this block
-    is only integrated when :class:`ForceFieldDynamics` is built with
-    ``fast_channel=<this>``):
+    2/3-D is exactly the legacy engine; this block is only integrated when
+    :class:`ForceFieldDynamics` is built with ``fast_channel=<this>``:
 
-        dR/dt   = a·R − δ·R + Φ·μ_F·R + (1−η)·λ·P_R − β·C
-        dC/dt   = κ_C·(1−Φ) − α_rc·R·C − γ_C·σ_soviet·C
-        dP_R/dt = S_in·R − λ·P_R − η·μ_E·P_R
-        dΦ/dt   = κ_Φ·CoopShare·(1−Φ) − ζ_Φ·DebtStress·Φ
-        dK/dt   = η·μ_E·P_R − γ_K·K
+        dR/dt   = a·R − δ·R + Φ·μ_F·R + (1−η)·λ·P_pool − β·C
+        dC/dt   = [c_eff·C + κ_C·(1−Φ)] − α_rc·R·C − γ_C·σ·C
+        dP_R/dt = S_in·R − λ·P_pool − η·μ_E·P_pool − J_dissolve + β·C
+        dΦ/dt   = κ_Φ·drive·(1−Φ) − ζ_Φ·suppress·Φ
+        dK/dt   = inflow − γ_K·K
+
+    C's source is bracketed because BOTH forces have internal growth
+    (GENERAL-PRINCIPLES §5): ``c_eff·C`` is institutional self-reproduction,
+    modulated by the substrate ``growth_c_fn`` (§2.3b); ``κ_C·(1−Φ)`` is the
+    additive blockage source. Either may be replaced wholesale by
+    ``c_source_fn``.
+
+    The ``−β·C`` (R) and ``+β·C`` (P_R) are ONE transfer, not a loss plus a
+    source: repression compresses kinetic force into latent potential
+    (T = R + P_R conserved under pressure, §2.2b/v1.6). This is why a crushed
+    movement can revive — the Canton Commune 1927 and 1905→1917 both require it.
+    ``λ`` is substrate-gated on tension (``release_fn``, §2.4b).
+
+    Substrate inputs (the kernel never names a world concept):
+    - ``phi_drive`` / ``phi_suppress`` — the two intensities of the generic
+      logistic Φ law. Scalar, per-node array, **or callable**
+      ``fn(t, ctx) -> per-node intensity`` where ``ctx`` carries the universal
+      observables (``R, C, P, Phi, K, S, T``). A world that wants "conductivity
+      rises with one substrate intensity and falls with another"
+      supplies those *intensities*; the kernel only knows the logistic form.
+    - ``k_inflow_fn`` / ``k_decay_fn`` — optional overrides of the default
+      ``η·μ_E·P_pool`` inflow and ``γ_K·K`` decay, same callable signature.
+    - ``c_source_fn`` — optional override of C's whole source law. Default:
+      ``growth_c·mult(growth_c_fn, S, T)·C + κ_C·(1−Φ)`` — institutional
+      self-reproduction (GENERAL-PRINCIPLES §5: both forces grow internally,
+      §2.3b supplies the form) plus the additive blockage source.
 
     Notes / interpretations (declared, not silent):
     - ``a`` and ``β`` are taken from the base engine (``growth_r`` / ``beta``),
       so the §2.5 external-field modulation still applies to β. ``β``'s friction
-      term is ``β·C`` (the ledger's ``βCR`` read through the module's §2.2 sign
-      convention and the ledger's own stability criterion ``βC*``).
+      term is ``β·C``.
     - Only the fast/slow channels above are integrated in this mode; the legacy
-      4-quadrant κ coupling / substrate feedback fns are a legacy-path feature.
+      4-quadrant κ coupling is a legacy-path feature.
     - Φ is a conductance share ∈ [0, 1] and is clamped to that range.
 
-    Seasonal operator splitting (ledger's 混合算子分裂): the continuous ODE is
-    interrupted at ``year_period·spring_phase`` (春耕鉗) and
-    ``year_period·autumn_phase`` (秋收兌現):
+    Seasonal operator splitting: the continuous ODE is interrupted at
+    ``year_period·spring_phase`` and ``year_period·autumn_phase``:
 
         spring: R ← R · (1 − (1−Φ)·Clamp_spring)
         autumn: R ← R + Yield·Φ·ReflowPurity ;  P_R ← P_R + SurplusGain
 
-    Every parameter below is tagged with a provenance label (see
-    :meth:`provenance`); untagged numbers are forbidden by ECC discipline.
+    Every numeric parameter below is tagged with a provenance label (see
+    :meth:`provenance`); untagged numbers are forbidden.
     """
 
-    # ── Φ fast variable ────────────────────────────────────────────────
+    # ── Φ fast variable: kernel owns the logistic form, world owns drive/suppress
     phi0: Any = 0.65                 # [SCENARIO] initial circulation conductivity
-    co_share: Any = 0.65             # [MEASURED] CoopShare driver (rlo/coop share)
-    debt_stress: Any = 0.5           # [DERIVED_PROXY] DebtStress back-pressure
-    kappa_phi: Any = 1.5             # [EXPERIMENTAL] logistic drive κ_Φ (ledger)
-    zeta_phi: Any = 1.0              # [DERIVED_PROXY] usury back-pressure ζ_Φ
+    phi_drive: Any = 0.65            # [SUBSTRATE_INPUT] Φ logistic drive intensity
+    phi_suppress: Any = 0.5          # [SUBSTRATE_INPUT] Φ back-pressure intensity
+    phi_drive_fn: Callable | None = None     # [SUBSTRATE] fn(t, ctx) -> drive
+    phi_suppress_fn: Callable | None = None  # [SUBSTRATE] fn(t, ctx) -> suppress
+    kappa_phi: Any = 1.5             # [EXPERIMENTAL] logistic drive κ_Φ
+    zeta_phi: Any = 1.0              # [DERIVED_PROXY] back-pressure ζ_Φ
     # ── R equation ─────────────────────────────────────────────────────
     delta: Any = 0.0                 # [DERIVED_PROXY] δ — autonomous R decay
     mu_f: Any = 0.12                 # [EXPERIMENTAL] Φ monetisation μ_F (ledger)
@@ -308,6 +364,19 @@ class FastChannelConfig:
     mu_e: Any = 0.0                  # [DERIVED_PROXY] μ_E — P_R → K extraction
     k0: Any = 0.0                    # [SCENARIO] initial alienated-capital pool
     gamma_k: Any = 0.0               # [DERIVED_PROXY] γ_K — K depreciation
+    # Optional substrate overrides for the K channel (default: η·μ_E·P_pool in,
+    # γ_K·K out). A world whose alienation-inflow law differs from the kernel's
+    # default — e.g. inflow proportional to a *release* rate rather than to the
+    # extraction parameter — supplies it here instead of forking the kernel.
+    k_inflow_fn: Callable | None = None   # [SUBSTRATE] fn(t, ctx) -> inflow
+    k_decay_fn: Callable | None = None    # [SUBSTRATE] fn(t, ctx) -> decay
+    # ── C equation source law ──────────────────────────────────────────
+    # Constitutional (GENERAL-PRINCIPLES §5): BOTH forces have internal growth
+    # — C reproduces itself (institutional reproduction) at ``c_eff = growth_c·
+    # mult(growth_c_fn, S, T)``, the §2.3b avalanche/desertion feedback. The
+    # blockage source κ_C·(1−Φ) is kept additively (the ledger's term). A world
+    # may replace the whole law via ``c_source_fn``.
+    c_source_fn: Callable | None = None   # [SUBSTRATE] fn(t, ctx) -> source
     # ── C equation ─────────────────────────────────────────────────────
     kappa_c: Any = 0.0               # [DERIVED_PROXY] κ_C — friction source (1−Φ)
     gamma_c: Any = 0.0               # [DERIVED_PROXY] γ_C — friction dissipation
@@ -315,15 +384,16 @@ class FastChannelConfig:
     # the force-model v1.6 "R suppresses C" channel (dC/dt = cC − αR) inside the
     # ledger's C equation as the bilinear −α_rc·R·C. Bilinear (not linear −αR)
     # keeps C ≥ 0 a repelling boundary of the flow (no constant forcing from R),
-    # and matches the "RLO = the organ that eliminates AE" adjudication. Default
-    # 0.1: (i) at the engine's operating point R ~ O(1) the added dissipation
-    # α_rc·R ≈ γ_C·σ_soviet = 0.10 — a same-order, non-dominant correction
+    # and matches the adjudication that the friction-eliminating organ acts by
+    # *contact* (the patch is what raises the effective contact surface).
+    # Default 0.1: (i) at the engine's operating point R ~ O(1) the added
+    # dissipation α_rc·R ≈ γ_C·σ = 0.10 — a same-order, non-dominant correction
     # (perturbative until calibrated); (ii) matching v1.6's linear −α·R at the
-    # friction-neutral reference C_ref ≈ 0.4 with the almanac α = 0.05 gives
+    # friction-neutral reference C_ref ≈ 0.4 with a base suppression α = 0.05 gives
     # α_rc = α/C_ref ≈ 0.12 — the same O(0.1). UNCALIBRATED: calibrate against
-    # RLO-elimination events before treating the value as measured.
+    # observed friction-elimination events before treating the value as measured.
     alpha_rc: Any = 0.1              # [UNCALIBRATED] α_rc — R·C contact-surface suppression
-    sigma_soviet: Any = 1.0          # [SCENARIO] σ_soviet — soviet effectiveness
+    sigma_admin: Any = 1.0           # [SCENARIO] σ — institutional effectiveness on friction dissipation
     # ── mixed operator splitting (seasonal jumps) ──────────────────────
     year_period: float = 1.0         # [SCENARIO] seasonal period (years)
     spring_phase: float = 0.25       # [DERIVED_PROXY] 春耕鉗 phase within the year
@@ -375,6 +445,27 @@ class FastChannelConfig:
         return max(0.0, 1.0 - float(self.mu_cef) - float(self.mu_sri))
 
     def __post_init__(self) -> None:
+        # Substrate driver slots accept scalar | per-node array | callable. A
+        # callable is evaluated against the universal observables at each RHS
+        # evaluation; anything else must be a non-negative real.
+        for name, val in (("phi_drive", self.phi_drive),
+                          ("phi_suppress", self.phi_suppress),
+                          ("phi_drive_fn", self.phi_drive_fn),
+                          ("phi_suppress_fn", self.phi_suppress_fn),
+                          ("k_inflow_fn", self.k_inflow_fn),
+                          ("k_decay_fn", self.k_decay_fn),
+                          ("c_source_fn", self.c_source_fn)):
+            if val is None or callable(val):
+                continue
+            try:
+                arr = np.asarray(val, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{name} must be a real, an array-like, or a callable; "
+                    f"got {type(val).__name__} ({exc})"
+                ) from exc
+            if np.any(arr < 0):
+                raise ValueError(f"{name} must be non-negative, got {val!r}")
         for name, val in (("year_period", self.year_period),
                           ("spring_phase", self.spring_phase),
                           ("autumn_phase", self.autumn_phase)):
@@ -735,6 +826,12 @@ class ForceFieldDynamics:
         def _b(name: str, value: Any) -> np.ndarray:
             return _broadcast(value, n, f"fast_channel.{name}")
 
+        def _driver(name: str, value: Any) -> Any:
+            """Broadcast a driver slot — callables pass through untouched."""
+            if callable(value):
+                return value
+            return _b(name, value)
+
         self._mu_f = _b("mu_f", cfg.mu_f)
         self._lam5 = _b("lam", cfg.lam)
         self._mu_cef = _b("mu_cef", cfg.mu_cef)
@@ -744,8 +841,13 @@ class ForceFieldDynamics:
         self._t_c_p = _b("t_c_p", cfg.t_c_p)
         self._t_c_k = _b("t_c_k", cfg.t_c_k)
         self._fc = {
-            "co_share": _b("co_share", cfg.co_share),
-            "debt_stress": _b("debt_stress", cfg.debt_stress),
+            "phi_drive": _driver("phi_drive", cfg.phi_drive),
+            "phi_suppress": _driver("phi_suppress", cfg.phi_suppress),
+            "phi_drive_fn": cfg.phi_drive_fn,
+            "phi_suppress_fn": cfg.phi_suppress_fn,
+            "k_inflow_fn": cfg.k_inflow_fn,
+            "k_decay_fn": cfg.k_decay_fn,
+            "c_source_fn": cfg.c_source_fn,
             "kappa_phi": _b("kappa_phi", cfg.kappa_phi),
             "zeta_phi": _b("zeta_phi", cfg.zeta_phi),
             "delta": _b("delta", cfg.delta),
@@ -757,7 +859,7 @@ class ForceFieldDynamics:
             "kappa_c": _b("kappa_c", cfg.kappa_c),
             "gamma_c": _b("gamma_c", cfg.gamma_c),
             "alpha_rc": _b("alpha_rc", cfg.alpha_rc),
-            "sigma_soviet": _b("sigma_soviet", cfg.sigma_soviet),
+            "sigma_admin": _b("sigma_admin", cfg.sigma_admin),
             "gamma_k": _b("gamma_k", cfg.gamma_k),
             "clamp_spring": _b("clamp_spring", cfg.clamp_spring),
             "autumn_yield": _b("autumn_yield", cfg.autumn_yield),
@@ -771,26 +873,51 @@ class ForceFieldDynamics:
             "t_c_k": self._t_c_k,
         }
 
-        nonneg = ("co_share", "debt_stress", "kappa_phi", "zeta_phi", "delta",
+        nonneg = ("kappa_phi", "zeta_phi", "delta",
                   "mu_f", "lam", "s_in", "mu_e", "kappa_c", "gamma_c",
                   "alpha_rc",
                   "gamma_k", "clamp_spring", "autumn_yield", "reflow_purity",
                   "surplus_gain", "mu_cef", "mu_sri", "rho", "t_c_phi", "t_c_p", "t_c_k")
+
+        # 🔴 No silent shadowing: the engine constructor and FastChannelConfig
+        # both carry a `lam`. The 5-D RHS reads the config's, so an engine-level
+        # `lam` that disagrees would be accepted and quietly ignored — the exact
+        # failure class this project keeps paying for (a caller sets a parameter,
+        # reads exit code 0, and gets different physics than configured).
+        # Both set and equal ⇒ fine (the consumer's normal case, 0.15 / 0.15).
+        # Engine unset (0) ⇒ fine, the config's λ governs the 5-D path alone.
+        # Both set and different ⇒ loud error, the caller must pick one.
+        _cfg_lam = self._fc["lam"]
+        if isinstance(self._lam, np.ndarray) and isinstance(_cfg_lam, np.ndarray):
+            _conflict = (np.any(self._lam != 0.0)
+                         & np.any(np.abs(self._lam - _cfg_lam) > 1e-12))
+        else:
+            _conflict = False
+        if _conflict:
+            raise ValueError(
+                "ambiguous lambda: ForceFieldDynamics(lam=...) disagrees with "
+                "fast_channel.lam. The 5-D RHS reads the config's λ (with the "
+                "engine's release_fn as its tension gate), so the constructor's "
+                "value would be silently ignored. Set them equal, or set the "
+                "engine's lam to 0 if the config's should govern alone."
+            )
+
         for name in nonneg:
-            if np.any(self._fc[name] < 0):
+            val = self._fc[name]
+            if isinstance(val, np.ndarray) and np.any(val < 0):
                 raise ValueError(
                     f"fast_channel.{name} must be non-negative, "
-                    f"got {self._fc[name].tolist()}"
+                    f"got {val.tolist()}"
                 )
         eta = self._fc["eta"]
         if np.any(eta < 0) or np.any(eta > 1):
             raise ValueError(
                 f"fast_channel.eta must be in [0, 1], got {eta.tolist()}"
             )
-        if np.any(self._fc["sigma_soviet"] <= 0):
+        if np.any(self._fc["sigma_admin"] <= 0):
             raise ValueError(
-                "fast_channel.sigma_soviet must be positive, "
-                f"got {self._fc['sigma_soviet'].tolist()}"
+                "fast_channel.sigma_admin must be positive, "
+                f"got {self._fc['sigma_admin'].tolist()}"
             )
 
         phi0 = _b("phi0", cfg.phi0)
@@ -1207,6 +1334,10 @@ class ForceFieldDynamics:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """7-component RHS tracking P_R morphology: ``(dR, dC, dP_pool, dP_dist, dΦ, dK, dM)``.
 
+        Includes the §2.2b/v1.6 compression channel (``dP_pool += β_eff·C``,
+        the counterpart of ``dR −= β_eff·C``) so T = R + P_R survives pressure,
+        and the §2.4b tension-gated release (``release_fn``).
+
         Operationalises THEORY-LEDGER (2026-09-10) P_R morphology split:
             P_R = P_pool + P_dist
             P_pool: centralized/concentrated reserve subject to administrative mobilization (lambda)
@@ -1234,22 +1365,65 @@ class ForceFieldDynamics:
         S_arr = self.s(R_arr, C_arr)
         T_arr = self.tension(R_arr, C_arr)
         a_eff = self._a * _apply_multiplier(self._a_fn, S_arr, T_arr)
+        # §2.4b tension-gated reservoir opening (v1.6): the release rate is a
+        # substrate feedback of tension — high tension cracks the reservoir
+        # open; None ⇒ constant. Restored in the 5-D path, which had dropped it
+        # (latent potential could then never be released *by tension*, which is
+        # the whole point of the reservoir).
+        lam_eff = fc["lam"] * _apply_multiplier(self._lam_fn, T_arr)
+
+        # ── Substrate driver context: the universal observables, nothing else ──
+        # Built before any RHS term because every substrate slot is evaluated
+        # against it (Φ drivers, K inflow/decay, C source).
+        ctx = {"R": R_arr, "C": C_arr, "P": Pp_arr, "Phi": Phi_arr,
+               "K": K_arr, "S": S_arr, "T": T_arr}
 
         # Central command mobilization lambda and bureaucratic alienation eta*mu_e
         # draw strictly from P_pool (centralized morphology).
+        # §2.2b spontaneous compression μ: even without C's pressure, part of R
+        # self-organises into latent form (going underground / memorisation).
+        # The 5-D path had dropped it (as it had dropped βC); μ is a
+        # constructor argument and was silently ignored here.
         dR = (a_eff * R_arr - fc["delta"] * R_arr
               + Phi_arr * fc["mu_f"] * R_arr
-              + (1.0 - fc["eta"]) * fc["lam"] * Pp_arr
-              - beta_eff * C_arr)
+              + (1.0 - fc["eta"]) * lam_eff * Pp_arr
+              - beta_eff * C_arr
+              - self._mu * R_arr)
 
-        dC_source = fc["kappa_c"] * (1.0 - Phi_arr)
+        # ── C source law ────────────────────────────────────────────────────
+        # Constitutional (GENERAL-PRINCIPLES §5): BOTH forces have internal
+        # growth. C therefore reproduces itself — institutional reproduction —
+        # at a rate which §2.3b hands to the substrate (growth_c_fn: the
+        # avalanche/desertion channel). The ledger's κ_C·(1−Φ) blockage source
+        # is kept as an ADDITIVE term, not a replacement: friction does not
+        # vanish merely because circulation was repaired while institutions
+        # keep reproducing themselves. A world may replace the whole law via
+        # c_source_fn.
+        c_eff = self._c * _apply_multiplier(self._c_fn, S_arr, T_arr)
+        c_source = c_eff * C_arr + fc["kappa_c"] * (1.0 - Phi_arr)
+        c_source = _driver_value(c_source, fc["c_source_fn"], t, ctx, C_arr,
+                                 "c_source")
         dC_sink = (fc["alpha_rc"] * R_arr * C_arr
-                   + fc["gamma_c"] * fc["sigma_soviet"] * C_arr)
-        dC = dC_source - dC_sink
+                   + fc["gamma_c"] * fc["sigma_admin"] * C_arr)
+        dC = c_source - dC_sink
 
-        dPhi = (fc["kappa_phi"] * fc["co_share"] * (1.0 - Phi_arr)
-                - fc["zeta_phi"] * fc["debt_stress"] * Phi_arr)
-        dK = fc["eta"] * fc["mu_e"] * Pp_arr - fc["gamma_k"] * K_arr
+        drive = _driver_value(fc["phi_drive"], fc["phi_drive_fn"], t, ctx,
+                              Phi_arr, "phi_drive")
+        suppress = _driver_value(fc["phi_suppress"], fc["phi_suppress_fn"], t,
+                                 ctx, Phi_arr, "phi_suppress")
+        dPhi = (fc["kappa_phi"] * drive * (1.0 - Phi_arr)
+                - fc["zeta_phi"] * suppress * Phi_arr)
+
+        # Alienation flow P_pool → K (default η·μ_E·P_pool; substrate may
+        # override the whole law via k_inflow_fn — e.g. a world whose
+        # alienation inflow is proportional to a release rate rather than to
+        # the extraction parameter). One flow, two places: it is the K inflow
+        # AND the P_pool drain, so the two can never drift apart.
+        j_alien = _driver_value(fc["eta"] * fc["mu_e"] * Pp_arr, fc["k_inflow_fn"],
+                                t, ctx, Pp_arr, "k_inflow")
+        k_decay = _driver_value(fc["gamma_k"] * K_arr, fc["k_decay_fn"],
+                                t, ctx, K_arr, "k_decay")
+        dK = j_alien - k_decay
 
         # Morphology dissolution: J_dissolve = k_dissolve * g(M) * P_pool
         # g(M) = M / (M + m_half)
@@ -1257,8 +1431,31 @@ class ForceFieldDynamics:
         g_sat = np.maximum(M_arr, 0.0) / m_denom
         j_dissolve = fc["k_dissolve"] * g_sat * Pp_arr
 
-        # Base pool evolution before digestion flows
-        dPp = fc["s_in"] * R_arr - fc["lam"] * Pp_arr - fc["eta"] * fc["mu_e"] * Pp_arr - j_dissolve
+        # Base pool evolution before digestion flows.
+        # ── §2.2b/v1.6 compression channel: βC → P_R ──────────────────────
+        # The −β_eff·C just removed from R above is the SAME transfer crediting
+        # P_R: repression compresses kinetic force into latent potential rather
+        # than destroying it, so T = R + P_R is conserved under pressure.
+        # Evidence (α history, not narrative): the Canton Commune (Dec 1927) was
+        # crushed in days yet the class forces it disclosed re-emerged by
+        # 1927–49; the 1905 defeat — Stolypin reaction — fed 1917. A suppressed
+        # force must stay latent and remain re-activatable.
+        # Without this term the high-β case decays to a dead-lock attractor and
+        # the revival channel is unrepresentable (v1.6's original defect).
+        # The 5-D path enables it unconditionally: P_pool is a state variable
+        # here, so the reservoir is structurally present.
+        #
+        # The two other §2.2b channels are restored here as well, since the 5-D
+        # RHS had dropped them too:
+        #   +μ·R      — spontaneous compression (§2.2b), the counterpart of
+        #               −μ·R above: one transfer, so T stays conserved.
+        #   −ρ·P_pool — genuinely forgotten history (§2.2b). Declared scope: ρ
+        #               drains the *centralized reserve* only; P_dist is living
+        #               capacity (literacy, mutual aid) that does direct work
+        #               and is not subject to reserve-mobilisation processes.
+        dPp = (fc["s_in"] * R_arr - lam_eff * Pp_arr - j_alien - j_dissolve
+               + beta_eff * C_arr + self._mu * R_arr
+               - self._rho * Pp_arr)
         dPd = j_dissolve
         dM = np.zeros_like(M_arr)
 
@@ -1635,7 +1832,9 @@ class ForceFieldDynamics:
                 "year_period": self._fast.year_period,
                 "spring_phase": self._fast.spring_phase,
                 "autumn_phase": self._fast.autumn_phase,
-                "params": {k: v.tolist() for k, v in self._fc.items()},
+                "params": {k: (v.tolist() if isinstance(v, np.ndarray) else
+                               ("<callable>" if callable(v) else v))
+                           for k, v in self._fc.items()},
             }
         return ForceTrajectory(
             t=times, R=R_hist, C=C_hist, P=P_hist, S=S_hist,
@@ -1672,10 +1871,10 @@ class ForceFieldDynamics:
         - 振盪發散 (seasonal loop gain > 1) — an operational ``[DERIVED_PROXY]``
           proxy for the ledger's qualitative "秋收跳躍增益過大＋春耕鉗滯後".
 
-        Equilibria used: Φ* from the Φ logistic (with the current CoopShare /
-        DebtStress), C* from the C equation (frozen-R quasi-steady state
-        including the −α_rc·R·C contact-surface patch). Only available in the
-        opt-in 5-D mode.
+        Equilibria used: Φ* from the Φ logistic (with the current drive /
+        suppress intensities), C* from the C equation (frozen-R quasi-steady
+        state including the −α_rc·R·C contact-surface patch). Only available in
+        the opt-in 5-D mode.
         """
         if self._fast is None:
             raise RuntimeError(
@@ -1689,8 +1888,15 @@ class ForceFieldDynamics:
         T_arr = self.tension()
         a_eff = self._a * _apply_multiplier(self._a_fn, S_arr, T_arr)
 
-        drive = fc["kappa_phi"] * fc["co_share"]
-        decay = fc["zeta_phi"] * fc["debt_stress"]
+        # Φ* uses the substrate drivers at the current state (a callable driver
+        # is evaluated here, so the quasi-steady point reflects the same law the
+        # integrator sees).
+        _st_ctx = {"R": self._R, "C": self._C, "P": self._P_pool,
+                   "Phi": self._Phi, "K": self._K, "S": S_arr, "T": T_arr}
+        drive = fc["kappa_phi"] * _driver_value(
+            fc["phi_drive"], fc["phi_drive_fn"], self._t, _st_ctx, S_arr, "phi_drive")
+        decay = fc["zeta_phi"] * _driver_value(
+            fc["phi_suppress"], fc["phi_suppress_fn"], self._t, _st_ctx, S_arr, "phi_suppress")
         denom = drive + decay
         phi_star = np.where(denom > 0.0, drive / np.where(denom > 0.0, denom, 1.0), 1.0)
         phi_star = np.clip(phi_star, _PHI_MIN, _PHI_MAX)
@@ -1698,7 +1904,7 @@ class ForceFieldDynamics:
         # C-equation quasi-steady state (frozen-R): the contact-surface patch
         # makes C's total dissipation rate γ_C·σ + α_rc·R, so
         # C* = κ_C·(1−Φ*) / (γ_C·σ + α_rc·R_current).
-        gc_sig = fc["gamma_c"] * fc["sigma_soviet"] + fc["alpha_rc"] * self._R
+        gc_sig = fc["gamma_c"] * fc["sigma_admin"] + fc["alpha_rc"] * self._R
         c_star = np.where(
             gc_sig > 0.0,
             fc["kappa_c"] * (1.0 - phi_star) / np.where(gc_sig > 0.0, gc_sig, 1.0),

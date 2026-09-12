@@ -81,9 +81,9 @@ def _legacy_simple() -> ForceFieldDynamics:
 def _fast(**kw) -> ForceFieldDynamics:
     """A single-node engine in the opt-in 5-D mode (sane defaults)."""
     base = dict(
-        phi0=0.65, co_share=0.65, debt_stress=0.5,
+        phi0=0.65, phi_drive=0.65, phi_suppress=0.5,
         kappa_phi=1.5, zeta_phi=1.0, delta=0.0, mu_f=0.12, eta=0.0, lam=0.15,
-        s_in=0.02, mu_e=0.0, kappa_c=0.05, gamma_c=0.10, sigma_soviet=1.0,
+        s_in=0.02, mu_e=0.0, kappa_c=0.05, gamma_c=0.10, sigma_admin=1.0,
         k0=0.0, gamma_k=0.0, clamp_spring=0.0, autumn_yield=0.0,
         reflow_purity=1.0, surplus_gain=0.0,
     )
@@ -150,7 +150,7 @@ class TestBackwardCompatibility:
 
 class TestOperatorSplitAndState:
     def test_phi_initial_and_bounds_hold(self):
-        eng = _fast(phi0=0.99, co_share=2.0, debt_stress=0.0)
+        eng = _fast(phi0=0.99, phi_drive=2.0, phi_suppress=0.0)
         assert eng.phi is not None and eng.phi[0] == pytest.approx(0.99)
         traj = eng.run(3.0)
         assert np.all(traj.phi >= 0.0) and np.all(traj.phi <= 1.0)
@@ -179,7 +179,7 @@ class TestOperatorSplitAndState:
 
     def test_spring_clamp_immunity_at_phi_one(self):
         """Φ→1 ⇒ the spring clamp is fully immunised (ledger)."""
-        common = dict(phi0=1.0, co_share=1.0, debt_stress=0.0, mu_f=0.0,
+        common = dict(phi0=1.0, phi_drive=1.0, phi_suppress=0.0, mu_f=0.0,
                       s_in=0.0, kappa_c=0.0, gamma_c=0.0, autumn_yield=0.0,
                       surplus_gain=0.0, clamp_spring=1.0)
         eng_clamped = _fast(**common)
@@ -190,14 +190,14 @@ class TestOperatorSplitAndState:
 
     def test_spring_clamp_zeroes_r_at_phi_zero(self):
         """Φ=0 + Clamp_spring=1 ⇒ R is annihilated at the spring boundary."""
-        eng = _fast(phi0=0.0, co_share=0.0, debt_stress=0.0, clamp_spring=1.0)
+        eng = _fast(phi0=0.0, phi_drive=0.0, phi_suppress=0.0, clamp_spring=1.0)
         eng.run(0.25)  # lands exactly on the spring event
         assert float(eng.state[0][0]) == pytest.approx(0.0)
 
     def test_autumn_payout_adds_r_and_p(self):
-        # Φ held exactly at its equilibrium 0.65 (debt_stress=0.525) so the
+        # Φ held exactly at its equilibrium 0.65 (phi_suppress=0.525) so the
         # autumn injection is analytically known.
-        base = dict(phi0=0.65, co_share=0.65, debt_stress=0.525,
+        base = dict(phi0=0.65, phi_drive=0.65, phi_suppress=0.525,
                     mu_f=0.0, s_in=0.0, kappa_c=0.0, gamma_c=0.0,
                     clamp_spring=0.0, surplus_gain=0.0)
         eng_none = _fast(**{**base, "autumn_yield": 0.0})
@@ -206,36 +206,72 @@ class TestOperatorSplitAndState:
         t_pay = eng_pay.run(0.75)
         # Continuous flow is identical; the only delta is the autumn operator.
         assert t_pay.R[-1, 0] == pytest.approx(t_none.R[-1, 0] + 0.05 * 0.65)
-        assert float(t_pay.P[-1, 0]) == pytest.approx(0.02)  # P0=0 ⇒ only SurplusGain
+        assert (float(t_pay.P[-1, 0]) - float(t_none.P[-1, 0])) == pytest.approx(0.02)
 
 
 class TestPhiDynamics:
-    def test_phi_saturates_under_high_coop_share(self):
-        eng = _fast(phi0=0.65, co_share=1.0, debt_stress=0.0)
+    def test_phi_saturates_under_high_drive(self):
+        eng = _fast(phi0=0.65, phi_drive=1.0, phi_suppress=0.0)
         traj = eng.run(5.0)
         assert traj.final_phi() > 0.999
 
-    def test_phi_decays_under_high_debt_stress(self):
-        eng = _fast(phi0=0.65, co_share=0.0, debt_stress=1.0, zeta_phi=1.0)
+    def test_phi_decays_under_high_suppress(self):
+        eng = _fast(phi0=0.65, phi_drive=0.0, phi_suppress=1.0, zeta_phi=1.0)
         traj = eng.run(3.0)
         assert traj.final_phi() < 0.05
         # strictly decreasing
         assert np.all(np.diff(traj.phi[:, 0]) < 0.0)
 
     def test_phi_equilibrium_matches_logistic(self):
-        cfg = FastChannelConfig(phi0=0.1, co_share=0.7, debt_stress=0.2,
+        cfg = FastChannelConfig(phi0=0.1, phi_drive=0.7, phi_suppress=0.2,
                                 kappa_phi=1.5, zeta_phi=1.0)
         eng = ForceFieldDynamics(1.0, 0.5, fast_channel=cfg, dt=0.25)
         phi_star = 1.5 * 0.7 / (1.5 * 0.7 + 1.0 * 0.2)
         final = eng.run(20.0).final_phi()
         assert final == pytest.approx(phi_star, abs=1e-6)
 
+    def test_substrate_driver_callables(self):
+        """Φ drivers may be world-supplied callables (v1.6 substrate pattern)."""
+        seen: list[tuple[float, dict]] = []
+
+        def drive_fn(t, ctx):
+            seen.append((t, ctx))
+            # drive depends on the world observable S — legal, kernel-agnostic
+            return 1.0 * ctx["S"]
+
+        def suppress_fn(t, ctx):
+            return 0.25 * (1.0 - ctx["S"])
+
+        cfg = FastChannelConfig(phi0=0.5, phi_drive_fn=drive_fn,
+                                phi_suppress_fn=suppress_fn, kappa_phi=1.0,
+                                zeta_phi=1.0)
+        eng = ForceFieldDynamics(1.0, 0.5, fast_channel=cfg, dt=0.25)
+        traj = eng.run(1.0)
+        assert seen, "driver callables were never evaluated"
+        # context carries exactly the universal observables
+        assert set(seen[0][1]) == {"R", "C", "P", "Phi", "K", "S", "T"}
+        assert np.all(traj.phi >= 0.0) and np.all(traj.phi <= 1.0)
+
+    def test_scalar_and_callable_driver_agree(self):
+        """A constant callable ≡ the scalar slot (same law, two spellings)."""
+        const = 0.4
+        a = ForceFieldDynamics(
+            1.0, 0.5, dt=0.25,
+            fast_channel=FastChannelConfig(phi0=0.3, phi_drive=const,
+                                           phi_suppress=0.2))
+        b = ForceFieldDynamics(
+            1.0, 0.5, dt=0.25,
+            fast_channel=FastChannelConfig(
+                phi0=0.3, phi_drive_fn=lambda t, ctx: const,
+                phi_suppress_fn=lambda t, ctx: 0.2))
+        assert np.allclose(a.run(3.0).phi, b.run(3.0).phi, rtol=0, atol=0)
+
 
 class TestStabilityCriteria:
     def test_convergent_regime(self):
         """βC* + δ dominates the growth/fast channel → convergent, not escape."""
-        cfg = FastChannelConfig(co_share=0.0, debt_stress=1.0, kappa_c=1.0,
-                                gamma_c=1.0, sigma_soviet=1.0, delta=0.1,
+        cfg = FastChannelConfig(phi_drive=0.0, phi_suppress=1.0, kappa_c=1.0,
+                                gamma_c=1.0, sigma_admin=1.0, delta=0.1,
                                 mu_f=0.0)
         eng = ForceFieldDynamics(1.0, 0.5, growth_r=0.0, beta=0.5,
                                  fast_channel=cfg)
@@ -247,7 +283,7 @@ class TestStabilityCriteria:
 
     def test_supercritical_bifurcation_regime(self):
         """Φ*·μ_F + a − δ > βC* with λ > 0 → escape the poverty trap."""
-        cfg = FastChannelConfig(co_share=1.0, debt_stress=0.0, mu_f=0.5,
+        cfg = FastChannelConfig(phi_drive=1.0, phi_suppress=0.0, mu_f=0.5,
                                 lam=0.15, kappa_c=0.0, gamma_c=0.0)
         eng = ForceFieldDynamics(1.0, 0.5, growth_r=0.05, beta=0.0,
                                  fast_channel=cfg)
@@ -258,7 +294,7 @@ class TestStabilityCriteria:
 
     def test_bifurcation_requires_lambda(self):
         """Zero λ still allows the margin but not the reservoir-release escape."""
-        cfg = FastChannelConfig(co_share=1.0, debt_stress=0.0, mu_f=0.5,
+        cfg = FastChannelConfig(phi_drive=1.0, phi_suppress=0.0, mu_f=0.5,
                                 lam=0.0, kappa_c=0.0, gamma_c=0.0)
         eng = ForceFieldDynamics(1.0, 0.5, growth_r=0.05, beta=0.0,
                                  fast_channel=cfg)
@@ -267,7 +303,7 @@ class TestStabilityCriteria:
         assert v.escape_poverty_trap is False
 
     def test_oscillatory_divergence_triggered(self):
-        cfg = FastChannelConfig(co_share=0.65, debt_stress=0.5, mu_f=0.12,
+        cfg = FastChannelConfig(phi_drive=0.65, phi_suppress=0.5, mu_f=0.12,
                                 clamp_spring=0.5, autumn_yield=2.0,
                                 reflow_purity=1.0)
         eng = ForceFieldDynamics(1.0, 0.5, growth_r=0.02, beta=0.0,
@@ -277,7 +313,7 @@ class TestStabilityCriteria:
         assert np.all(v.seasonal_loop_gain > 1.0)
 
     def test_oscillation_needs_both_clamp_and_yield(self):
-        base = dict(co_share=0.65, debt_stress=0.5, mu_f=0.12)
+        base = dict(phi_drive=0.65, phi_suppress=0.5, mu_f=0.12)
         no_clamp = FastChannelConfig(**base, clamp_spring=0.0, autumn_yield=2.0)
         no_yield = FastChannelConfig(**base, clamp_spring=0.5, autumn_yield=0.0)
         for cfg in (no_clamp, no_yield):
@@ -289,7 +325,7 @@ class TestStabilityCriteria:
 class TestAlienatedCapitalPool:
     def test_k_accumulates_when_eta_positive(self):
         cfg = FastChannelConfig(eta=0.5, mu_e=0.2, s_in=0.05, lam=0.15,
-                                gamma_k=0.0, co_share=0.65, debt_stress=0.5)
+                                gamma_k=0.0, phi_drive=0.65, phi_suppress=0.5)
         eng = ForceFieldDynamics(1.0, 0.5, growth_r=0.02, beta=0.03,
                                  fast_channel=cfg, dt=0.25)
         traj = eng.run(3.0)
@@ -305,13 +341,202 @@ class TestAlienatedCapitalPool:
         assert np.all(np.diff(traj.k_pool[:, 0]) < 0.0)
 
 
+class TestCompressionChannel:
+    """§2.2b/v1.6: repression COMPRESSES force into latent potential — it does
+    not destroy it. βC is one transfer (R → P_R), so T = R + P_R is conserved
+    against it.
+
+    Evidence is α history, and the compression channel exists to represent it:
+    the Canton Commune (Dec 1927) was crushed within days, yet the class forces
+    it laid bare re-emerged in 1927–49; the 1905 defeat (Stolypin reaction) fed
+    1917. Without this channel the high-β case decays to a dead-lock attractor
+    and revival is unrepresentable.
+    """
+
+    def _pressed(self) -> ForceFieldDynamics:
+        """5-D engine with only the suppression/reservoir channels live."""
+        return ForceFieldDynamics(
+            1.0, 1.0, growth_r=0.0, alpha=0.0, beta=0.40, dt=0.25,
+            fast_channel=FastChannelConfig(
+                phi0=0.65, phi_drive=0.0, phi_suppress=0.0,
+                mu_f=0.0, s_in=0.0, kappa_c=0.0, gamma_c=0.0,
+                alpha_rc=0.0, eta=0.0, mu_e=0.0, gamma_k=0.0,
+                delta=0.0, lam=0.15, k_dissolve=0.0,
+            ),
+        )
+
+    def test_bc_is_one_transfer_not_a_loss(self):
+        """dR + dP_R == 0 against the βC term alone (exact conservation)."""
+        eng = self._pressed()
+        # P=0 isolates βC: the λ·P release term (also a transfer) vanishes.
+        dR, _dC, dP, _dPhi, _dK = eng.derivatives_5d(
+            0.0, R=1.0, C=0.9, P=0.0, Phi=0.65, K=0.0)
+        assert float(dR[0]) == pytest.approx(-0.40 * 0.9)
+        assert float(dP[0]) == pytest.approx(+0.40 * 0.9)
+        assert float(dR[0] + dP[0]) == pytest.approx(0.0, abs=1e-12)
+
+    def test_repression_credits_the_reservoir(self):
+        eng = self._pressed()
+        traj = eng.run(4.0)
+        assert traj.R[-1, 0] < traj.R[0, 0]          # kinetic force crushed
+        assert float(eng._P_pool[0]) > 0.0           # ...into latent potential
+
+    def test_suppressed_force_revives_when_pressure_lifts(self):
+        """The 1905→1917 / Canton shape: compress, then release."""
+        eng = self._pressed()
+        eng.run(4.0)
+        R_pressed = float(eng.state[0][0])
+        P_pressed = float(eng._P_pool[0])
+        T_pressed = R_pressed + P_pressed
+
+        eng.set_modulation(mod_beta=lambda t: 0.0)   # pressure lifts
+        eng.run(16.0)
+        R_revived = float(eng.state[0][0])
+        P_left = float(eng._P_pool[0])
+
+        assert R_revived > R_pressed, "latent force must revive"
+        assert P_left < P_pressed, "the reservoir is the source of the revival"
+        # Total capacity survives the whole cycle (a=0, ρ=0, μ_F=0).
+        assert R_revived + P_left == pytest.approx(T_pressed, rel=1e-9)
+
+    def test_compression_is_not_lanchester_destruction(self):
+        """A dead-lock attractor would leave nothing to revive from."""
+        eng = self._pressed()
+        eng.run(4.0)
+        assert float(eng.state[0][0]) == pytest.approx(0.0, abs=1e-9)
+        assert float(eng._P_pool[0]) > 1.0, "capacity is latent, not destroyed"
+
+
+    def test_spontaneous_compression_mu_and_forgetting_rho(self):
+        """§2.2b: μ (self-organisation into latent form) and ρ (genuinely
+        forgotten history) must act in the 5-D path, not only in 3-D.
+
+        μ is one transfer (R → P_pool) so T stays conserved; ρ is the only
+        genuinely dissipative channel. ρ is declared to drain the centralized
+        reserve only — P_dist is living capacity, not idle stock.
+        """
+        def build(mu=0.0, rho=0.0):
+            return ForceFieldDynamics(
+                1.0, 0.5, growth_r=0.0, alpha=0.0, beta=0.0, mu=mu, rho=rho,
+                dt=0.25,
+                fast_channel=FastChannelConfig(
+                    phi0=0.65, phi_drive=0.0, phi_suppress=0.0, mu_f=0.0,
+                    s_in=0.0, kappa_c=0.0, gamma_c=0.0, alpha_rc=0.0,
+                    eta=0.0, mu_e=0.0, gamma_k=0.0, delta=0.0, lam=0.0,
+                    k_dissolve=0.0,
+                ),
+            )
+
+        # μ alone: R compresses into P_pool, T conserved
+        # (derivatives_morphology addresses P_pool/P_dist directly)
+        eng = build(mu=0.05)
+        dR, _dC, dPp, _dPd, _dPhi, _dK, _dM = eng.derivatives_morphology(
+            0.0, R=1.0, C=0.5, P_pool=0.0, P_dist=0.0, Phi=0.65, K=0.0, M=0.0)
+        assert float(dR[0]) == pytest.approx(-0.05)
+        assert float(dPp[0]) == pytest.approx(+0.05)
+        assert float(dR[0] + dPp[0]) == pytest.approx(0.0, abs=1e-12)
+
+        # ρ alone: the pool decays (the one true loss)
+        eng = build(rho=0.10)
+        _dR, _dC, dPp, _dPd, _dPhi, _dK, _dM = eng.derivatives_morphology(
+            0.0, R=0.0, C=0.0, P_pool=0.8, P_dist=0.5, Phi=0.65, K=0.0, M=0.0)
+        assert float(dPp[0]) == pytest.approx(-0.10 * 0.8)
+        assert float(_dPd[0]) == pytest.approx(0.0), "P_dist is not decayed"
+
+        # No ρ, no other action ⇒ a pool built by μ does NOT evaporate
+        eng = build(mu=0.05, rho=0.0)
+        eng.run(4.0)
+        assert float(eng._P_pool[0]) > 0.0
+        assert float(eng.state[0][0]) < 1.0
+
+
+class TestCSelfReproduction:
+    """GENERAL-PRINCIPLES §5 (constitutional): "兩者各有內部增長" — BOTH forces
+    grow internally. C is institutional reproduction, so it must reproduce
+    itself; it is not merely sourced from blocked circulation. §2.3b hands the
+    *form* of that growth to the substrate (``growth_c_fn``).
+
+    The ledger's κ_C·(1−Φ) is kept as an ADDITIVE blockage source: friction does
+    not vanish merely because circulation was repaired while institutions keep
+    reproducing themselves.
+    """
+
+    def _engine(self, *, growth_c=0.05, growth_c_fn=None, c_source_fn=None,
+                kappa_c=0.0, phi0=0.65, alpha_rc=0.0, gamma_c=0.0):
+        """Isolate the C channel: no suppression, no dissipation."""
+        return ForceFieldDynamics(
+            1.0, 0.5, growth_r=0.0, growth_c=growth_c, alpha=0.0, beta=0.0,
+            growth_c_fn=growth_c_fn, dt=0.25,
+            fast_channel=FastChannelConfig(
+                phi0=phi0, phi_drive=0.0, phi_suppress=0.0,
+                kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc,
+                sigma_admin=1.0, mu_f=0.0, s_in=0.0, lam=0.0,
+                eta=0.0, mu_e=0.0, gamma_k=0.0, delta=0.0, k_dissolve=0.0,
+                c_source_fn=c_source_fn,
+            ),
+        )
+
+    def test_c_grows_without_any_blockage(self):
+        """κ_C=0 ⇒ no blockage source, yet C must still grow (constitutional)."""
+        eng = self._engine(growth_c=0.05, kappa_c=0.0)
+        traj = eng.run(3.0)
+        assert traj.C[-1, 0] > traj.C[0, 0]
+        # Nothing else acts on C ⇒ pure exponential: C(3) = 0.5·e^{0.15}
+        assert traj.C[-1, 0] == pytest.approx(0.5 * np.exp(0.05 * 3.0), rel=1e-6)
+
+    def test_growth_c_fn_attaches_in_5d(self):
+        """§2.3b avalanche/desertion feedback must reach the 5-D C equation."""
+        seen: list[tuple[np.ndarray, np.ndarray]] = []
+
+        def avalanche(S, T):
+            seen.append((S, T))
+            return 2.0          # constant multiplier ⇒ c_eff = 2·growth_c
+
+        eng = self._engine(growth_c=0.05, growth_c_fn=avalanche)
+        eng.run(1.0)
+        assert seen, "growth_c_fn was never evaluated in the 5-D path"
+        assert seen[0][0].shape == (1,)     # receives per-node S
+        assert float(eng.state[1][0]) == pytest.approx(0.5 * np.exp(0.1), rel=1e-6)
+
+    def test_blockage_source_is_additive_not_a_replacement(self):
+        """Repairing circulation must not switch institutional growth off."""
+        clean = self._engine(growth_c=0.05, kappa_c=0.0, phi0=0.5)
+        blocked = self._engine(growth_c=0.05, kappa_c=0.4, phi0=0.5)
+        c_clean = clean.run(2.0).C[-1, 0]
+        c_blocked = blocked.run(2.0).C[-1, 0]
+        assert c_blocked > c_clean, "blockage must add to self-reproduction"
+        # ...and self-reproduction alone still grows (Φ fixed, no repair path)
+        assert c_clean > 0.5
+
+    def test_c_source_fn_replaces_the_whole_law(self):
+        """A world may declare its own institutional-reproduction law."""
+        def constant_source(t, ctx):
+            return np.full_like(ctx["C"], 0.4)
+
+        eng = self._engine(growth_c=0.05, c_source_fn=constant_source)
+        eng.run(1.0)
+        # Pure constant influx, self-reproduction suppressed ⇒ C = 0.5 + 0.4t
+        assert float(eng.state[1][0]) == pytest.approx(0.9, rel=1e-6)
+
+    def test_c_source_fn_context_is_the_universal_observables(self):
+        seen: list[dict] = []
+
+        def probe(t, ctx):
+            seen.append(dict(ctx))
+            return np.full_like(ctx["C"], 0.1)
+
+        self._engine(c_source_fn=probe).run(0.5)
+        assert seen
+        assert set(seen[0]) == {"R", "C", "P", "Phi", "K", "S", "T"}
+
+
 class TestFiveDimRHS:
     def test_rhs_matches_hand_computation(self):
         cfg = FastChannelConfig(
-            phi0=0.6, co_share=0.7, debt_stress=0.2, kappa_phi=1.5,
+            phi0=0.6, phi_drive=0.7, phi_suppress=0.2, kappa_phi=1.5,
             zeta_phi=1.0, delta=0.01, mu_f=0.12, eta=0.2, lam=0.15,
             s_in=0.05, mu_e=0.3, kappa_c=0.05, gamma_c=0.1,
-            alpha_rc=0.05, sigma_soviet=1.2, gamma_k=0.4,
+            alpha_rc=0.05, sigma_admin=1.2, gamma_k=0.4,
         )
         eng = ForceFieldDynamics(1.0, 0.5, growth_r=0.02, beta=0.03,
                                  fast_channel=cfg)
@@ -324,7 +549,7 @@ class TestFiveDimRHS:
         assert float(dC[0]) == pytest.approx(
             0.05 * (1 - 0.6) - 0.05 * 1.0 * 0.5 - 0.1 * 1.2 * 0.5)
         assert float(dP[0]) == pytest.approx(
-            0.05 - 0.15 * 0.2 - 0.2 * 0.3 * 0.2)
+            0.05 - 0.15 * 0.2 - 0.2 * 0.3 * 0.2 + 0.03 * 0.5)  # incl. βC → P_R
         assert float(dPhi[0]) == pytest.approx(
             1.5 * 0.7 * (1 - 0.6) - 1.0 * 0.2 * 0.6)
         assert float(dK[0]) == pytest.approx(0.2 * 0.3 * 0.2 - 0.4 * 0.1)
@@ -399,7 +624,7 @@ class TestContactSurfaceSuppression:
     @staticmethod
     def _frozen_r_engine(r0, alpha_rc=0.1, dt=0.05, **cfg_kw):
         """Engine with R frozen (a=δ=μ_F=β=0, no P_R inflow) so dC is analytic."""
-        base = dict(kappa_c=0.0, gamma_c=0.10, sigma_soviet=1.0, mu_f=0.0,
+        base = dict(kappa_c=0.0, gamma_c=0.10, sigma_admin=1.0, mu_f=0.0,
                     s_in=0.0, lam=0.15, clamp_spring=0.0, autumn_yield=0.0)
         base.update(cfg_kw)
         return ForceFieldDynamics(
@@ -433,7 +658,7 @@ class TestContactSurfaceSuppression:
         """C* = κ_C(1−Φ*)/(γ_C·σ + α_rc·R) with R frozen; bounded, no divergence."""
         r0 = 1.0
         eng = self._frozen_r_engine(
-            r0, kappa_c=0.05, co_share=0.65, debt_stress=0.5,
+            r0, kappa_c=0.05, phi_drive=0.65, phi_suppress=0.5,
             kappa_phi=1.5, zeta_phi=1.0)
         traj = eng.run(60.0)
         phi_star = 1.5 * 0.65 / (1.5 * 0.65 + 1.0 * 0.5)

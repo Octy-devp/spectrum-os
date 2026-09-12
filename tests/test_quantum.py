@@ -15,6 +15,7 @@ from spectrum_os.quantum import (
     ROLES,
     RoleMultigraph,
     decoherence_watch,
+    distribution_shift,
     kl_divergence,
     load_knowledge_edges,
     load_warfare_tree,
@@ -108,6 +109,52 @@ def test_kl_divergence_hand_computed():
     uniform = {r: 0.25 for r in ROLES}
     assert kl_divergence(p, uniform) == pytest.approx(LN2)
     assert kl_divergence(uniform, uniform) == pytest.approx(0.0)
+
+
+def test_distribution_shift_identical_arbitrary_keys():
+    p = {"communal": 0.4, "hierarchical": 0.35, "dispersed": 0.25}
+    q = {"communal": 0.4, "hierarchical": 0.35, "dispersed": 0.25}
+    res = distribution_shift(p, q)
+    assert res["total_forward"] == pytest.approx(0.0)
+    assert res["total_reverse"] == pytest.approx(0.0)
+    assert res["jeffreys"] == pytest.approx(0.0)
+    for k in p:
+        assert res["contributions"][k] == pytest.approx(0.0)
+
+
+def test_distribution_shift_contributions_sum_and_jeffreys():
+    p = {"communal": 0.5, "hierarchical": 0.3, "dispersed": 0.2}
+    q = {"communal": 0.2, "hierarchical": 0.5, "dispersed": 0.3}
+    fwd = distribution_shift(p, q)
+    rev = distribution_shift(q, p)
+    assert sum(fwd["contributions"].values()) == pytest.approx(fwd["total_forward"])
+    assert sum(rev["contributions"].values()) == pytest.approx(fwd["total_reverse"])
+    assert rev["total_forward"] == pytest.approx(fwd["total_reverse"])
+    assert fwd["jeffreys"] == pytest.approx(fwd["total_forward"] + fwd["total_reverse"])
+    assert rev["jeffreys"] == pytest.approx(fwd["jeffreys"])
+
+
+def test_distribution_shift_key_union_and_finite_single_sided():
+    p = {"communal": 0.6, "alpha_only": 0.4}
+    q = {"communal": 0.5, "beta_only": 0.5}
+    res = distribution_shift(p, q)
+    assert set(res["contributions"].keys()) == {"communal", "alpha_only", "beta_only"}
+    assert "alpha_only" in res["contributions"]
+    assert "beta_only" in res["contributions"]
+    assert all(math.isfinite(v) for v in res["contributions"].values())
+    assert math.isfinite(res["total_forward"])
+    assert math.isfinite(res["total_reverse"])
+    assert math.isfinite(res["jeffreys"])
+
+
+def test_distribution_shift_does_not_mutate_inputs():
+    p_orig = {"communal": 0.6, "alpha_only": 0.4}
+    q_orig = {"communal": 0.5, "beta_only": 0.5}
+    p = dict(p_orig)
+    q = dict(q_orig)
+    distribution_shift(p, q)
+    assert p == p_orig
+    assert q == q_orig
 
 
 def test_role_entropy_values():
