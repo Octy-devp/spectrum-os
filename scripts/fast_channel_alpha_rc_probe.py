@@ -9,7 +9,7 @@ reports the C(t) trajectory's end state and stability:
 
   * counterfactual base arm (no intervention): R0 = NMP+SRI+CEF, C0 = AE+gov-risk,
     friction-neutral κ_C,i = C0_i·γ_C/(1−Φ0) (C stationary at 1917 when α_rc=0),
-    co_share/debt_stress = harness base (Φ* ≈ 0.65), RK4, dt=0.25, horizon 3y
+    phi_drive/phi_suppress = harness base (Φ* ≈ 0.65), RK4, dt=0.25, horizon 3y
     (1917→1920, identical recipe to fast_channel_dnspv_harness.py);
   * per sweep: C(1y/2y/3y) means, analytic frozen-R quasi-steady state
     C* = κ_C·(1−Φ*)/(γ_C·σ + α_rc·R), min/max C, negative/NaN counts.
@@ -36,12 +36,12 @@ def run_arm(r0, c0, alpha_rc, dt, horizon):
     fp = h.FAST_PARAMS
     kappa_c = c0 * fp["gamma_c"] / (1.0 - fp["phi0"])
     cfg = h.FastChannelConfig(
-        phi0=fp["phi0"], co_share=h.CO_SHARE_BASE,
-        debt_stress=h.DEBT_STRESS_BASE, kappa_phi=fp["kappa_phi"],
+        phi0=fp["phi0"], phi_drive=h.PHI_DRIVE_BASE,
+        phi_suppress=h.PHI_SUPPRESS_BASE, kappa_phi=fp["kappa_phi"],
         zeta_phi=fp["zeta_phi"], delta=fp["delta"], mu_f=fp["mu_f"],
         eta=fp["eta"], lam=fp["lam"], s_in=fp["s_in"], mu_e=fp["mu_e"],
         kappa_c=kappa_c, gamma_c=fp["gamma_c"], alpha_rc=alpha_rc,
-        sigma_soviet=fp["sigma_soviet"], gamma_k=fp["gamma_k"],
+        sigma_admin=fp["sigma_admin"], gamma_k=fp["gamma_k"],
         clamp_spring=fp["clamp_spring"], autumn_yield=fp["autumn_yield"],
         reflow_purity=fp["reflow_purity"], surplus_gain=fp["surplus_gain"],
     )
@@ -76,14 +76,14 @@ def main(argv=None):
         return 2
     R0, C0 = d["R0"], d["C0"]
     fp = h.FAST_PARAMS
-    drive = fp["kappa_phi"] * h.CO_SHARE_BASE
-    decay = fp["zeta_phi"] * h.DEBT_STRESS_BASE
+    drive = fp["kappa_phi"] * h.PHI_DRIVE_BASE
+    decay = fp["zeta_phi"] * h.PHI_SUPPRESS_BASE
     phi_star = drive / (drive + decay)
 
     print(f"[data] source={d['source']} nodes={len(d['names'])} "
           f"horizon={args.horizon}y dt={args.dt} (base period 1917→1920, no intervention)")
-    print(f"[params] γ_C={fp['gamma_c']} σ={fp['sigma_soviet']} Φ0={fp['phi0']} "
-          f"Φ*={phi_star:.4f} co_share={h.CO_SHARE_BASE} debt_stress={h.DEBT_STRESS_BASE}")
+    print(f"[params] γ_C={fp['gamma_c']} σ={fp['sigma_admin']} Φ0={fp['phi0']} "
+          f"Φ*={phi_star:.4f} phi_drive={h.PHI_DRIVE_BASE} phi_suppress={h.PHI_SUPPRESS_BASE}")
     print(f"[base] mean R0={R0.mean():.4f} mean C0={C0.mean():.4f} "
           f"(friction-neutral κ_C ⇒ C stationary at α_rc=0)")
     hdr = (f"  {'α_rc':>5} {'C(1y)':>8} {'C(2y)':>8} {'C(3y)':>8} {'C*analytic':>10} "
@@ -96,7 +96,7 @@ def main(argv=None):
         idx = {1.0: int(round(1.0 / args.dt)), 2.0: int(round(2.0 / args.dt)),
                3.0: len(t) - 1}
         c_star = float(np.mean(kappa_c * (1.0 - phi_star)
-                               / (fp["gamma_c"] * fp["sigma_soviet"]
+                               / (fp["gamma_c"] * fp["sigma_admin"]
                                   + a_rc * R[-1])))
         neg = int(np.sum(C < 0.0))
         nan = int(np.sum(~np.isfinite(C)))

@@ -84,7 +84,7 @@ FAST_PARAMS = dict(
     gamma_k=0.0,          # [DERIVED_PROXY] inert at η=0
     gamma_c=0.10,         # [DERIVED_PROXY] friction dissipation
     alpha_rc=0.1,         # [UNCALIBRATED] THEORY-LEDGER minimal patch 2026-09-10
-    sigma_soviet=1.0,     # [SCENARIO] full soviet effectiveness
+    sigma_admin=1.0,      # [SCENARIO] full institutional effectiveness
     clamp_spring=0.0,     # [EXPERIMENTAL] unspecified → 0 in the spec-anchored core
     autumn_yield=0.0,     # [EXPERIMENTAL] unspecified → 0 in the spec-anchored core
     reflow_purity=1.0,    # [DERIVED_PROXY]
@@ -92,10 +92,10 @@ FAST_PARAMS = dict(
 )
 # Φ scenario: baseline Φ*≈0.65 (measured mean rlo_share as CoopShare); cooperative
 # entry drives the intervention Φ*→0.9066 (ledger target 0.90).
-CO_SHARE_BASE = 0.297     # [MEASURED] mean rlo_share (dkk-aggregate-1917.json)
-DEBT_STRESS_BASE = 0.24   # [DERIVED_PROXY] calibrated so Φ*≈0.65
-CO_SHARE_IV = 0.647       # [SCENARIO] cooperative entry
-DEBT_STRESS_IV = 0.10     # [DERIVED_PROXY] usury back-pressure collapses
+PHI_DRIVE_BASE = 0.297     # [MEASURED] mean rlo_share (dkk-aggregate-1917.json)
+PHI_SUPPRESS_BASE = 0.24   # [DERIVED_PROXY] calibrated so Φ*≈0.65
+PHI_DRIVE_IV = 0.647       # [SCENARIO] cooperative entry
+PHI_SUPPRESS_IV = 0.10     # [DERIVED_PROXY] usury back-pressure collapses
 
 PROVENANCE = {
     "legacy_params": "PARAMS of project-almanac-dynamics.py [CALIBRATED]",
@@ -109,12 +109,12 @@ PROVENANCE = {
     "gamma_c": "DERIVED_PROXY (γ_C=0.10)",
     "alpha_rc": "UNCALIBRATED (THEORY-LEDGER minimal patch 2026-09-10; α_rc=0.1, O(0.1) argument)",
     "kappa_c": "DERIVED_PROXY (per-node κ_C=C0·γ_C/(1−Φ0), friction-neutral)",
-    "sigma_soviet": "SCENARIO (σ_soviet=1.0)",
+    "sigma_admin": "SCENARIO (σ_admin=1.0)",
     "phi0": "SCENARIO (Φ0=0.65)",
-    "co_share_base": "MEASURED (mean rlo_share=0.297)",
-    "debt_stress_base": "DERIVED_PROXY (0.24 → Φ*=0.65)",
-    "co_share_iv": "SCENARIO (0.647 → Φ*=0.9066, ledger target 0.90)",
-    "debt_stress_iv": "DERIVED_PROXY (0.10)",
+    "phi_drive_base": "MEASURED (mean rlo_share=0.297)",
+    "phi_suppress_base": "DERIVED_PROXY (0.24 → Φ*=0.65)",
+    "phi_drive_iv": "SCENARIO (0.647 → Φ*=0.9066, ledger target 0.90)",
+    "phi_suppress_iv": "DERIVED_PROXY (0.10)",
     "clamp_spring": "EXPERIMENTAL (unspecified; 0 in spec-anchored core)",
     "autumn_yield": "EXPERIMENTAL (unspecified; 0 in spec-anchored core)",
 }
@@ -188,18 +188,18 @@ def _run_legacy(R0: np.ndarray, C0: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return eng._R.copy(), eng._C.copy()
 
 
-def _run_fast(R0: np.ndarray, C0: np.ndarray, co_share: float,
-              debt_stress: float, *, kappa_c: np.ndarray,
+def _run_fast(R0: np.ndarray, C0: np.ndarray, phi_drive: float,
+              phi_suppress: float, *, kappa_c: np.ndarray,
               clamp_spring: float = 0.0, autumn_yield: float = 0.0,
               mu_f: float = FAST_PARAMS["mu_f"]) -> tuple[np.ndarray, np.ndarray, float, float]:
     cfg = FastChannelConfig(
-        phi0=FAST_PARAMS["phi0"], co_share=co_share, debt_stress=debt_stress,
+        phi0=FAST_PARAMS["phi0"], phi_drive=phi_drive, phi_suppress=phi_suppress,
         kappa_phi=FAST_PARAMS["kappa_phi"], zeta_phi=FAST_PARAMS["zeta_phi"],
         delta=FAST_PARAMS["delta"], mu_f=mu_f, eta=FAST_PARAMS["eta"],
         lam=FAST_PARAMS["lam"], s_in=FAST_PARAMS["s_in"],
         mu_e=FAST_PARAMS["mu_e"], kappa_c=kappa_c,
         gamma_c=FAST_PARAMS["gamma_c"], alpha_rc=FAST_PARAMS["alpha_rc"],
-        sigma_soviet=FAST_PARAMS["sigma_soviet"],
+        sigma_admin=FAST_PARAMS["sigma_admin"],
         gamma_k=FAST_PARAMS["gamma_k"], clamp_spring=clamp_spring,
         autumn_yield=autumn_yield, reflow_purity=FAST_PARAMS["reflow_purity"],
         surplus_gain=FAST_PARAMS["surplus_gain"],
@@ -248,16 +248,16 @@ def measure(d: dict, *, fscale: float = 1.0, clamp_spring: float = 0.0,
     # fast arm (friction-neutral κ_C per node)
     kappa_c = fscale * C0 * FAST_PARAMS["gamma_c"] / (1.0 - FAST_PARAMS["phi0"])
     Rc2, Cc2, phi_cf_final, phi_cf_mean = _run_fast(
-        R0, C0, CO_SHARE_BASE, DEBT_STRESS_BASE, kappa_c=kappa_c,
+        R0, C0, PHI_DRIVE_BASE, PHI_SUPPRESS_BASE, kappa_c=kappa_c,
         clamp_spring=clamp_spring, autumn_yield=autumn_yield, mu_f=mu_f)
     Ri2, Ci2, phi_iv_final, phi_iv_mean = _run_fast(
-        R_iv0, C_iv0, CO_SHARE_IV, DEBT_STRESS_IV,
+        R_iv0, C_iv0, PHI_DRIVE_IV, PHI_SUPPRESS_IV,
         kappa_c=kappa_c, clamp_spring=clamp_spring, autumn_yield=autumn_yield,
         mu_f=mu_f)
     fast = _delta(d, Ri2, Ci2, Rc2, Cc2)
 
     # fast channel alone (same initial conditions, no boost/AE cut)
-    R3, C3, _, _ = _run_fast(R0, C0, CO_SHARE_IV, DEBT_STRESS_IV,
+    R3, C3, _, _ = _run_fast(R0, C0, PHI_DRIVE_IV, PHI_SUPPRESS_IV,
                              kappa_c=kappa_c, clamp_spring=clamp_spring,
                              autumn_yield=autumn_yield, mu_f=mu_f)
     fast_only_delta = _nspv_project(d["nspv0"], d["s0"], R3, C3) - fast["aggregate_NSPV_cf"]
@@ -279,8 +279,8 @@ def measure(d: dict, *, fscale: float = 1.0, clamp_spring: float = 0.0,
         "params": {
             "fscale_kappa_c": fscale, "clamp_spring": clamp_spring,
             "autumn_yield": autumn_yield, "mu_f": mu_f,
-            "co_share_base": CO_SHARE_BASE, "debt_stress_base": DEBT_STRESS_BASE,
-            "co_share_iv": CO_SHARE_IV, "debt_stress_iv": DEBT_STRESS_IV,
+            "phi_drive_base": PHI_DRIVE_BASE, "phi_suppress_base": PHI_SUPPRESS_BASE,
+            "phi_drive_iv": PHI_DRIVE_IV, "phi_suppress_iv": PHI_SUPPRESS_IV,
             **FAST_PARAMS,
         },
     }

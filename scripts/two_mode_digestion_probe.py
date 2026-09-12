@@ -118,17 +118,17 @@ def run_scenario(nodes: list[dict], mode: str, dt: float = DT, horizon: float = 
     phi0 = 0.65
     gamma_c = 0.10
     kappa_c = C0 * gamma_c / (1.0 - phi0)
-    debt_stress = 0.24
+    phi_suppress = 0.24
     alpha_rc = 0.10 if mode != "failure" else 0.0
 
     steps = int(round(horizon / dt))
 
     if mode == "digestion":
         cfg = FastChannelConfig(
-            phi0=phi0, co_share=rlo, debt_stress=debt_stress,
+            phi0=phi0, phi_drive=rlo, phi_suppress=phi_suppress,
             kappa_phi=1.5, zeta_phi=1.0, delta=0.0, mu_f=0.12,
             eta=0.0, lam=0.15, s_in=0.02, mu_e=0.0, gamma_k=0.0,
-            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_soviet=1.0,
+            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_admin=1.0,
             mu_cef=0.5, mu_sri=0.3, rho=0.2,
             t_c_phi=1.0, t_c_p=1.0, t_c_k=1.0,
         )
@@ -156,10 +156,10 @@ def run_scenario(nodes: list[dict], mode: str, dt: float = DT, horizon: float = 
     elif mode == "exclusion":
         # Pure dissipation: mu_cef=0, mu_sri=0, rho=None
         cfg = FastChannelConfig(
-            phi0=phi0, co_share=rlo, debt_stress=debt_stress,
+            phi0=phi0, phi_drive=rlo, phi_suppress=phi_suppress,
             kappa_phi=1.5, zeta_phi=1.0, delta=0.0, mu_f=0.12,
             eta=0.0, lam=0.15, s_in=0.02, mu_e=0.0, gamma_k=0.0,
-            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_soviet=1.0,
+            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_admin=1.0,
             mu_cef=0.0, mu_sri=0.0, rho=None,
         )
         eng = ForceFieldDynamics(
@@ -189,10 +189,10 @@ def run_scenario(nodes: list[dict], mode: str, dt: float = DT, horizon: float = 
         rem_steps = steps - mid_steps
 
         cfg1 = FastChannelConfig(
-            phi0=phi0, co_share=rlo, debt_stress=debt_stress,
+            phi0=phi0, phi_drive=rlo, phi_suppress=phi_suppress,
             kappa_phi=1.5, zeta_phi=1.0, delta=0.0, mu_f=0.12,
             eta=0.0, lam=0.15, s_in=0.02, mu_e=0.0, gamma_k=0.0,
-            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_soviet=1.0,
+            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_admin=1.0,
             mu_cef=0.25, mu_sri=0.15, rho=0.60,
         )
         eng1 = ForceFieldDynamics(
@@ -217,10 +217,10 @@ def run_scenario(nodes: list[dict], mode: str, dt: float = DT, horizon: float = 
             history["R"].append(eng1._R.copy())
 
         cfg2 = FastChannelConfig(
-            phi0=eng1.phi, k0=eng1.k_pool, co_share=rlo, debt_stress=debt_stress,
+            phi0=eng1.phi, k0=eng1.k_pool, phi_drive=rlo, phi_suppress=phi_suppress,
             kappa_phi=1.5, zeta_phi=1.0, delta=0.0, mu_f=0.12,
             eta=0.0, lam=0.15, s_in=0.02, mu_e=0.0, gamma_k=0.0,
-            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_soviet=1.0,
+            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=alpha_rc, sigma_admin=1.0,
             mu_cef=0.50, mu_sri=0.30, rho=0.20,
         )
         eng2 = ForceFieldDynamics(
@@ -240,10 +240,10 @@ def run_scenario(nodes: list[dict], mode: str, dt: float = DT, horizon: float = 
     elif mode == "failure":
         # alpha_rc=0, friction-neutral base, [-C_dot]_+ = 0
         cfg = FastChannelConfig(
-            phi0=phi0, co_share=rlo, debt_stress=debt_stress,
+            phi0=phi0, phi_drive=rlo, phi_suppress=phi_suppress,
             kappa_phi=1.5, zeta_phi=1.0, delta=0.0, mu_f=0.12,
             eta=0.0, lam=0.15, s_in=0.02, mu_e=0.0, gamma_k=0.0,
-            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=0.0, sigma_soviet=1.0,
+            kappa_c=kappa_c, gamma_c=gamma_c, alpha_rc=0.0, sigma_admin=1.0,
             mu_cef=0.5, mu_sri=0.3, rho=0.2,
         )
         eng = ForceFieldDynamics(
