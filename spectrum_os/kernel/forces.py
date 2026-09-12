@@ -183,6 +183,13 @@ class FastChannelConfig:
     phi0: float = 0.65           # [THEORY-LEDGER] Φ 初值（1917 現值錨）
     eta_k: float = 0.2           # [EXPERIMENTAL_HEURISTIC] 釋放流異化截留份額
     gamma_k: float = 0.25        # [EXPERIMENTAL_HEURISTIC] K 折舊率
+    phi_feedback: bool = False   # Φ↔R 反饋閉環（2026-09-11 用戶裁定實裝）。False=開環
+                                 # （DS 外生常數，一階實特徵值，無振盪）。
+                                 # True：DebtStress_eff = DS0·(1−S_i)，S=R/(R+C)——
+                                 # 語義（THEORY-LEDGER「合作社取代高利貸」）：反撲壓力隨
+                                 # 社會化深度衰減；R-C-Φ 三變量非線性閉環 → 複特徵值候選。
+                                 # [EXPERIMENTAL_HEURISTIC: ENDOGENOUS_COERCION_DECAY]
+                                 # ⚠ 形式為最小閉環實現，正式推導待 agy 複核。
 
 
 class ForceFieldDynamics:
@@ -695,7 +702,13 @@ class ForceFieldDynamics:
             dK/dt = η_K·λ_eff·P − γ_K·K
         """
         fc = self._fc
-        dPhi = fc.kappa_phi * self._fc_co * (1.0 - Phi) - fc.zeta_phi * self._fc_ds * Phi
+        dPhi = fc.kappa_phi * self._fc_co * (1.0 - Phi)
+        if fc.phi_feedback:
+            # Φ↔R 閉環（ENDOGENOUS_COERCION_DECAY）：反撲壓力隨社會化深度衰減
+            S_arr = self.s(R, C)
+            dPhi = dPhi - fc.zeta_phi * self._fc_ds * (1.0 - S_arr) * Phi
+        else:
+            dPhi = dPhi - fc.zeta_phi * self._fc_ds * Phi
         # K 漏斗用與 dP 分流同一個 λ_eff（release_fn 一致性）
         S_arr = self.s(R, C)
         T_arr = self.tension(R, C)
