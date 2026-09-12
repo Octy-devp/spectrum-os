@@ -153,6 +153,38 @@ class ForceTrajectory:
         return float(self.S[-1, 0])
 
 
+@dataclass
+class FastChannelConfig:
+    """快通道配置（THEORY-LEDGER「完整動態方程組」2026-09-08 agy 設計的引擎實裝）。
+
+    五維狀態 = R / C / P_R + Φ（流通電導率，快變量 ∈[0,1]）+ K（異化資本沉澱池）。
+    方程（追加項；R/C/P_R 主幹不動，fast_channel=None 時引擎行為逐位不變）：
+
+        dΦ/dt = κ_Φ·CoopShare·(1−Φ) − ζ_Φ·DebtStress·Φ
+        dK/dt = η_K·λ_eff·P_R − γ_K·K          （釋放流的異化截留漏斗）
+        dR/dt += Φ·μ_F·R                        （快通道兌現）
+        dP_R/dt −= η_K·λ_eff·P_R                （漏斗從釋放流分流）
+
+    參數標註沿 THEORY-LEDGER：
+    - mu_F=0.12, kappa_phi=1.5 [EXPERIMENTAL]（κ_Φ 標定依據：CoopShare~0.65 時
+      快通道 τ≈1 年，帳本「快通道 τ≈1 年」）
+    - phi0=0.65 [THEORY-LEDGER 1917 現值錨：Φ_circ 0.65→0.90 為快通道前後]
+    - zeta_phi=0.5, eta_k=0.2, gamma_k=0.25 [EXPERIMENTAL_HEURISTIC——帳本未給值，
+      對偶量級拍定；穩態 Φ* = κ_Φ·CS/(κ_Φ·CS + ζ_Φ·DS)，可在消費端複算]
+    - co_share / debt_stress：標量或逐節點向量；debt_stress 建議餵
+      delivery slip（actual−promised，天）÷30 的實測歸一值。
+    """
+
+    co_share: Any = 0.0          # CoopShare（合作社/RLO 穿透率份額 ∈[0,1]）
+    debt_stress: Any = 0.0       # DebtStress（歸一化高利貸反撲壓力）
+    mu_F: float = 0.12           # [EXPERIMENTAL] 快通道兌現率
+    kappa_phi: float = 1.5       # [EXPERIMENTAL] 合作社推進率
+    zeta_phi: float = 0.5        # [EXPERIMENTAL_HEURISTIC] 高利貸反撲率
+    phi0: float = 0.65           # [THEORY-LEDGER] Φ 初值（1917 現值錨）
+    eta_k: float = 0.2           # [EXPERIMENTAL_HEURISTIC] 釋放流異化截留份額
+    gamma_k: float = 0.25        # [EXPERIMENTAL_HEURISTIC] K 折舊率
+
+
 class ForceFieldDynamics:
     """Deterministic R/C counterforce field engine (no LLM dependency).
 
@@ -271,6 +303,7 @@ class ForceFieldDynamics:
         clamp_nonneg: bool = True,
         node_ids: list[str] | None = None,
         meta: dict | None = None,
+        fast_channel: "FastChannelConfig | None" = None,
     ) -> None:
         R0 = _as_float_array(revolutionary_force, "revolutionary_force")
         C0 = _as_float_array(conservative_force, "conservative_force")
@@ -364,6 +397,21 @@ class ForceFieldDynamics:
         self._R = self._R0.copy()
         self._C = self._C0.copy()
         self._P = self._P0.copy()
+
+        # ── 5D 快通道（THEORY-LEDGER「完整動態方程組」實裝；None ⇒ 3D 逐位不變）──
+        self._fc = fast_channel
+        if fast_channel is not None:
+            self._fc_co = _broadcast(fast_channel.co_share, n, "fast_channel.co_share")
+            self._fc_ds = _broadcast(fast_channel.debt_stress, n, "fast_channel.debt_stress")
+            for _nm, _arr in (("co_share", self._fc_co), ("debt_stress", self._fc_ds)):
+                if np.any(_arr < 0):
+                    raise ValueError(f"{_nm} must be non-negative")
+            self._Phi = np.full(n, float(fast_channel.phi0), dtype=np.float64)
+            self._K = np.zeros(n, dtype=np.float64)
+        else:
+            self._fc_co = self._fc_ds = None
+            self._Phi = None
+            self._K = None
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -564,7 +612,8 @@ class ForceFieldDynamics:
         return dR, dC
 
     def derivatives_full(
-        self, t: float, R: Any = None, C: Any = None, P: Any = None
+        self, t: float, R: Any = None, C: Any = None, P: Any = None,
+        *, phi_arr: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Full ODE right-hand side incl. the P_R reservoir: ``(dR, dC, dP)``.
 
@@ -610,6 +659,13 @@ class ForceFieldDynamics:
         if self._reservoir_active:
             dP = dP + beta_eff * C_arr
 
+        # ── 5D 快通道追加項（fast_channel=None 時完全跳過 ⇒ 3D 逐位不變）──
+        if self._fc is not None:
+            Phi = self._Phi if phi_arr is None else phi_arr
+            fc = self._fc
+            dR = dR + Phi * fc.mu_F * R_arr                     # 快通道兌現
+            dP = dP - fc.eta_k * lam_eff * P_arr                # 異化截留漏斗分流
+
         # Same-force diffusion: solidarity (RR) and coordination (CC).
         if np.any(self._kappa_RR):
             dR = dR + self._kappa_RR @ R_arr - np.sum(self._kappa_RR, axis=1) * R_arr
@@ -631,6 +687,25 @@ class ForceFieldDynamics:
 
         return dR, dC, dP
 
+    def fast_derivatives(self, t: float, R: np.ndarray, C: np.ndarray, P: np.ndarray,
+                         Phi: np.ndarray, K: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Φ/K 快通道方程（獨立於 R/C/P 導數，THEORY-LEDGER 五維組的追加兩行）。
+
+            dΦ/dt = κ_Φ·CoopShare·(1−Φ) − ζ_Φ·DebtStress·Φ
+            dK/dt = η_K·λ_eff·P − γ_K·K
+        """
+        fc = self._fc
+        dPhi = fc.kappa_phi * self._fc_co * (1.0 - Phi) - fc.zeta_phi * self._fc_ds * Phi
+        # K 漏斗用與 dP 分流同一個 λ_eff（release_fn 一致性）
+        S_arr = self.s(R, C)
+        T_arr = self.tension(R, C)
+        lam_eff = self._lam * (np.ones_like(T_arr) if self._lam_fn is None
+                               else np.maximum(np.broadcast_to(
+                                   np.asarray(self._lam_fn(T_arr), dtype=np.float64),
+                                   T_arr.shape), 0.0))
+        dK = fc.eta_k * lam_eff * P - fc.gamma_k * K
+        return dPhi, dK
+
     # ------------------------------------------------------------------
     # Integration
     # ------------------------------------------------------------------
@@ -645,31 +720,71 @@ class ForceFieldDynamics:
         """Advance the internal state by one step of ``dt`` using ``method``."""
         if self._method == "rk4":
             t, R, C, P = self._t, self._R, self._C, self._P
-            k1 = self.derivatives_full(t, R, C, P)
-            k2 = self._stage_derivatives(t, R, C, P, k1[0], k1[1], k1[2], dt / 2.0)
-            k3 = self._stage_derivatives(t, R, C, P, k2[0], k2[1], k2[2], dt / 2.0)
-            k4 = self._stage_derivatives(t, R, C, P, k3[0], k3[1], k3[2], dt)
-            dR = dt * (k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0]) / 6.0
-            dC = dt * (k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1]) / 6.0
-            dP = dt * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2]) / 6.0
+            if self._fc is not None:
+                # 5D RK4：Φ/K 與 R/C/P 同步 stage 演化（快通道兌現項吃 stage Φ）
+                Phi0, K0 = self._Phi, self._K
+                k1R, k1C, k1P = self.derivatives_full(t, R, C, P, phi_arr=Phi0)
+                k1F, k1K = self.fast_derivatives(t, R, C, P, Phi0, K0)
+                R2, C2, P2 = R + dt/2*k1R, C + dt/2*k1C, P + dt/2*k1P
+                Phi2, K2 = Phi0 + dt/2*k1F, K0 + dt/2*k1K
+                k2R, k2C, k2P = self.derivatives_full(t, R2, C2, P2, phi_arr=Phi2)
+                k2F, k2K = self.fast_derivatives(t, R2, C2, P2, Phi2, K2)
+                R3, C3, P3 = R + dt/2*k2R, C + dt/2*k2C, P + dt/2*k2P
+                Phi3, K3 = Phi0 + dt/2*k2F, K0 + dt/2*k2K
+                k3R, k3C, k3P = self.derivatives_full(t, R3, C3, P3, phi_arr=Phi3)
+                k3F, k3K = self.fast_derivatives(t, R3, C3, P3, Phi3, K3)
+                R4, C4, P4 = R + dt*k3R, C + dt*k3C, P + dt*k3P
+                Phi4, K4 = Phi0 + dt*k3F, K0 + dt*k3K
+                k4R, k4C, k4P = self.derivatives_full(t, R4, C4, P4, phi_arr=Phi4)
+                k4F, k4K = self.fast_derivatives(t, R4, C4, P4, Phi4, K4)
+                dR = dt * (k1R + 2.0*k2R + 2.0*k3R + k4R) / 6.0
+                dC = dt * (k1C + 2.0*k2C + 2.0*k3C + k4C) / 6.0
+                dP = dt * (k1P + 2.0*k2P + 2.0*k3P + k4P) / 6.0
+                dPhi = dt * (k1F + 2.0*k2F + 2.0*k3F + k4F) / 6.0
+                dK = dt * (k1K + 2.0*k2K + 2.0*k3K + k4K) / 6.0
+            else:
+                k1 = self.derivatives_full(t, R, C, P)
+                k2 = self._stage_derivatives(t, R, C, P, k1[0], k1[1], k1[2], dt / 2.0)
+                k3 = self._stage_derivatives(t, R, C, P, k2[0], k2[1], k2[2], dt / 2.0)
+                k4 = self._stage_derivatives(t, R, C, P, k3[0], k3[1], k3[2], dt)
+                dR = dt * (k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0]) / 6.0
+                dC = dt * (k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1]) / 6.0
+                dP = dt * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2]) / 6.0
         else:  # euler
-            dR, dC, dP = self.derivatives_full(self._t, self._R, self._C, self._P)
-            dR = dR * dt
-            dC = dC * dt
-            dP = dP * dt
+            if self._fc is not None:
+                kR, kC, kP = self.derivatives_full(self._t, self._R, self._C, self._P,
+                                                   phi_arr=self._Phi)
+                kF, kK = self.fast_derivatives(self._t, self._R, self._C, self._P,
+                                               self._Phi, self._K)
+                dR, dC, dP = kR * dt, kC * dt, kP * dt
+                dPhi, dK = kF * dt, kK * dt
+            else:
+                dR, dC, dP = self.derivatives_full(self._t, self._R, self._C, self._P)
+                dR = dR * dt
+                dC = dC * dt
+                dP = dP * dt
 
         new_R = self._R + dR
         new_C = self._C + dC
         new_P = self._P + dP
+        if self._fc is not None:
+            new_Phi = self._Phi + dPhi
+            new_K = self._K + dK
         if self._clamp_nonneg:
             new_R = np.maximum(new_R, 0.0)
             new_C = np.maximum(new_C, 0.0)
             new_P = np.maximum(new_P, 0.0)
+            if self._fc is not None:
+                new_Phi = np.clip(new_Phi, 0.0, 1.0)  # Φ 定義域 [0,1]（電導率）
+                new_K = np.maximum(new_K, 0.0)
 
         self._t += dt
         self._R = new_R
         self._C = new_C
         self._P = new_P
+        if self._fc is not None:
+            self._Phi = new_Phi
+            self._K = new_K
 
     def step(self, dt: float | None = None) -> dict:
         """Advance one step (default ``self._dt``) and return a state snapshot.
@@ -677,7 +792,7 @@ class ForceFieldDynamics:
         Snapshot keys: ``t``, ``R``, ``C``, ``S``, ``T`` (numpy arrays).
         """
         self._advance(self._dt if dt is None else float(dt))
-        return {
+        snap = {
             "t": self._t,
             "R": self._R.copy(),
             "C": self._C.copy(),
@@ -686,6 +801,11 @@ class ForceFieldDynamics:
             "T": self.total_capacity(),
             "tension": self.tension(),
         }
+        if self._fc is not None:
+            snap["Phi"] = self._Phi.copy()
+            snap["K"] = self._K.copy()
+            snap["fast_channel_enabled"] = True
+        return snap
 
     def run(self, t_end: float, dt: float | None = None) -> ForceTrajectory:
         """Integrate from the current state to ``t_end`` (inclusive).
@@ -765,6 +885,15 @@ class ForceFieldDynamics:
             "kappa_CR": self._kappa_CR.tolist(),
             "meta": self._meta,
         }
+        if self._fc is not None:
+            meta["fast_channel"] = {
+                "enabled": True,
+                "co_share": self._fc_co.tolist(),
+                "debt_stress": self._fc_ds.tolist(),
+                "mu_F": self._fc.mu_F, "kappa_phi": self._fc.kappa_phi,
+                "zeta_phi": self._fc.zeta_phi, "phi0": self._fc.phi0,
+                "eta_k": self._fc.eta_k, "gamma_k": self._fc.gamma_k,
+            }
         return ForceTrajectory(
             t=times, R=R_hist, C=C_hist, P=P_hist, S=S_hist,
             T=T_hist, tension=tens_hist, meta=meta,
@@ -776,6 +905,9 @@ class ForceFieldDynamics:
         self._R = self._R0.copy()
         self._C = self._C0.copy()
         self._P = self._P0.copy()
+        if self._fc is not None:
+            self._Phi = np.full(self._n, float(self._fc.phi0), dtype=np.float64)
+            self._K = np.zeros(self._n, dtype=np.float64)
         return self
 
     # ------------------------------------------------------------------
