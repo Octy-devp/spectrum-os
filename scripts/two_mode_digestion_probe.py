@@ -71,7 +71,7 @@ def load_45_rural_nodes(ecc_root: str | Path) -> list[dict]:
         nspv_data = json.load(f)
 
     bpu = nspv_data.get("1917", {}).get("by_panel_unit", {})
-    obs_dir = root / "index/locations/data/almanac/1917/observation"
+    obs_dir = root / "index/locations/data/almanac/1910-1920/1917/observation"
 
     nodes = []
     for city in CORE_15:

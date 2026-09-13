@@ -122,7 +122,7 @@ def _require_root(root_path: Optional[Path]) -> Path:
 def load_all_gnp_villages(root_path: Optional[Path] = None) -> Dict[str, List[VillageProfile]]:
     """Load and classify all 120 GNP villages, extracting empirical 1914 sold_share baselines."""
     root_path = _require_root(root_path)
-    base_dir = root_path / 'index/locations/data/almanac/1917/observation-gnp'
+    base_dir = root_path / 'index/locations/data/almanac/1910-1920/1917/observation-gnp'
     
     files_17 = sorted(list(base_dir.glob('*/*-1917.json')))
     files_17 = [f for f in files_17 if 'monitor' not in f.name and 'registry' not in f.name]
@@ -474,11 +474,11 @@ def get_ar_frigorifico_config() -> MarketConfig:
         geography='argentina_buenos_aires',
         base_unit='gbp_per_carcass_tonne',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/sphere/argentina-beef-frigorifico-periurban-1914.json',
-            'index/locations/data/almanac/1917/observation-gnp/sphere/argentina-beef-frigorifico-periurban-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/sphere/argentina-beef-frigorifico-secondary-1914.json',
-            'index/locations/data/almanac/1917/observation-gnp/sphere/argentina-beef-frigorifico-secondary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/sphere/argentina-wheat-buenosaires-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/argentina-beef-frigorifico-periurban-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/argentina-beef-frigorifico-periurban-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/argentina-beef-frigorifico-secondary-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/argentina-beef-frigorifico-secondary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/argentina-wheat-buenosaires-primary-1917.json',
         ],
         actors={
             'FG_01': {
@@ -552,10 +552,10 @@ def get_us_midwest_grain_config() -> MarketConfig:
         geography='us_midwest_corn_wheat_belt',
         base_unit='gbp_tonne_and_cents_per_bushel',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/usa/illinois-corn-soy-chicago-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/usa/illinois-corn-soy-chicago-secondary-1914.json',
-            'index/locations/data/almanac/1917/observation-gnp/usa/minnesota-springwheat-dairy-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/usa/kansas-wheat-chicago-primary-1905.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/illinois-corn-soy-chicago-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/illinois-corn-soy-chicago-secondary-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/minnesota-springwheat-dairy-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/kansas-wheat-chicago-primary-1905.json',
         ],
         actors={
             'cbot_grain_trust': {
@@ -619,9 +619,9 @@ def get_uk_corn_factor_config() -> MarketConfig:
         geography='uk_east_anglia_home_counties',
         base_unit='gbp_tonne_and_shillings_quarter',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/uk/east-anglia-suffolk-london-secondary-1914.json',
-            'index/locations/data/almanac/1917/observation-gnp/uk/home-counties-kent-london-periurban-1905.json',
-            'index/locations/data/almanac/1917/observation-gnp/uk/home-counties-kent-london-periurban-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/uk/east-anglia-suffolk-london-secondary-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/uk/home-counties-kent-london-periurban-1905.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/uk/home-counties-kent-london-periurban-1917.json',
         ],
         actors={
             'london_mark_lane_factors': {
@@ -685,9 +685,9 @@ def get_in_chettiar_credit_config() -> MarketConfig:
         geography='british_india_bengal_madras',
         base_unit='rupee_per_maund_and_gbp_equivalent',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/empire/bengal-jute-calcutta-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/empire/madras-cotton-madras-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/empire/benares-primary-1905.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/empire/bengal-jute-calcutta-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/empire/madras-cotton-madras-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/empire/benares-primary-1905.json',
         ],
         actors={
             'chettiar_moneylender_syndicate': {
@@ -751,9 +751,9 @@ def get_us_furnish_lien_config() -> MarketConfig:
         geography='us_cotton_belt_black_belt',
         base_unit='gbp_tonne_and_cents_per_pound',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/usa/alabama-tenant-montgomery-periurban-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/usa/georgia-cotton-savannah-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/usa/vicksburg-primary-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/alabama-tenant-montgomery-periurban-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/georgia-cotton-savannah-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/usa/vicksburg-primary-1914.json',
         ],
         actors={
             'furnish_merchant_planter_ring': {
@@ -817,9 +817,9 @@ def get_prd_silk_filature_config() -> MarketConfig:
         geography='cn_pearl_river_delta_shunde',
         base_unit='tael_per_picul_and_gbp_equivalent',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/empire/prd-shunde-mulberry-hongkong-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/empire/prd-dongguan-rice-hongkong-secondary-1914.json',
-            'index/locations/data/almanac/1917/observation-gnp/empire/prd-kowloon-ntl-village-hongkong-periurban-1905.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/empire/prd-shunde-mulberry-hongkong-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/empire/prd-dongguan-rice-hongkong-secondary-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/empire/prd-kowloon-ntl-village-hongkong-periurban-1905.json',
         ],
         actors={
             'shunde_steam_filature_association': {
@@ -883,9 +883,9 @@ def get_jp_rice_tenancy_config() -> MarketConfig:
         geography='japan_kanto_tohoku_niigata',
         base_unit='yen_per_koku_and_gbp_equivalent',
         source_volumes=[
-            'index/locations/data/almanac/1917/observation-gnp/sphere/tohoku-rice-tokyo-primary-1917.json',
-            'index/locations/data/almanac/1917/observation-gnp/sphere/kanto-orchard-yokohama-primary-1914.json',
-            'index/locations/data/almanac/1917/observation-gnp/sphere/shinano-sericulture-tokyo-secondary-1905.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/tohoku-rice-tokyo-primary-1917.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/kanto-orchard-yokohama-primary-1914.json',
+            'index/locations/data/almanac/1910-1920/1917/observation-gnp/sphere/shinano-sericulture-tokyo-secondary-1905.json',
         ],
         actors={
             'absentee_parasite_landlords': {
@@ -1136,7 +1136,7 @@ def main():
     args = parser.parse_args()
 
     root = Path(args.root)
-    out_dir = root / 'index/locations/data/almanac/1917/projection'
+    out_dir = root / 'index/locations/data/almanac/1910-1920/1917/projection'
     print('=== EXECUTING COMPLETE 7-MARKET CLOSED-LOOP SUITE ===')
     run_and_save_all_markets(out_dir, root_path=root, delta_idle=args.delta_idle)
 

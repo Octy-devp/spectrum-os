@@ -7,7 +7,7 @@ Standalone, deterministic, numpy-only. Reproduces the ECC urban-almanac
   * ``legacy`` — the existing :class:`ForceFieldDynamics` R/C/P_R engine with the
     almanac's calibrated parameters (``growth_r=0.02, growth_c=0.01, alpha=0.05,
     beta=0.03, mu=0.02, lam=0.15, rk4, dt=0.25``; the recipe behind
-    ``index/locations/data/almanac/1917/intervention/dynamics.json``).
+    ``index/locations/data/almanac/1910-1920/1917/intervention/dynamics.json``).
   * ``fast`` — the opt-in 5-D mode (Φ, K) from THEORY-LEDGER
     §「完整動態方程組」, with the ledger's stated parameters
     (λ=0.15 [CALIBRATED], μ_F≈0.12, κ_Φ≈1.5 [EXPERIMENTAL], Φ 0.65→0.90).
@@ -130,7 +130,7 @@ def _nspv_project(nspv0: np.ndarray, s0: np.ndarray, R: np.ndarray,
 def _load_ecc(ecc_root: str) -> dict | None:
     root = Path(ecc_root)
     nspv_path = root / "index/locations/data/nspv-index.json"
-    traj_path = root / "index/locations/data/almanac/1917/intervention/S-trajectory-1920.json"
+    traj_path = root / "index/locations/data/almanac/1910-1920/1917/intervention/S-trajectory-1920.json"
     if not (nspv_path.exists() and traj_path.exists()):
         return None
     nspv = json.load(open(nspv_path, encoding="utf-8"))
