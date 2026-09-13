@@ -4,34 +4,36 @@
 > **規格**：OS 本體規格在 `docs/PLAN.md`；ECC 應用層在 ECC `docs/plans/PLAN-23-spectrum-computer-engine.md` + ECC `index/data/SPECTRUM-TASKLOG.md`。
 > **定位**：本文件記錄「OS 怎麼長大」，不記錄「OS 被用來做什麼」（那在應用層）。
 
-## 📌 現況快照（2026-08-04）
+## 📌 現況快照（2026-08-07）
 
 | 項 | 值 |
 |:---|:---|
-| HEAD | `1abf6d4`（[Stage 3] T16 語義中介 + T6 定稿 prompt + L3 修復）＋**未提交工作樹**（T17a/T18/T19 已實作，待 commit） |
-| 測試 | **631 passed / 4.85s**（24 test files，2026-08-04 實跑） |
-| 模組規模 | 36 模組 / 11,395 行 |
+| HEAD | `59af3d3`（[Forces] v1.6 βC→P_R 壓縮通道） |
+| 測試 | **764 passed / 10.57s**（30 test files，2026-08-07 實跑） |
+| 模組規模 | 36+ 模組（含 forces.py 815 行 + round_loop.py 1358 行） |
 | 規格-代碼差距 | `docs/v25-spec-code-gap.md`：5 項全數 conscious divergence（已收斂） |
-| push 狀態 | `1abf6d4` 已 push 至 origin/master；T17a/T18/T19 待 commit（README v3.4 + docs/tickets/ 文檔已備妥） |
+| push 狀態 | `59af3d3` 已 push 至 origin/master |
 
-### 🚧 未提交工作樹（2026-08-04，待 commit）
+### ✅ 已 commit（4ead001，2026-08-04 12:14）+ 後續 forces/RoundLoop 三 commit
 
-> 上表 HEAD 之後的工作尚未 commit，全部在**工作樹**：
->
-> | 變更 | 內容 |
-> |:---|:---|
-> | `spectrum_os/contracts.py` | T17a 插件契約：`FieldSpec`/`ActorCard`/`SituationSpec`/`FieldLog` + `to_dict()`（vector_6d→6d_vector 對映） |
-> | `spectrum_os/synth/probe.py` | T18 手動逐層：`probe_tree_manual`（on_layer 回呼）+ `probe_expand_layer`（公開單層原語，reflect_on 屬上一層防禦） |
-> | `spectrum_os/synth/convergence.py`（新） | T19 收束 UX：`convergence_view`（text/markdown/json 渲染）+ `probe_converge_round`（一輪收束，選後渲染 + 累積路徑） |
-> | `spectrum_os/synth/gate_prompts.py` | 與 T18/T19 配套的 prompt 調整 |
-> | `tests/test_contracts.py` / `test_probe.py` / `test_gate_prompts.py` / `test_convergence.py`（新） | +29 / +12 / +31 等（584→596→621→631） |
-> | `docs/PLAN.md`、`docs/TASKLOG.md`、`docs/tickets/`、`README.md`（v3.4） | 本週文檔 |
-> | `scripts/ab_prompt_test.py` / `prompt_editor.py` | A/B/C/D prompt 對照 + prompt-editor skill（ECC 側亦有） |
+> 上表工作樹已於 `4ead001`（T17a/T18/T19 + 收束持久層，657 tests）commit。
+> **08-04 後另起三條新線（forces/RoundLoop）**——本文件當時未追蹤，2026-08-07 補記：
+
+| commit | 內容 |
+|:---|:---|
+| `59af3d3`（08-07） | [Forces] v1.6 βC→P_R 壓縮通道（壓制轉移非毀滅、growth_r_fn/growth_c_fn/release_fn 基板回饋）——764 tests |
+| `808672f`（08-04 21:56） | [RoundLoop] 回合協定編排器 + Mode B 委派 + **TREE 干涉網段** + forces 公開 setter——753 tests |
+| `ea369e7`（08-04 20:28） | [Forces] 社會動力學第一定理引擎（R/C/P_R 對抗力場 + 四象限耦合 + from_actor_cards）——716 tests |
+| `4ead001`（08-04 12:14） | T17a 插件契約 + T18 手動逐層 + T19 收束 UX/持久層——657 tests |
 
 ## 📊 最近 commit 歷史（Stage 3 收束段）
 
 | commit | 內容 |
 |:---|:---|
+| `59af3d3` | [Forces] v1.6 βC→P_R 壓縮通道（壓制轉移非毀滅、基板回饋）——764 tests |
+| `808672f` | [RoundLoop] 回合協定編排器 + Mode B 委派 + TREE 干涉網段 + forces setter——753 tests |
+| `ea369e7` | [Forces] 社會動力學第一定理引擎（R/C/P_R + 四象限 + from_actor_cards）——716 tests |
+| `4ead001` | T17a 插件契約 + T18 手動逐層 + T19 收束 UX/持久層——657 tests |
 | `1abf6d4` | T16 語義中介取代黑名單 + T6 定稿 prompt + 層間 echo 語義化（L3 單鏈修復）——548 tests |
 | `12ddb68` | P2 補齊：standing_wave_per_layer + 語義聚類 + 收束視圖 + Mode A→B 接線 + remasking 校準 |
 | `8257744` | 探針修補 F1-F10 + W1 DCA 基底接回 + probe pilot 腳本 |

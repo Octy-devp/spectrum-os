@@ -11,6 +11,15 @@ dependencies = [
     "numpy>=2.0,<3.0",
 ]
 
+[project.optional-dependencies]
+yaml = [
+    "PyYAML>=6.0",
+]
+test = [
+    "pytest>=8,<9",
+    "PyYAML>=6.0",
+]
+
 [tool.setuptools.packages.find]
 include = ["spectrum_os*"]
 
