@@ -140,6 +140,10 @@ _FAST_PROVENANCE: dict[str, str] = {
     "m0": "[MORPHOLOGY 2026-09-10, SCENARIO]",
     "p_pool0": "[MORPHOLOGY 2026-09-10, SCENARIO]",
     "p_dist0": "[MORPHOLOGY 2026-09-10, SCENARIO]",
+    "issuance_fn": "[SIXTH STATE 2026-09-16, SUBSTRATE]",
+    "verified_growth_fn": "[SIXTH STATE 2026-09-16, SUBSTRATE]",
+    "verified_stock": "[SIXTH STATE 2026-09-16, SUBSTRATE_INPUT]",
+    "kappa_eta": "[SIXTH STATE 2026-09-16, EXPERIMENTAL]",
 }
 
 
@@ -236,6 +240,14 @@ class ForceTrajectory:
     p_dist: np.ndarray | None = None
     m_cum: np.ndarray | None = None
     g_sat: np.ndarray | None = None
+    # Opt-in η value-level channel (SIXTH STATE 2026-09-16). ``None`` on the
+    # legacy path. ``eta`` is the value-level state, ``s_real`` the real
+    # resultant S_real = R·η/(R·η + C) (vs the nominal ``S``), and
+    # ``issued_cumulative`` the mechanical per-node cumulative-issuance
+    # accumulator (stays zero when no issuance substrate is supplied).
+    eta: np.ndarray | None = None
+    s_real: np.ndarray | None = None
+    issued_cumulative: np.ndarray | None = None
 
     def to_dict(self) -> dict:
         """Serialize to plain JSON-safe dict (numpy arrays → nested lists).
@@ -265,6 +277,12 @@ class ForceTrajectory:
             payload["m_cum"] = self.m_cum.tolist()
         if self.g_sat is not None:
             payload["g_sat"] = self.g_sat.tolist()
+        if self.eta is not None:
+            payload["eta"] = self.eta.tolist()
+        if self.s_real is not None:
+            payload["s_real"] = self.s_real.tolist()
+        if self.issued_cumulative is not None:
+            payload["issued_cumulative"] = self.issued_cumulative.tolist()
         return payload
 
     def final_s(self) -> float:
@@ -436,6 +454,28 @@ class FastChannelConfig:
     m0: Any = 0.0                    # [MORPHOLOGY 2026-09-10, SCENARIO] initial cumulative socialization M(0)
     p_pool0: Any = None              # [MORPHOLOGY 2026-09-10, SCENARIO] initial P_pool (defaults to P0 if None)
     p_dist0: Any = 0.0               # [MORPHOLOGY 2026-09-10, SCENARIO] initial P_dist
+    # ── η value-level state channel (SIXTH STATE 2026-09-16) ──────────
+    # η (seeded by the engine's ``eta_level`` argument, canonical default 1.42)
+    # is a per-node STATE variable integrated alongside (R, C, P_pool, P_dist,
+    # Φ, K, M). The kernel owns the erosion law's STRUCTURE; the world supplies
+    # the FLOWS through the substrate slots below:
+    #
+    #     dη/dt = −κ_eta · max(0, j_issue − j_verified) / v_stock
+    #
+    # ``j_issue``   — per-step issuance amount (``issuance_fn``; None ≡ none)
+    # ``j_verified``— verified-value growth flow (``verified_growth_fn``; None ≡ 0)
+    # ``v_stock``   — verified-value stock (``verified_stock``, floored at 1e-9)
+    # η is monotone non-increasing (dη/dt ≤ 0) and clamped ≥ 0. It NEVER enters
+    # the other seven equations — it is a pure observable lens: analysts read
+    # ``S_real = R·η/(R·η + C)`` against the nominal ``S = R/(R + C)``. The
+    # kernel also keeps a mechanical cumulative-issuance accumulator (post-step
+    # injection; it does NOT touch R/C — the caller decides what issuance means).
+    # NOTE: this η is a STATE, not the alienation-extraction RATE parameter
+    # ``eta`` above — different concept, different layer; do not conflate.
+    issuance_fn: Callable | None = None         # [SUBSTRATE] fn(t, ctx) -> per-step issuance amount
+    verified_growth_fn: Callable | None = None  # [SUBSTRATE] fn(t, ctx) -> verified-value growth flow
+    verified_stock: Any = 1.0                   # [SUBSTRATE_INPUT] verified-value stock (denominator v_stock)
+    kappa_eta: Any = 0.0                        # [EXPERIMENTAL] η erosion rate κ_η
 
     @property
     def rho_impl(self) -> float:
@@ -454,7 +494,9 @@ class FastChannelConfig:
                           ("phi_suppress_fn", self.phi_suppress_fn),
                           ("k_inflow_fn", self.k_inflow_fn),
                           ("k_decay_fn", self.k_decay_fn),
-                          ("c_source_fn", self.c_source_fn)):
+                          ("c_source_fn", self.c_source_fn),
+                          ("issuance_fn", self.issuance_fn),
+                          ("verified_growth_fn", self.verified_growth_fn)):
             if val is None or callable(val):
                 continue
             try:
@@ -486,7 +528,9 @@ class FastChannelConfig:
                           ("t_c_phi", self.t_c_phi), ("t_c_p", self.t_c_p),
                           ("t_c_k", self.t_c_k),
                           ("k_dissolve", self.k_dissolve), ("m0", self.m0),
-                          ("p_dist0", self.p_dist0)):
+                          ("p_dist0", self.p_dist0),
+                          ("kappa_eta", self.kappa_eta),
+                          ("verified_stock", self.verified_stock)):
             if isinstance(val, (int, float)) and val < 0:
                 raise ValueError(f"{name} must be non-negative, got {val}")
         if isinstance(self.m_half, (int, float)) and self.m_half <= 0:
@@ -656,6 +700,23 @@ class ForceFieldDynamics:
         the K alienated-capital pool; :meth:`derivatives_5d`, :meth:`assess_stability`
         and seasonal operator splitting become available. All parameters live on
         the config, each with a provenance tag (:meth:`FastChannelConfig.provenance`).
+    eta_level
+        Seed of the η value-level state — the SIXTH STATE variable
+        (SIXTH STATE 2026-09-16), canonical default 1.42. Integrated only in
+        the opt-in fast-channel mode (alongside R/C/P_R/Φ/K); the legacy path
+        validates the seed but ignores it. Erosion law and substrate slots are
+        documented on :class:`FastChannelConfig`. Distinct from the config's
+        alienation-extraction RATE parameter ``eta``.
+    capacity
+        Optional logistic carrying ceiling K_cap on R's growth:
+        ``a_eff·R·(1 − R/K_cap)`` — the world supplies the magnitude, the
+        kernel owns the logistic form. ``None`` (default) ≡ uncapped
+        (backward compatible). Applies on BOTH the legacy and 5-D paths.
+    spatial_latency, tau_spatial
+        Optional spatial damping ``a_eff(i) = a₀·exp(−latency_i/τ_spatial)``:
+        per-node hub latency (world-supplied) and a positive damping time
+        constant. Both ``None`` (default) ≡ disabled (backward compatible).
+        Applies on BOTH the legacy and 5-D paths.
     """
 
     def __init__(
@@ -685,6 +746,10 @@ class ForceFieldDynamics:
         node_ids: list[str] | None = None,
         meta: dict | None = None,
         fast_channel: "FastChannelConfig | bool | dict | None" = None,
+        eta_level: Any = 1.42,
+        capacity: Any = None,
+        spatial_latency: Any = None,
+        tau_spatial: Any = None,
     ) -> None:
         R0 = _as_float_array(revolutionary_force, "revolutionary_force")
         C0 = _as_float_array(conservative_force, "conservative_force")
@@ -732,6 +797,45 @@ class ForceFieldDynamics:
                 f"latent_force must be non-negative, got {self._P0.tolist()}"
             )
         self._lam_fn = release_fn
+        # ── R growth modifiers (SIXTH STATE round 2026-09-16) ─────────────
+        # Logistic carrying ceiling (K_cap): None ≡ uncapped (backward compat).
+        # A world-agnostic growth limiter — the world supplies the magnitude,
+        # the kernel owns the logistic form ``a_eff·R·(1 − R/K_cap)``.
+        if capacity is None:
+            self._Kcap: np.ndarray | None = None
+        else:
+            self._Kcap = _broadcast(capacity, n, "capacity")
+            if np.any(self._Kcap <= 0):
+                raise ValueError(
+                    f"capacity must be strictly positive when given, "
+                    f"got {self._Kcap.tolist()}"
+                )
+        # Spatial damping: a_eff(i) = a₀ · exp(−latency_i / τ_spatial). Both
+        # arguments None ≡ disabled (factor 1, backward compat); a latency
+        # without a time constant is ambiguous → error.
+        if spatial_latency is None and tau_spatial is None:
+            self._spatial_damp: np.ndarray | None = None
+        else:
+            if tau_spatial is None or float(tau_spatial) <= 0:
+                raise ValueError(
+                    f"tau_spatial must be strictly positive when spatial "
+                    f"latency is used, got {tau_spatial}"
+                )
+            lat = _broadcast(0.0 if spatial_latency is None else spatial_latency,
+                             n, "spatial_latency")
+            if np.any(lat < 0):
+                raise ValueError(
+                    f"spatial_latency must be non-negative, got {lat.tolist()}"
+                )
+            self._spatial_damp = np.exp(-lat / float(tau_spatial))
+        # η (SIXTH STATE) seed — canonical default 1.42. The state itself only
+        # exists in the opt-in fast-channel mode; on the legacy path the seed
+        # is validated but inert.
+        self._eta_level0 = _broadcast(eta_level, n, "eta_level")
+        if np.any(self._eta_level0 < 0):
+            raise ValueError(
+                f"eta_level must be non-negative, got {self._eta_level0.tolist()}"
+            )
         # v1.6: the βC → P_R compression channel is active only when the
         # reservoir is in use (any compression/release/decay rate or initial
         # latent force set). Reservoir off ⇒ v1.0 behaviour (P inert).
@@ -787,6 +891,11 @@ class ForceFieldDynamics:
         self._K0: np.ndarray | None = None
         self._Phi: np.ndarray | None = None
         self._K: np.ndarray | None = None
+        # SIXTH STATE (η) — None on the legacy path (attribute exists so the
+        # accessors can gate on it without hasattr dances).
+        self._Eta0: np.ndarray | None = None
+        self._Eta: np.ndarray | None = None
+        self._issued_cum: np.ndarray | None = None
         self._fc: dict[str, np.ndarray] = {}
         if self._fast is not None:
             self._initialise_fast_state(n)
@@ -979,6 +1088,33 @@ class ForceFieldDynamics:
             np.any(self._mu_cef > 0.0) or np.any(self._mu_sri > 0.0) or (cfg.rho is not None)
         )
 
+        # ── η value-level channel (SIXTH STATE 2026-09-16) ────────────────
+        # Seed from the engine's ``eta_level`` argument (single SSOT for the
+        # seed — the config deliberately carries no eta0, mirroring the lam
+        # no-silent-shadowing discipline). Dynamics parameters live on the
+        # config: kappa_eta / verified_stock / issuance_fn / verified_growth_fn.
+        self._kappa_eta = _b("kappa_eta", cfg.kappa_eta)
+        self._verified_stock = _b("verified_stock", cfg.verified_stock)
+        if np.any(self._kappa_eta < 0):
+            raise ValueError(
+                f"fast_channel.kappa_eta must be non-negative, "
+                f"got {self._kappa_eta.tolist()}"
+            )
+        if np.any(self._verified_stock < 0):
+            raise ValueError(
+                f"fast_channel.verified_stock must be non-negative, "
+                f"got {self._verified_stock.tolist()}"
+            )
+        self._fc.update({
+            "kappa_eta": self._kappa_eta,
+            "verified_stock": self._verified_stock,
+            "issuance_fn": cfg.issuance_fn,
+            "verified_growth_fn": cfg.verified_growth_fn,
+        })
+        self._Eta0 = self._eta_level0.copy().astype(np.float64)
+        self._Eta = self._Eta0.copy()
+        self._issued_cum = np.zeros(n, dtype=np.float64)
+
     # ------------------------------------------------------------------
     # Validation helpers
     # ------------------------------------------------------------------
@@ -1141,6 +1277,53 @@ class ForceFieldDynamics:
         denom = np.where(tot > 1e-12, tot, 1.0)
         return np.where(tot > 1e-12, self._P_pool / denom, 1.0)
 
+    @property
+    def eta_level(self) -> np.ndarray | None:
+        """Current η value-level state (read-only copy), or ``None`` (legacy).
+
+        η is the SIXTH STATE variable (SIXTH STATE 2026-09-16): seeded at the
+        engine's ``eta_level`` argument (canonical default 1.42), eroded by
+        dη/dt = −κ_eta·max(0, j_issue − j_verified)/v_stock. NOTE: distinct
+        from the config's alienation-extraction RATE parameter ``eta``.
+        """
+        return None if self._Eta is None else self._Eta.copy()
+
+    @property
+    def issued_cumulative(self) -> np.ndarray | None:
+        """Cumulative per-node issuance accumulator, or ``None`` (legacy).
+
+        Stays zero unless the substrate supplies ``issuance_fn``. The kernel
+        only accumulates — the semantic meaning of the accumulated magnitude
+        belongs to the caller.
+        """
+        if self._Eta is None:
+            return None
+        return self._issued_cum.copy()
+
+    def s_real(self, R: Any = None, C: Any = None, eta: Any = None) -> np.ndarray:
+        """Real resultant S_real = R·η / (R·η + C) ∈ [0, 1].
+
+        The η-deflated lens on the social content: the nominal ``s()`` is
+        ``R/(R + C)``; here R's transformative force is valued at the η level
+        before the ratio. Defaults to the current engine state (fast-channel
+        mode only — raises ``RuntimeError`` on the legacy path where η does
+        not exist). Degenerate guard: R·η + C → 0 pins S_real to 0.5.
+        """
+        if self._Eta is None:
+            raise RuntimeError(
+                "s_real requires the η state (opt-in fast channel); construct "
+                "ForceFieldDynamics(..., fast_channel=...) to enable it"
+            )
+        R_arr = self._R if R is None else _as_float_array(R, "R")
+        C_arr = self._C if C is None else _as_float_array(C, "C")
+        Eta_arr = self._Eta if eta is None else _as_float_array(eta, "eta")
+        R_real = np.maximum(R_arr, 0.0) * np.maximum(Eta_arr, 0.0)
+        total = R_real + np.maximum(C_arr, 0.0)
+        out = np.full_like(R_arr, 0.5, dtype=np.float64)
+        mask = total > _S_EPS
+        out[mask] = R_real[mask] / total[mask]
+        return np.clip(out, 0.0, 1.0)
+
     def fast_state(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Current ``(Φ, K)`` read-only copies, or ``None`` on the legacy path."""
         if self._Phi is None or self._K is None:
@@ -1160,6 +1343,18 @@ class ForceFieldDynamics:
             return None
         return (self._R.copy(), self._C.copy(), self._P.copy(),
                 self._Phi.copy(), self._K.copy())
+
+    def six_dim_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray,
+                                     np.ndarray, np.ndarray,
+                                     np.ndarray] | None:
+        """Current ``(R, C, P_R, Φ, K, η)`` read-only copies, or ``None`` (legacy).
+
+        η is the SIXTH STATE variable (SIXTH STATE 2026-09-16).
+        """
+        if self._Phi is None or self._K is None or self._Eta is None:
+            return None
+        return (self._R.copy(), self._C.copy(), self._P.copy(),
+                self._Phi.copy(), self._K.copy(), self._Eta.copy())
 
     def effective_rates(self, t: float | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Return the external-field-modulated rates (α_eff, β_eff) at time ``t``.
@@ -1238,6 +1433,19 @@ class ForceFieldDynamics:
     # ODE right-hand side
     # ------------------------------------------------------------------
 
+    def _r_growth_flow(self, a_eff: np.ndarray, R_arr: np.ndarray) -> np.ndarray:
+        """R's growth flow ``a_eff·R`` with the optional logistic ceiling.
+
+        ``capacity`` (K_cap) given ⇒ logistic ``a_eff·R·(1 − R/K_cap)``:
+        growth saturates at the carrying ceiling (a world-agnostic limiter —
+        the world supplies the magnitude, the kernel owns the logistic form).
+        ``None`` ≡ uncapped, the term is exactly the legacy ``a_eff·R``.
+        """
+        flow = a_eff * R_arr
+        if self._Kcap is not None:
+            flow = flow * (1.0 - R_arr / self._Kcap)
+        return flow
+
     def derivatives(self, t: float, R: Any = None, C: Any = None) -> tuple[np.ndarray, np.ndarray]:
         """ODE right-hand side for (R, C): growth − suppression + coupling + reservoir.
 
@@ -1286,8 +1494,13 @@ class ForceFieldDynamics:
         a_eff = self._a * _mult(self._a_fn, S_arr, T_arr)
         c_eff = self._c * _mult(self._c_fn, S_arr, T_arr)
         lam_eff = self._lam * _mult(self._lam_fn, T_arr)
+        # Spatial damping (SIXTH STATE round 2026-09-16): a_eff(i) =
+        # a₀·mult·exp(−latency_i/τ). None ≡ factor 1 (backward compat).
+        if self._spatial_damp is not None:
+            a_eff = a_eff * self._spatial_damp
 
-        dR = a_eff * R_arr - beta_eff * C_arr + lam_eff * P_arr - self._mu * R_arr
+        dR = self._r_growth_flow(a_eff, R_arr) - beta_eff * C_arr \
+            + lam_eff * P_arr - self._mu * R_arr
         dC = c_eff * C_arr - alpha_eff * R_arr
         # v1.6: C's suppression compresses R into P_R (βC → P_R) instead of
         # destroying it — total capacity T = R + P_R conserved under pressure
@@ -1334,6 +1547,11 @@ class ForceFieldDynamics:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """7-component RHS tracking P_R morphology: ``(dR, dC, dP_pool, dP_dist, dΦ, dK, dM)``.
 
+        Public contract UNCHANGED by the η round: a thin wrapper over
+        :meth:`_morphology_core` that resolves ``None`` arguments from the
+        current state and DROPS the η derivative. The integrator uses the
+        8-component core directly.
+
         Includes the §2.2b/v1.6 compression channel (``dP_pool += β_eff·C``,
         the counterpart of ``dR −= β_eff·C``) so T = R + P_R survives pressure,
         and the §2.4b tension-gated release (``release_fn``).
@@ -1347,24 +1565,59 @@ class ForceFieldDynamics:
             J_dissolve = k_dissolve * g(M) * P_pool: autonomous dissolution of pool into distributed form.
             dM/dt = J_sri_dist >= 0: cumulative socialization capacity.
         """
+        dR, dC, dPp, dPd, dPhi, dK, dM, _dEta = self._morphology_core(
+            t,
+            self._R if R is None else _as_float_array(R, "R"),
+            self._C if C is None else _as_float_array(C, "C"),
+            self._P_pool if P_pool is None else _as_float_array(P_pool, "P_pool"),
+            self._P_dist if P_dist is None else _as_float_array(P_dist, "P_dist"),
+            self._Phi if Phi is None else _as_float_array(Phi, "Phi"),
+            self._K if K is None else _as_float_array(K, "K"),
+            self._M if M is None else _as_float_array(M, "M"),
+            self._Eta,
+        )
+        return dR, dC, dPp, dPd, dPhi, dK, dM
+
+    def _morphology_core(
+        self,
+        t: float,
+        R_arr: np.ndarray,
+        C_arr: np.ndarray,
+        Pp_arr: np.ndarray,
+        Pd_arr: np.ndarray,
+        Phi_arr: np.ndarray,
+        K_arr: np.ndarray,
+        M_arr: np.ndarray,
+        Eta_arr: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+               np.ndarray, np.ndarray, np.ndarray]:
+        """8-component internal RHS: ``(dR, dC, dP_pool, dP_dist, dΦ, dK, dM, dη)``.
+
+        The first seven components are the morphology dynamics (see
+        :meth:`derivatives_morphology`); the eighth is the η value-level
+        erosion law (SIXTH STATE 2026-09-16):
+
+            dη/dt = −κ_eta · max(0, j_issue − j_verified) / v_stock
+
+        One-way by construction: η never enters the other seven equations —
+        it is a pure observable lens (``S_real``), and the substrate ctx stays
+        EXACTLY the seven universal observables (contract-tested).
+        """
         if self._fast is None:
             raise RuntimeError(
                 "derivatives_morphology requires the opt-in fast channel; construct "
                 "ForceFieldDynamics(..., fast_channel=...) to enable it"
             )
-        R_arr = self._R if R is None else _as_float_array(R, "R")
-        C_arr = self._C if C is None else _as_float_array(C, "C")
-        Pp_arr = self._P_pool if P_pool is None else _as_float_array(P_pool, "P_pool")
-        Pd_arr = self._P_dist if P_dist is None else _as_float_array(P_dist, "P_dist")
-        Phi_arr = self._Phi if Phi is None else _as_float_array(Phi, "Phi")
-        K_arr = self._K if K is None else _as_float_array(K, "K")
-        M_arr = self._M if M is None else _as_float_array(M, "M")
 
         fc = self._fc
         _alpha_eff, beta_eff = self.effective_rates(t)
         S_arr = self.s(R_arr, C_arr)
         T_arr = self.tension(R_arr, C_arr)
         a_eff = self._a * _apply_multiplier(self._a_fn, S_arr, T_arr)
+        # Spatial damping (SIXTH STATE round 2026-09-16): a_eff(i) =
+        # a₀·mult·exp(−latency_i/τ). None ≡ factor 1 (backward compat).
+        if self._spatial_damp is not None:
+            a_eff = a_eff * self._spatial_damp
         # §2.4b tension-gated reservoir opening (v1.6): the release rate is a
         # substrate feedback of tension — high tension cracks the reservoir
         # open; None ⇒ constant. Restored in the 5-D path, which had dropped it
@@ -1384,7 +1637,7 @@ class ForceFieldDynamics:
         # self-organises into latent form (going underground / memorisation).
         # The 5-D path had dropped it (as it had dropped βC); μ is a
         # constructor argument and was silently ignored here.
-        dR = (a_eff * R_arr - fc["delta"] * R_arr
+        dR = (self._r_growth_flow(a_eff, R_arr) - fc["delta"] * R_arr
               + Phi_arr * fc["mu_f"] * R_arr
               + (1.0 - fc["eta"]) * lam_eff * Pp_arr
               - beta_eff * C_arr
@@ -1473,7 +1726,21 @@ class ForceFieldDynamics:
             dPd = dPd + j_sri_dist
             dM = dM + j_sri_dist
 
-        return dR, dC, dPp, dPd, dPhi, dK, dM
+        # ── η value-level erosion (SIXTH STATE 2026-09-16) ────────────────
+        # dη/dt = −κ_eta · max(0, j_issue − j_verified) / v_stock. Both flows
+        # are non-negative driver magnitudes (same contract as every other
+        # substrate slot); the stock denominator is floored at 1e-9. With the
+        # defaults (issuance_fn=None, kappa_eta=0) η is inert — the pre-η
+        # dynamics are bit-identical.
+        j_issue = _driver_value(0.0, fc["issuance_fn"], t, ctx, Eta_arr,
+                                "issuance")
+        j_verified = _driver_value(0.0, fc["verified_growth_fn"], t, ctx,
+                                   Eta_arr, "verified_growth")
+        v_stock = np.maximum(fc["verified_stock"], 1e-9)
+        dEta = -(fc["kappa_eta"] * np.maximum(0.0, j_issue - j_verified)
+                 / v_stock)
+
+        return dR, dC, dPp, dPd, dPhi, dK, dM, dEta
 
     def derivatives_5d(
         self,
@@ -1527,24 +1794,25 @@ class ForceFieldDynamics:
     # ------------------------------------------------------------------
 
     def _integrate_5d(self, dt: float) -> None:
-        """Continuous 7-component step (no seasonal operator) using ``method``."""
+        """Continuous 8-component step (no seasonal operator) using ``method``."""
         if dt <= 0:
             return
-        y = (self._R, self._C, self._P_pool, self._P_dist, self._Phi, self._K, self._M)
+        y = (self._R, self._C, self._P_pool, self._P_dist, self._Phi,
+             self._K, self._M, self._Eta)
         if self._method == "rk4":
             t = self._t
-            k1 = self.derivatives_morphology(t, *y)
+            k1 = self._morphology_core(t, *y)
 
             def _stage(frac: float, ks) -> tuple:
                 return tuple(b + frac * dt * k for b, k in zip(y, ks))
 
-            k2 = self.derivatives_morphology(t + 0.5 * dt, *_stage(0.5, k1))
-            k3 = self.derivatives_morphology(t + 0.5 * dt, *_stage(0.5, k2))
-            k4 = self.derivatives_morphology(t + dt, *_stage(1.0, k3))
+            k2 = self._morphology_core(t + 0.5 * dt, *_stage(0.5, k1))
+            k3 = self._morphology_core(t + 0.5 * dt, *_stage(0.5, k2))
+            k4 = self._morphology_core(t + dt, *_stage(1.0, k3))
             inc = tuple((k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]) * (dt / 6.0)
-                        for i in range(7))
+                        for i in range(8))
         else:  # euler
-            inc = tuple(v * dt for v in self.derivatives_morphology(self._t, *y))
+            inc = tuple(v * dt for v in self._morphology_core(self._t, *y))
 
         new_R = self._R + inc[0]
         new_C = self._C + inc[1]
@@ -1553,6 +1821,7 @@ class ForceFieldDynamics:
         new_Phi = np.clip(self._Phi + inc[4], _PHI_MIN, _PHI_MAX)
         new_K = self._K + inc[5]
         new_M = self._M + inc[6]
+        new_Eta = self._Eta + inc[7]
 
         if self._clamp_nonneg:
             new_R = np.maximum(new_R, 0.0)
@@ -1561,6 +1830,7 @@ class ForceFieldDynamics:
             new_Pd = np.maximum(new_Pd, 0.0)
             new_K = np.maximum(new_K, 0.0)
             new_M = np.maximum(new_M, 0.0)
+            new_Eta = np.maximum(new_Eta, 0.0)
 
         self._t += dt
         self._R = new_R
@@ -1571,6 +1841,7 @@ class ForceFieldDynamics:
         self._Phi = new_Phi
         self._K = new_K
         self._M = new_M
+        self._Eta = new_Eta
 
     def _season_events(self, t0: float, t1: float) -> list[tuple[float, str]]:
         """Seasonal operator-split events in the half-open interval ``(t0, t1]``.
@@ -1638,7 +1909,8 @@ class ForceFieldDynamics:
             events = self._season_events(self._t, t1)
             if not events:
                 self._integrate_5d(remaining)
-                return
+                remaining = 0.0
+                break
             te, kind = events[0]
             sub = te - self._t
             if sub > _FAST_T_EPS:
@@ -1649,6 +1921,22 @@ class ForceFieldDynamics:
                 # sub-epsilon remainder and consume the event below.
                 remaining = 0.0
             self._apply_season_event(kind)
+
+        # ── issuance accumulator (SIXTH STATE round 2026-09-16) ───────────
+        # Mechanical post-step injection (the step()'s "after the R update"
+        # hook): the substrate's per-step issuance amount is added to a
+        # cumulative counter ONLY — it never touches R/C (the caller decides
+        # what issuance means downstream). One call per advance, at the
+        # post-step time, against the universal-observables ctx. Placed AFTER
+        # the operator-split loop so BOTH exit paths (with or without seasonal
+        # events) accumulate exactly once per advance.
+        if self._fc.get("issuance_fn") is not None:
+            ctx = {"R": self._R, "C": self._C, "P": self._P_pool,
+                   "Phi": self._Phi, "K": self._K, "S": self.s(),
+                   "T": self.tension()}
+            issued = _driver_value(0.0, self._fc["issuance_fn"], self._t, ctx,
+                                   self._R, "issuance")
+            self._issued_cum = self._issued_cum + issued
 
     def _advance(self, dt: float) -> None:
         """Advance the internal state by one step of ``dt`` using ``method``.
@@ -1707,6 +1995,10 @@ class ForceFieldDynamics:
         if self._fast is not None:
             snap["Phi"] = self._Phi.copy()
             snap["K"] = self._K.copy()
+            # SIXTH STATE: η state + real/nominal S columns + issuance counter.
+            snap["Eta"] = self._Eta.copy()
+            snap["S_real"] = self.s_real()
+            snap["issued_cumulative"] = self._issued_cum.copy()
         return snap
 
     def run(self, t_end: float, dt: float | None = None) -> ForceTrajectory:
@@ -1744,6 +2036,10 @@ class ForceFieldDynamics:
                   if fast else None)
         G_sat_hist = (np.empty((n_steps + 1, self._n), dtype=np.float64)
                       if fast else None)
+        Eta_hist = (np.empty((n_steps + 1, self._n), dtype=np.float64)
+                    if fast else None)
+        Issued_hist = (np.empty((n_steps + 1, self._n), dtype=np.float64)
+                       if fast else None)
 
         times[0] = self._t
         R_hist[0] = self._R
@@ -1756,6 +2052,8 @@ class ForceFieldDynamics:
             P_dist_hist[0] = self._P_dist
             M_hist[0] = self._M
             G_sat_hist[0] = self.g_sat
+            Eta_hist[0] = self._Eta
+            Issued_hist[0] = self._issued_cum
 
         for k in range(1, n_steps + 1):
             target = t0 + k * dt
@@ -1776,6 +2074,8 @@ class ForceFieldDynamics:
                 P_dist_hist[k] = self._P_dist
                 M_hist[k] = self._M
                 G_sat_hist[k] = self.g_sat
+                Eta_hist[k] = self._Eta
+                Issued_hist[k] = self._issued_cum
 
         # If a remainder (< dt) still separates us from t_end, take one short step.
         if self._t < t_end - 1e-12:
@@ -1791,14 +2091,19 @@ class ForceFieldDynamics:
                 P_dist_hist = np.vstack([P_dist_hist, self._P_dist])
                 M_hist = np.vstack([M_hist, self._M])
                 G_sat_hist = np.vstack([G_sat_hist, self.g_sat])
+                Eta_hist = np.vstack([Eta_hist, self._Eta])
+                Issued_hist = np.vstack([Issued_hist, self._issued_cum])
 
         S_hist = np.empty_like(R_hist)
         T_hist = np.empty_like(R_hist)      # T = R + P_R (conservation observable)
         tens_hist = np.empty_like(R_hist)   # tension = f(R·C) (§2.4)
+        S_real_hist = (np.empty_like(R_hist) if fast else None)
         for k in range(len(times)):
             S_hist[k] = self.s(R_hist[k], C_hist[k])
             T_hist[k] = R_hist[k] + P_hist[k]
             tens_hist[k] = self.tension(R_hist[k], C_hist[k])
+            if fast:
+                S_real_hist[k] = self.s_real(R_hist[k], C_hist[k], Eta_hist[k])
 
         meta = {
             "method": self._method,
@@ -1829,6 +2134,7 @@ class ForceFieldDynamics:
                 "provenance": self._fast.provenance(),
                 "phi0": self._Phi0.tolist(),
                 "k0": self._K0.tolist(),
+                "eta0": self._Eta0.tolist(),
                 "year_period": self._fast.year_period,
                 "spring_phase": self._fast.spring_phase,
                 "autumn_phase": self._fast.autumn_phase,
@@ -1842,10 +2148,12 @@ class ForceFieldDynamics:
             phi=Phi_hist, k_pool=K_hist,
             p_pool=P_pool_hist, p_dist=P_dist_hist,
             m_cum=M_hist, g_sat=G_sat_hist,
+            eta=Eta_hist, s_real=S_real_hist,
+            issued_cumulative=Issued_hist,
         )
 
     def reset(self, t0: float = 0.0) -> "ForceFieldDynamics":
-        """Restore initial forces (R₀, C₀, P_R,₀), Φ₀, K₀, morphology and time ``t0``. Returns self."""
+        """Restore initial forces (R₀, C₀, P_R,₀), Φ₀, K₀, η₀, morphology and time ``t0``. Returns self."""
         self._t = float(t0)
         self._R = self._R0.copy()
         self._C = self._C0.copy()
@@ -1857,6 +2165,8 @@ class ForceFieldDynamics:
             self._P_dist = self._P_dist0.copy()
             self._M = self._M0.copy()
             self._P = self._P_pool + self._P_dist
+            self._Eta = self._Eta0.copy()
+            self._issued_cum = np.zeros_like(self._issued_cum)
         return self
 
     # ------------------------------------------------------------------

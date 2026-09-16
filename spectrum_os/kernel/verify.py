@@ -166,6 +166,109 @@ evaluate = verify
 
 
 # ---------------------------------------------------------------------------
+# Bounded-issuance invariant (SIXTH STATE round 2026-09-16)
+# ---------------------------------------------------------------------------
+
+_ISSUANCE_FLOOR = 1e-12   # guards division / strict-positivity comparisons
+_ISSUANCE_EPS = 1e-9      # relative slack on the flow bound
+
+
+def check_issuance_bound(
+    issued_cumulative,
+    *,
+    max_single_year=None,
+    years_elapsed=None,
+    r_initial=None,
+    r_final=None,
+    magnitude_cap=1e6,
+) -> dict:
+    """Bounded-issuance invariant check (world-agnostic, mechanical).
+
+    Two independent invariants over a per-node cumulative-issuance magnitude
+    (e.g. ``ForceTrajectory.issued_cumulative`` / ``issued_cumulative``
+    property). Each is evaluated only when its arguments are supplied;
+    ``None`` results mean "not evaluated", not "passed".
+
+    * **Flow bound** — ``total_issuance_i ≤ max_single_year × years_elapsed``:
+      cumulative issuance cannot exceed the maximum annual issuance rate
+      sustained over the elapsed horizon. Needs ``max_single_year`` AND
+      ``years_elapsed`` (> 0).
+    * **Magnitude bound** — ``R_i(final) ≤ R_i(0) × magnitude_cap``: an
+      order-of-magnitude assertion (NOT a canonical iron law) on the force
+      stock the issuance feeds — a blow-up beyond ``magnitude_cap`` decades of
+      the initial stock signals an unbounded/unphysical run. Needs
+      ``r_initial`` AND ``r_final`` (per-node arrays or scalars);
+      ``magnitude_cap`` defaults to 1e6.
+
+    The kernel does not know what the issued magnitude means economically —
+    it only checks the bound's arithmetic. Returns a JSON-safe dict:
+
+        {"flow_bound_ok": bool | None,
+         "magnitude_bound_ok": bool | None,
+         "detail": {...per-node violators / observed ratios...}}
+    """
+    issued = np.asarray(issued_cumulative, dtype=np.float64)
+    if issued.ndim == 0:
+        issued = issued.reshape(1)
+    if np.any(issued < 0):
+        raise ValueError(
+            f"issued_cumulative must be non-negative, got {issued.tolist()}"
+        )
+
+    detail: dict = {"n_nodes": int(issued.size),
+                    "total_issuance_max": float(np.max(issued))}
+
+    flow_ok: bool | None = None
+    if max_single_year is not None and years_elapsed is not None:
+        if years_elapsed <= 0:
+            raise ValueError(
+                f"years_elapsed must be positive, got {years_elapsed}"
+            )
+        if max_single_year < 0:
+            raise ValueError(
+                f"max_single_year must be non-negative, got {max_single_year}"
+            )
+        budget = float(max_single_year) * float(years_elapsed)
+        budget += _ISSUANCE_EPS * max(budget, 1.0)   # relative slack
+        violators = np.nonzero(issued > max(budget, _ISSUANCE_FLOOR))[0]
+        flow_ok = bool(violators.size == 0)
+        detail["flow_bound"] = {
+            "budget": budget,
+            "violator_nodes": violators.tolist(),
+            "worst_ratio": float(np.max(issued) / max(budget, _ISSUANCE_FLOOR)),
+        }
+
+    mag_ok: bool | None = None
+    if r_initial is not None and r_final is not None:
+        r0 = np.asarray(r_initial, dtype=np.float64)
+        r1 = np.asarray(r_final, dtype=np.float64)
+        if r0.shape != r1.shape:
+            raise ValueError(
+                f"r_initial shape {r0.shape} != r_final shape {r1.shape}"
+            )
+        if np.any(r0 < 0) or np.any(r1 < 0):
+            raise ValueError("r_initial / r_final must be non-negative")
+        if magnitude_cap <= 0:
+            raise ValueError(
+                f"magnitude_cap must be positive, got {magnitude_cap}"
+            )
+        ceiling = np.maximum(r0, _ISSUANCE_FLOOR) * float(magnitude_cap)
+        violators = np.nonzero(r1 > ceiling)[0]
+        mag_ok = bool(violators.size == 0)
+        detail["magnitude_bound"] = {
+            "magnitude_cap": float(magnitude_cap),
+            "violator_nodes": violators.tolist(),
+            "worst_ratio": float(np.max(r1 / ceiling)),
+        }
+
+    return {
+        "flow_bound_ok": flow_ok,
+        "magnitude_bound_ok": mag_ok,
+        "detail": detail,
+    }
+
+
+# ---------------------------------------------------------------------------
 # JSONL persistence (opt-in via init_log)
 # ---------------------------------------------------------------------------
 

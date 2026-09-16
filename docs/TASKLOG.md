@@ -136,3 +136,11 @@
 ## 文件職能變更紀錄
 
 - **2026-08-03**：本文件（TASKLOG.md）+ `docs/PLAN.md` 建立——OS 本體從 ECC PLAN-23 獨立（三分：規格→PLAN.md、日誌→TASKLOG.md、應用→ECC PLAN-23）。
+
+## 🧊 四大缺口定點解凍：η 第六狀態 + issuance 通道 + R 承載項 + 空間阻尼（2026-09-16）
+
+> 用戶裁定定點解凍（08-11 凍結令的例外白名單擴充）＋ THEORY-LEDGER :406「η 不作狀態量進方程」修訂批准。
+
+| commit | 內容 |
+|:---|:---|
+| 本輪 | [Forces] kernel 層：η 狀態量（第六狀態，種子 1.42，dη/dt = −κ_η·max(0, issuance−verified)/stock）+ `issuance_fn` 合法注入通道（機械累計器，不觸 R/C）+ R logistic 承載項 `a_eff·R·(1−R/K_cap)`（`capacity` 參數，雙路徑）+ 空間阻尼 `a_eff(i)=a₀·exp(−latency_i/τ)`（`spatial_latency`/`tau_spatial`，雙路徑）+ `verify.check_issuance_bound` 有界不變量（flow/magnitude 兩式）——908 行 kernel diff 全部零世界詞（kernel 只知 issuance/capacity/eta_level）；S_nominal/S_real 兩欄（`s_real()`、trajectory `eta`/`s_real`/`issued_cumulative`、step snapshot `Eta`/`S_real`/`issued_cumulative`、`six_dim_state()`）。 向後兼容：預設參數下 legacy golden digests 不變、探針三支輸出 byte-identical、η 慣性（κ_η=0）。 **測試**：889 passed + 1 pre-existing red（`test_quantum.py::test_real_warfare_tomography_track0`，ASSERTED→CONTESTED 數值漂移，乾淨 HEAD `0dbc282` 同樣失飛——本輪之前已存在，屬 §8.2 預言的「凍結期環境漂移」，待人類/下輪 debug）。 新增 `tests/test_forces_eta_issuance.py` 36 tests。 ECC 側：substrate 煙霧（3 節點 step×5，S/S_real 合理）、1,172 卷驗證器全綠（dkk 452/452 + gnp 720/720、路徑缺漏 0）。 **不 push**——依修改律 2.5 agent 停在本地 commit，交接清單見會話報告。 |

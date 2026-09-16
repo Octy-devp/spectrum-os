@@ -56,6 +56,12 @@ BASE_CFG: dict[str, Any] = {
     "t_c_phi": 1.0, "t_c_p": 1.0, "t_c_k": 1.0,
     "m_half": 0.50, "mu_sri_to_dist": 0.60, "k_dissolve": 0.40, "m0": 0.20,
     "p_pool0": 0.30, "p_dist0": 0.10,
+    # η value-level channel (SIXTH STATE 2026-09-16): kept LIVE so κ_eta /
+    # verified_stock reachability is measurable — without an issuance flow the
+    # erosion law is vacuously inert and the guard would mislabel wired params.
+    "issuance_fn": lambda t, ctx: np.full_like(ctx["C"], 0.40),
+    "kappa_eta": 0.15,
+    "verified_stock": 1.5,
 }
 
 BASE_ENGINE: dict[str, Any] = {
@@ -82,6 +88,10 @@ def _trajectory(cfg_kwargs: dict[str, Any],
     traj = eng.run(HORIZON)
     parts = [traj.R.ravel(), traj.C.ravel(), traj.P.ravel(), traj.phi.ravel(),
              traj.k_pool.ravel(), np.atleast_1d(traj.final_s())]
+    if traj.eta is not None:
+        # SIXTH STATE (η) is an emitted observable too — a parameter that only
+        # moves η (e.g. κ_eta) must still count as reachable.
+        parts.append(traj.eta.ravel())
     return np.concatenate(parts)
 
 
