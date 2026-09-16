@@ -150,9 +150,12 @@ class TestRealAndNominalColumns:
         traj = eng.run(0.5)
         assert np.all(traj.s_real >= traj.S - 1e-12)
 
-    def test_degenerate_state_pins_half(self):
+    def test_degenerate_state_pins_zero(self):
+        # AUDIT FIX 2026-09-16: degenerate R·η + C → 0 is institutional
+        # collapse (both real-valued forces gone), NOT a healthy tie — the
+        # old 0.5 default called a dead node "neutral middle".
         eng = _fast()
-        assert eng.s_real(R=0.0, C=0.0)[0] == pytest.approx(0.5)
+        assert eng.s_real(R=0.0, C=0.0)[0] == pytest.approx(0.0)
 
     def test_snapshot_and_dict_columns(self):
         eng = _fast()
@@ -343,6 +346,75 @@ class TestIssuanceBound:
         with pytest.raises(ValueError):
             check_issuance_bound([1.0], r_initial=[1.0], r_final=[1.0],
                                  magnitude_cap=0.0)
+
+
+class TestAuditFixes20260916:
+    """agy 第三輪終審修復——NaN/Inf 毒化防護、R 承載項平滑夾制、τ_spatial 帶。
+
+    World-agnostic regression tests: each pins an audit fix so the fix
+    cannot silently regress (the poisoning bugs were all SILENT passes).
+    """
+
+    def test_nan_issuance_fn_raises(self):
+        def _nan(t, ctx):
+            return float("nan")
+        eng = _fast(issuance_fn=_nan, dt=1.0)
+        with pytest.raises(ValueError, match="NaN/Inf"):
+            eng.step()
+
+    def test_inf_issuance_fn_raises(self):
+        def _inf(t, ctx):
+            return float("inf")
+        eng = _fast(issuance_fn=_inf, dt=1.0)
+        with pytest.raises(ValueError, match="NaN/Inf"):
+            eng.step()
+
+    def test_nan_driver_guard_covers_all_slots(self):
+        """The guard lives in _driver_value — every fast-channel substrate
+        slot (c_source_fn / phi_drive_fn / k_inflow_fn / issuance_fn / …)
+        inherits it, not just the issuance channel."""
+        def _nan(t, ctx):
+            return float("nan")
+        eng = _fast(c_source_fn=_nan, dt=1.0)
+        with pytest.raises(ValueError, match="NaN/Inf"):
+            eng.step()
+
+    def test_bound_check_nan_fails_flow_bound(self):
+        """IEEE 754: NaN > budget is False ⇒ the old code silently passed."""
+        res = check_issuance_bound([1.0, float("nan")], max_single_year=1.0,
+                                   years_elapsed=3.0)
+        assert res["flow_bound_ok"] is False
+        assert res["detail"]["nonfinite_nodes"] == [1]
+        json.dumps(res)  # JSON-safe even in the poisoned branch
+
+    def test_bound_check_nan_fails_magnitude_bound(self):
+        res = check_issuance_bound([1.0], r_initial=[1.0],
+                                   r_final=[float("inf")])
+        assert res["magnitude_bound_ok"] is False
+        json.dumps(res)
+
+    def test_r_overload_decays_without_sudden_death(self):
+        """R ≫ K_cap: raw logistic factor ⇒ huge negative flow ⇒ Euler sign
+        flip ⇒ clamp erases to 0 (non-physical sudden death). The smoothed
+        floor stops inflow instead; the node decays back naturally."""
+        eng = ForceFieldDynamics(10.0, 0.0, growth_r=0.5, mu=0.2, beta=0.0,
+                                 capacity=1.0, method="euler", dt=1.0)
+        traj = eng.run(5.0)
+        R = traj.R[:, 0]
+        assert np.all(np.isfinite(R))
+        assert np.all(R >= 0.0)
+        assert np.all(np.diff(R) < 0.0)   # monotone decay, no crash to zero
+        assert R[1] == pytest.approx(8.0)  # first step: μ·R only, not −47
+        assert R[-1] > 1.0                 # still well above zero at horizon
+
+    def test_tau_spatial_plausibility_band(self):
+        # Dimensional contract: τ in the same unit as dt (years recommended);
+        # values outside [0.1, 100] almost always mean a unit mismatch.
+        with pytest.raises(ValueError, match="plausible band"):
+            ForceFieldDynamics(1.0, 0.5, spatial_latency=1.0, tau_spatial=0.01)
+        with pytest.raises(ValueError, match="plausible band"):
+            ForceFieldDynamics(1.0, 0.5, spatial_latency=1.0, tau_spatial=1e4)
+        ForceFieldDynamics(1.0, 0.5, spatial_latency=1.0, tau_spatial=0.5)
 
     def test_end_to_end_with_trajectory(self):
         eng = _fast(issuance_fn=_const(2.0), dt=1.0)

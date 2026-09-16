@@ -164,6 +164,12 @@ def _driver_value(slot: Any, fn: Callable | None, t: float, ctx: dict,
     if arr.ndim == 0:
         arr = np.full(like.shape, float(arr))
     arr = np.broadcast_to(arr, like.shape)
+    # NaN/Inf poisoning guard (AUDIT FIX 2026-09-16): under IEEE 754 the
+    # comparison ``NaN < 0`` is always False, so the negative check below
+    # silently passes a NaN through into the state. Refuse at the injection
+    # point instead — a poisoned driver must be loud, not latent.
+    if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+        raise ValueError(f"substrate driver {name} returned NaN/Inf at t={t}")
     if np.any(arr < 0):
         raise ValueError(f"substrate driver {name} returned a negative value")
     return arr
@@ -717,6 +723,14 @@ class ForceFieldDynamics:
         per-node hub latency (world-supplied) and a positive damping time
         constant. Both ``None`` (default) ≡ disabled (backward compatible).
         Applies on BOTH the legacy and 5-D paths.
+
+        ⚠ Dimensional contract (AUDIT FIX 2026-09-16): ``spatial_latency``
+        and ``tau_spatial`` MUST be expressed in the SAME time unit — and
+        that unit must be the engine's integration unit (``dt``; years
+        recommended). Mixing days and months across the two (or against
+        ``dt``) silently rescales the damping by up to ~126×. The kernel
+        cannot infer units, so it only enforces a plausibility band on
+        ``tau_spatial`` ∈ [0.1, 100]; unit discipline belongs to the caller.
     """
 
     def __init__(
@@ -820,6 +834,17 @@ class ForceFieldDynamics:
                 raise ValueError(
                     f"tau_spatial must be strictly positive when spatial "
                     f"latency is used, got {tau_spatial}"
+                )
+            # Plausibility band (AUDIT FIX 2026-09-16): τ is a damping time in
+            # the SAME unit as dt (see class docstring dimensional contract).
+            # Values outside [0.1, 100] almost always mean a unit mismatch
+            # (days fed into a yearly engine, etc.) rather than intent.
+            if not (0.1 <= float(tau_spatial) <= 100.0):
+                raise ValueError(
+                    f"tau_spatial {tau_spatial} outside plausible band "
+                    f"[0.1, 100] (same time unit as dt — years recommended); "
+                    f"if this is intentional, rescale the value, do not "
+                    f"loosen the band"
                 )
             lat = _broadcast(0.0 if spatial_latency is None else spatial_latency,
                              n, "spatial_latency")
@@ -1307,7 +1332,24 @@ class ForceFieldDynamics:
         ``R/(R + C)``; here R's transformative force is valued at the η level
         before the ratio. Defaults to the current engine state (fast-channel
         mode only — raises ``RuntimeError`` on the legacy path where η does
-        not exist). Degenerate guard: R·η + C → 0 pins S_real to 0.5.
+        not exist).
+
+        η semantics (AUDIT NOTE 2026-09-16, asymmetry declared — formula
+        unchanged for backward compatibility): η is the Parity Ratio (法定
+        平價比), NOT a price deflator. η = 1.42 is the canonical baseline
+        over-collateralization at the base period. Only R's transformative
+        force is valued at parity; C is NOT deflated — the inflation rigidity
+        of C is an INSTITUTIONAL ASSUMPTION: friction is a structure of
+        institutions and does not swell with the currency. The asymmetry is
+        therefore deliberate: deflating both sides would silently rewrite
+        that assumption.
+
+        Degenerate guard (AUDIT FIX 2026-09-16): ``R·η + C → 0`` pins S_real
+        to **0.0**, not 0.5. Degeneracy here means BOTH the (parity-valued)
+        transformative force and the conservative force have vanished — an
+        institutional collapse. Collapsing a system to zero real content is
+        not a neutral middle; reporting 0.5 ("healthy tie") for a dead node
+        was a semantic lie. Zero = the socialist ratio is gone.
         """
         if self._Eta is None:
             raise RuntimeError(
@@ -1319,7 +1361,9 @@ class ForceFieldDynamics:
         Eta_arr = self._Eta if eta is None else _as_float_array(eta, "eta")
         R_real = np.maximum(R_arr, 0.0) * np.maximum(Eta_arr, 0.0)
         total = R_real + np.maximum(C_arr, 0.0)
-        out = np.full_like(R_arr, 0.5, dtype=np.float64)
+        # Degenerate (total ≤ eps) ⇒ 0.0: institutional collapse, NOT a
+        # neutral state (see docstring — AUDIT FIX 2026-09-16).
+        out = np.zeros_like(R_arr, dtype=np.float64)
         mask = total > _S_EPS
         out[mask] = R_real[mask] / total[mask]
         return np.clip(out, 0.0, 1.0)
@@ -1440,10 +1484,17 @@ class ForceFieldDynamics:
         growth saturates at the carrying ceiling (a world-agnostic limiter —
         the world supplies the magnitude, the kernel owns the logistic form).
         ``None`` ≡ uncapped, the term is exactly the legacy ``a_eff·R``.
+
+        Above the ceiling (R > K_cap) the logistic factor is floored at zero
+        (AUDIT FIX 2026-09-16): the raw ``(1 − R/K_cap)`` would produce a huge
+        NEGATIVE flow that a single Euler step turns into a sign flip and the
+        non-negativity clamp then erases — a non-physical sudden death. With
+        the floor, an overloaded node simply stops inflowing and decays back
+        toward the ceiling through its own outflow terms.
         """
         flow = a_eff * R_arr
         if self._Kcap is not None:
-            flow = flow * (1.0 - R_arr / self._Kcap)
+            flow = flow * np.maximum(0.0, 1.0 - R_arr / self._Kcap)
         return flow
 
     def derivatives(self, t: float, R: Any = None, C: Any = None) -> tuple[np.ndarray, np.ndarray]:

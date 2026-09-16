@@ -214,9 +214,19 @@ def check_issuance_bound(
         raise ValueError(
             f"issued_cumulative must be non-negative, got {issued.tolist()}"
         )
+    # NaN/Inf poisoning guard (AUDIT FIX 2026-09-16): under IEEE 754 every
+    # ``NaN > budget`` comparison is False, so a poisoned accumulator would
+    # silently PASS the flow bound below. Non-finite input ⇒ the bound it
+    # feeds is reported as failed, never as passed. NaN also breaks
+    # JSON-safety of ``detail``, so the recorded max excludes non-finite
+    # entries and the offending nodes are listed explicitly.
+    nonfinite = ~np.isfinite(issued)
+    nonfinite_nodes = np.nonzero(nonfinite)[0]
 
     detail: dict = {"n_nodes": int(issued.size),
-                    "total_issuance_max": float(np.max(issued))}
+                    "total_issuance_max": float(np.max(np.where(nonfinite, 0.0, issued)))}
+    if nonfinite_nodes.size:
+        detail["nonfinite_nodes"] = nonfinite_nodes.tolist()
 
     flow_ok: bool | None = None
     if max_single_year is not None and years_elapsed is not None:
@@ -228,15 +238,24 @@ def check_issuance_bound(
             raise ValueError(
                 f"max_single_year must be non-negative, got {max_single_year}"
             )
-        budget = float(max_single_year) * float(years_elapsed)
-        budget += _ISSUANCE_EPS * max(budget, 1.0)   # relative slack
-        violators = np.nonzero(issued > max(budget, _ISSUANCE_FLOOR))[0]
-        flow_ok = bool(violators.size == 0)
-        detail["flow_bound"] = {
-            "budget": budget,
-            "violator_nodes": violators.tolist(),
-            "worst_ratio": float(np.max(issued) / max(budget, _ISSUANCE_FLOOR)),
-        }
+        if nonfinite_nodes.size:
+            flow_ok = False
+            detail["flow_bound"] = {
+                "budget": float(max_single_year) * float(years_elapsed),
+                "violator_nodes": nonfinite_nodes.tolist(),
+                "worst_ratio": "nan (non-finite issuance)",
+                "reason": "non-finite issuance (NaN/Inf) — bound cannot pass",
+            }
+        else:
+            budget = float(max_single_year) * float(years_elapsed)
+            budget += _ISSUANCE_EPS * max(budget, 1.0)   # relative slack
+            violators = np.nonzero(issued > max(budget, _ISSUANCE_FLOOR))[0]
+            flow_ok = bool(violators.size == 0)
+            detail["flow_bound"] = {
+                "budget": budget,
+                "violator_nodes": violators.tolist(),
+                "worst_ratio": float(np.max(issued) / max(budget, _ISSUANCE_FLOOR)),
+            }
 
     mag_ok: bool | None = None
     if r_initial is not None and r_final is not None:
@@ -252,14 +271,26 @@ def check_issuance_bound(
             raise ValueError(
                 f"magnitude_cap must be positive, got {magnitude_cap}"
             )
-        ceiling = np.maximum(r0, _ISSUANCE_FLOOR) * float(magnitude_cap)
-        violators = np.nonzero(r1 > ceiling)[0]
-        mag_ok = bool(violators.size == 0)
-        detail["magnitude_bound"] = {
-            "magnitude_cap": float(magnitude_cap),
-            "violator_nodes": violators.tolist(),
-            "worst_ratio": float(np.max(r1 / ceiling)),
-        }
+        # Same poisoning guard as the flow bound: ``NaN > ceiling`` is False,
+        # so a non-finite final stock must fail the bound, not pass it.
+        nonfinite_r = np.nonzero(~(np.isfinite(r0) & np.isfinite(r1)))[0]
+        if nonfinite_r.size:
+            mag_ok = False
+            detail["magnitude_bound"] = {
+                "magnitude_cap": float(magnitude_cap),
+                "violator_nodes": nonfinite_r.tolist(),
+                "worst_ratio": "nan (non-finite stock)",
+                "reason": "non-finite r_initial/r_final — bound cannot pass",
+            }
+        else:
+            ceiling = np.maximum(r0, _ISSUANCE_FLOOR) * float(magnitude_cap)
+            violators = np.nonzero(r1 > ceiling)[0]
+            mag_ok = bool(violators.size == 0)
+            detail["magnitude_bound"] = {
+                "magnitude_cap": float(magnitude_cap),
+                "violator_nodes": violators.tolist(),
+                "worst_ratio": float(np.max(r1 / ceiling)),
+            }
 
     return {
         "flow_bound_ok": flow_ok,
