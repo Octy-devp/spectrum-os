@@ -1704,7 +1704,15 @@ class ForceFieldDynamics:
         # keep reproducing themselves. A world may replace the whole law via
         # c_source_fn.
         c_eff = self._c * _apply_multiplier(self._c_fn, S_arr, T_arr)
-        c_source = c_eff * C_arr + fc["kappa_c"] * (1.0 - Phi_arr)
+        # Institutional reproduction is a magnitude: the linear law is defined
+        # for C >= 0. RK4 stage states may transiently undershoot zero (the
+        # alpha_rc sink is then a restoring flow, so the continuous dynamics
+        # is self-correcting); reading C raw here would make c_source negative
+        # and trip the driver guard on a healthy trajectory. Same idiom as the
+        # magnitude reads in s()/tension()/panic weight.
+        # (AUDIT FIX 2026-09-17: fast5 lane crash "c_source returned a
+        # negative value" — stage undershoot, not substrate poison.)
+        c_source = c_eff * np.maximum(C_arr, 0.0) + fc["kappa_c"] * (1.0 - Phi_arr)
         c_source = _driver_value(c_source, fc["c_source_fn"], t, ctx, C_arr,
                                  "c_source")
         dC_sink = (fc["alpha_rc"] * R_arr * C_arr
