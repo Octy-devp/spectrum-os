@@ -172,6 +172,10 @@ class MarketDynamicsEngine:
     def __init__(self, config: MarketConfig, villages: Optional[List[VillageProfile]] = None):
         self.cfg = config
         self.villages = villages or []
+        # Per-village monthly sold_share history, stashed by run_simulation:
+        # {mode: {village_id: [float x (total_months+1)]}}. This is a retention of
+        # state the loop already computes (village_shares_history) — no physics change.
+        self.village_monthly: Dict[str, Dict[str, List[float]]] = {}
 
     def _interpolate_p_world(self, month_idx: int) -> float:
         p14 = self.cfg.p_world_series[1914]
@@ -325,6 +329,15 @@ class MarketDynamicsEngine:
             if month_in_year == 1 and str(year) not in annual_readouts:
                 annual_readouts[str(year)] = record
 
+        # Retain the full per-village monthly series (37 points, m=0..36) computed
+        # inside the loop. Values are the engine's own monthly sold_share outputs —
+        # not interpolation. The return dict stays unchanged so existing
+        # dynamics-gnp-{market}.json artifacts keep their exact shape.
+        if self.villages:
+            self.village_monthly[mode] = {
+                v.village_id: list(village_shares_history[v.village_id]) for v in self.villages
+            }
+
         return {
             'mode': mode,
             'total_months': total_months,
@@ -332,6 +345,124 @@ class MarketDynamicsEngine:
             'monthly_series': monthly_records,
             'village_shares_final': {v.village_id: village_shares_history[v.village_id][-1] for v in self.villages}
             if self.villages else {},
+        }
+
+    def village_monthly_series(self, village_id: str, mode: str = 'free_evolution') -> List[float]:
+        """Return the per-village monthly sold_share series for a regime.
+
+        Series length is total_months + 1 (37 points, 1914-01..1917-01), matching
+        the market-level monthly_series grid. Raises KeyError if the mode has not
+        been run or the village_id is unknown.
+        """
+        if mode not in self.village_monthly:
+            raise KeyError(
+                f"no village monthly history for mode '{mode}'; "
+                "run_simulation(mode=...) must run first"
+            )
+        series = self.village_monthly[mode]
+        if village_id not in series:
+            raise KeyError(
+                f"unknown village_id '{village_id}' for market '{self.cfg.market_id}'"
+            )
+        return list(series[village_id])
+
+    def build_village_monthly_document(
+        self,
+        suite: Optional[Dict[str, Any]] = None,
+        endpoint_tolerance: float = 1e-6,
+    ) -> Dict[str, Any]:
+        """Build the S-trajectory-gnp per-village monthly document (draft schema
+        ``s-trajectory-gnp-village-monthly-v1``).
+
+        Requires that all three regimes have been run on this engine (i.e. after
+        run_comparative_suite). If ``suite`` (the run_comparative_suite output) is
+        supplied, monthly series endpoints are cross-checked against the annual
+        three-regime village values in village_transmission (tolerance
+        ``endpoint_tolerance``, default 1e-6 — same convention as the DKK
+        S-trajectory v4 curation cross-check).
+        """
+        required_modes = ('free_evolution', 'cartel_lock', 'cartel_split')
+        missing = [m for m in required_modes if m not in self.village_monthly]
+        if missing:
+            raise ValueError(
+                f"village monthly history missing for regimes {missing}; "
+                "run_comparative_suite() must run first"
+            )
+        if not self.villages:
+            raise ValueError(
+                "no villages loaded for market "
+                f"'{self.cfg.market_id}'; per-village monthly serialization is undefined"
+            )
+
+        dates = [f'{1914 + m // 12}-{(m % 12) + 1:02d}' for m in range(36 + 1)]
+
+        village_entries = []
+        max_abs_dev = 0.0
+        suite_villages = {}
+        if suite is not None:
+            suite_villages = {
+                vr['village_id']: vr for vr in suite['village_transmission']['villages']
+            }
+        endpoint_field = {
+            'free_evolution': 'sold_share_1917_free',
+            'cartel_lock': 'sold_share_1917_lock',
+            'cartel_split': 'sold_share_1917_split',
+        }
+
+        for v in self.villages:
+            series_block = {}
+            for mode in required_modes:
+                s = self.village_monthly[mode][v.village_id]
+                series_block[mode] = s
+                if suite is not None and v.village_id in suite_villages:
+                    expected = suite_villages[v.village_id][endpoint_field[mode]]
+                    max_abs_dev = max(max_abs_dev, abs(s[-1] - expected))
+            village_entries.append({
+                'village_id': v.village_id,
+                'zone_id': v.zone_id,
+                'market_id': self.cfg.market_id,
+                'source_volume_1917': v.source_volume_1917,
+                'sold_share_1914': v.sold_share_1914,
+                'sold_share_monthly': series_block,
+            })
+
+        endpoint_consistency = {
+            'check': 'sold_share_monthly[regime][-1] == village_transmission sold_share_1917_{free,lock,split}',
+            'tolerance': endpoint_tolerance,
+            'max_abs_deviation': round(max_abs_dev, 10),
+            'cross_checked_against_suite': suite is not None,
+            'passed': max_abs_dev <= endpoint_tolerance,
+        }
+
+        return {
+            'schema': 's-trajectory-gnp-village-monthly-v1',
+            'track': 'projection',
+            'worldline': 'beta_1_gnp',
+            'market_id': self.cfg.market_id,
+            'commodity': self.cfg.commodity,
+            'geography': self.cfg.geography,
+            'base_unit': self.cfg.base_unit,
+            'dimension_declaration': {
+                'trajectory_quantity': 'village sold_share (marketed share of harvest, clamped [0.10, 1.0])',
+                'not_dkk_s': 'This is NOT the DKK ForceField S = R/(R+C). Per SLOT-MIRROR-SCHEMA §六, '
+                             'the GNP-side dynamics dimension is a market-structure quantity '
+                             '(p_farmgate / retention_rate / kappa / hhi / village_sold_share); '
+                             'kappa(t) here is the collusion index in [0,1], not a force ratio.',
+                'kappa_range': '[0, 1]',
+            },
+            'time_horizon': '1914-01..1917-01',
+            'dates': dates,
+            'total_villages': len(self.villages),
+            'model_specification': 'sold_share_v(t) = sold_share_v,1914 * (P_farmgate(t) / P_1914)^epsilon_p * [1 - epsilon_kappa * (kappa(t) - kappa_0)]',
+            'parameter_tagging': '[DERIVED_PROXY]',
+            'provenance': {
+                'canon_ruling': 'SINGLE_CANON_DIRECT_ADJUSTMENT',
+                'framework': 'SLOT-MIRROR-SCHEMA §六 + Lenin 1916 Monopoly-Competition Coexistence + Closed-Loop Feedback',
+                'source_volumes': self.cfg.source_volumes,
+                'generator': 'spectrum_os.extensions.market_suite_dynamics.MarketDynamicsEngine.build_village_monthly_document',
+            },
+            'villages': village_entries,
+            'endpoint_consistency': endpoint_consistency,
         }
 
     def run_comparative_suite(self, delta_idle_override: Optional[float] = None) -> Dict[str, Any]:
@@ -958,11 +1089,18 @@ def run_and_save_all_markets(
     output_dir: Path,
     root_path: Optional[Path] = None,
     delta_idle: float = 0.20,
+    save_village_monthly: bool = False,
 ) -> Dict[str, Any]:
-    """Run simulation for all 7 markets with 120-village feedback loop and save outputs."""
+    """Run simulation for all 7 markets with 120-village feedback loop and save outputs.
+
+    When ``save_village_monthly`` is True, additionally writes one
+    ``village-monthly-{market}.json`` per market (per-village monthly sold_share
+    series, schema draft s-trajectory-gnp-village-monthly-v1). Default False so
+    existing callers keep producing exactly the artifacts they produced before.
+    """
     root_path = _require_root(root_path)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Load all 120 villages
     all_market_villages = load_all_gnp_villages(root_path)
     total_villages = sum(len(v) for v in all_market_villages.values())
@@ -970,7 +1108,7 @@ def run_and_save_all_markets(
 
     configs = get_all_market_configs()
     market_results: Dict[str, Any] = {}
-    
+
     # Track macro distribution shift across all 120 villages
     all_village_shifts = []
 
@@ -979,13 +1117,25 @@ def run_and_save_all_markets(
         cfg.delta_idle = delta_idle
         engine = MarketDynamicsEngine(cfg, villages=v_list)
         suite = engine.run_comparative_suite(delta_idle_override=delta_idle)
-        
+
         # Save individual market file
         out_file = output_dir / f'dynamics-gnp-{mid.replace("_", "-")}.json'
         with open(out_file, 'w', encoding='utf-8') as f:
             json.dump(suite, f, indent=2, ensure_ascii=False)
         print(f'[OK] Generated {mid} ({len(v_list)} villages) -> {out_file.relative_to(root_path)}')
         market_results[mid] = suite
+
+        if save_village_monthly:
+            vm_doc = engine.build_village_monthly_document(suite=suite)
+            if not vm_doc['endpoint_consistency']['passed']:
+                raise AssertionError(
+                    f"village-monthly endpoint consistency failed for {mid}: "
+                    f"max_abs_deviation={vm_doc['endpoint_consistency']['max_abs_deviation']}"
+                )
+            vm_file = output_dir / f'village-monthly-{mid.replace("_", "-")}.json'
+            with open(vm_file, 'w', encoding='utf-8') as f:
+                json.dump(vm_doc, f, indent=2, ensure_ascii=False)
+            print(f'[OK] Generated village-monthly {mid} ({len(v_list)} villages) -> {vm_file.relative_to(root_path)}')
 
         for vr in suite['village_transmission']['villages']:
             all_village_shifts.append({
@@ -1077,6 +1227,47 @@ def run_and_save_all_markets(
         'consolidated_doc': consolidated_doc,
         'all_village_shifts': all_village_shifts,
     }
+
+
+def run_and_save_village_monthly(
+    output_dir: Path,
+    root_path: Optional[Path] = None,
+    delta_idle: float = 0.20,
+) -> Dict[str, Dict[str, Any]]:
+    """Serialize per-village monthly sold_share series for all 7 GNP markets.
+
+    Writes one ``village-monthly-{market}.json`` per market (schema draft
+    ``s-trajectory-gnp-village-monthly-v1``) without touching the existing
+    ``dynamics-gnp-{market}.json`` artifacts. Endpoint consistency against the
+    annual three-regime village values is asserted per market (tolerance 1e-6).
+    """
+    root_path = _require_root(root_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_market_villages = load_all_gnp_villages(root_path)
+    total_villages = sum(len(v) for v in all_market_villages.values())
+    assert total_villages == 120, f'Expected 120 villages, found {total_villages}'
+
+    configs = get_all_market_configs()
+    docs: Dict[str, Dict[str, Any]] = {}
+
+    for mid, cfg in configs.items():
+        v_list = all_market_villages.get(mid, [])
+        cfg.delta_idle = delta_idle
+        engine = MarketDynamicsEngine(cfg, villages=v_list)
+        suite = engine.run_comparative_suite(delta_idle_override=delta_idle)
+        doc = engine.build_village_monthly_document(suite=suite)
+        assert doc['endpoint_consistency']['passed'], (
+            f"village-monthly endpoint consistency failed for {mid}: "
+            f"max_abs_deviation={doc['endpoint_consistency']['max_abs_deviation']}"
+        )
+        out_file = output_dir / f'village-monthly-{mid.replace("_", "-")}.json'
+        with open(out_file, 'w', encoding='utf-8') as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+        print(f'[OK] Generated village-monthly {mid} ({len(v_list)} villages) -> {out_file.relative_to(root_path)}')
+        docs[mid] = doc
+
+    return docs
 
 
 def run_sensitivity_scan(delta_idles: List[float] = [0.0, 0.20, 0.40], root_path: Optional[Path] = None) -> Dict[str, Any]:

@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "spectrum-os:schema:s-trajectory-gnp-village-monthly-v1",
+  "title": "S-trajectory-gnp (per-village monthly, GNP market suite)",
+  "description": "Schema DRAFT for the GNP-side equivalent of the DKK counterfactual-S-trajectory-v4: a per-village monthly sold_share trajectory serialized from MarketDynamicsEngine (spectrum_os/extensions/market_suite_dynamics.py), one document per commodity market. STATUS: draft v1 — emitted by build_village_monthly_document(); the engine-side implementation is live, the dual-world-bifurcation constitution entry ('GNP 不適用 S 軌道') is owned by the main agent and is NOT modified by this draft. This schema describes market-structure trajectory quantities, not force ratios.",
+  "type": "object",
+  "required": [
+    "schema",
+    "track",
+    "worldline",
+    "market_id",
+    "commodity",
+    "dimension_declaration",
+    "dates",
+    "total_villages",
+    "model_specification",
+    "parameter_tagging",
+    "provenance",
+    "villages",
+    "endpoint_consistency"
+  ],
+  "properties": {
+    "schema": { "const": "s-trajectory-gnp-village-monthly-v1" },
+    "track": { "const": "projection", "description": "Same track vocabulary as DKK S-trajectory v4 (projection | intervention)." },
+    "worldline": { "const": "beta_1_gnp", "description": "Worldline tag: beta_1 GNP market suite. DKK S-trajectory v4 carries no explicit worldline tag (worker-state side implied); GNP must always tag." },
+    "market_id": {
+      "type": "string",
+      "enum": [
+        "ar_frigorifico",
+        "us_midwest_grain",
+        "uk_corn_factor",
+        "in_chettiar_credit",
+        "us_furnish_lien",
+        "prd_silk_filature",
+        "jp_rice_tenancy"
+      ]
+    },
+    "commodity": { "type": "string" },
+    "geography": { "type": "string" },
+    "base_unit": { "type": "string" },
+    "dimension_declaration": {
+      "type": "object",
+      "required": ["trajectory_quantity", "not_dkk_s", "kappa_range"],
+      "properties": {
+        "trajectory_quantity": { "type": "string", "description": "Must declare a market-structure quantity: village sold_share (marketed share of harvest, clamped [0.10, 1.0]). Siblings in the same dimension family: p_farmgate / retention_rate / kappa / hhi." },
+        "not_dkk_s": { "type": "string", "description": "Mandatory asymmetry declaration: this is NOT the DKK ForceField S = R/(R+C). Per SLOT-MIRROR-SCHEMA §六 (2026-09-03 用戶裁定), GNP dynamics = actors_n=N with kappa(t) collusion index; the GNP-side 'trajectory' dimension is market structure, never a revolutionary/conservative force ratio. Applying S=R/(R+C) to GNP village data is a category error." },
+        "kappa_range": { "const": "[0, 1]", "description": "kappa(t) collusion index range: 0 = cartel split / cutthroat bidding, 1 = quota cartel / full monopsony collusion (SLOT-MIRROR §六)." }
+      }
+    },
+    "time_horizon": { "type": "string", "const": "1914-01..1917-01" },
+    "dates": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^(1914|1915|1916|1917)-([1-9]|1[0-2])$" },
+      "minItems": 37,
+      "maxItems": 37,
+      "description": "Monthly labels generated as {1914 + m//12}-{(m%12)+1:02} for m=0..36. First = 1914-01, last = 1917-01."
+    },
+    "total_villages": { "type": "integer", "minimum": 1 },
+    "model_specification": {
+      "type": "string",
+      "description": "Must state the transmission law: sold_share_v(t) = sold_share_v,1914 * (P_farmgate(t)/P_1914)^epsilon_p * [1 - epsilon_kappa*(kappa(t)-kappa_0)], clamped to [0.10, 1.0]."
+    },
+    "parameter_tagging": { "const": "[DERIVED_PROXY]", "description": "All transmission parameters are [DERIVED_PROXY]; no engine fitting (MODIFICATION-LAW: the engine never fits parameters)." },
+    "provenance": {
+      "type": "object",
+      "required": ["canon_ruling", "framework", "source_volumes", "generator"],
+      "properties": {
+        "canon_ruling": { "const": "SINGLE_CANON_DIRECT_ADJUSTMENT" },
+        "framework": { "type": "string" },
+        "source_volumes": { "type": "array", "items": { "type": "string" } },
+        "generator": { "type": "string" }
+      }
+    },
+    "villages": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Village-major layout (asymmetry vs DKK v4's month-major S_monthly[month][node]): one entry per village, each carrying its per-regime monthly series.",
+      "items": {
+        "type": "object",
+        "required": ["village_id", "zone_id", "market_id", "sold_share_1914", "sold_share_monthly"],
+        "properties": {
+          "village_id": { "type": "string" },
+          "zone_id": { "type": "string" },
+          "market_id": { "$ref": "#/properties/market_id" },
+          "source_volume_1917": { "type": "string" },
+          "sold_share_1914": { "type": "number", "minimum": 0, "maximum": 1, "description": "Empirical baseline from the 1914 census volume." },
+          "sold_share_monthly": {
+            "type": "object",
+            "required": ["free_evolution", "cartel_lock", "cartel_split"],
+            "propertyNames": { "enum": ["free_evolution", "cartel_lock", "cartel_split"] },
+            "additionalProperties": {
+              "type": "array",
+              "items": { "type": "number", "minimum": 0.10, "maximum": 1.0 },
+              "minItems": 37,
+              "maxItems": 37,
+              "description": "Engine-native monthly sold_share (not interpolation). series[m] is the value at dates[m]."
+            }
+          }
+        }
+      }
+    },
+    "endpoint_consistency": {
+      "type": "object",
+      "required": ["check", "tolerance", "max_abs_deviation", "passed"],
+      "properties": {
+        "check": { "type": "string", "description": "sold_share_monthly[regime][-1] == village_transmission sold_share_1917_{free,lock,split}." },
+        "tolerance": { "type": "number", "const": 1e-6, "description": "Same 1e-6 convention as the DKK S-trajectory v4 curation cross-check (row-endpoint vs annual, max |delta| < 1e-6)." },
+        "max_abs_deviation": { "type": "number", "minimum": 0 },
+        "cross_checked_against_suite": { "type": "boolean" },
+        "passed": { "const": true }
+      }
+    }
+  },
+  "x-era-rules": {
+    "grid": "Fixed 37-point monthly grid 1914-01..1917-01 shared by all villages, regimes and markets (mirrors DKK v4's fixed dates[37] grid ending at the anchor year-01 month).",
+    "anchor_semantics": "dates[0]=1914-01 is the empirical baseline year (census sold_share_1914); dates[36]=1917-01 is the anchor/bust endpoint whose values must equal the annual three-regime village readouts.",
+    "regime_era_marker": "Under cartel_split the collusion-collapse window opens at month index m=24 (dates[24]=1916-01, kappa decay exp(-0.35*(m-24))); free_evolution has no exogenous era marker (endogenous ODE).",
+    "era_boundary_law": "No date may be invented outside the grid; extensions of the horizon require a new engine run and a schema version bump, not label edits."
+  },
+  "x-dkk-s-trajectory-v4-symmetry": {
+    "symmetric": [
+      "37-point monthly grid with anchor-year-01 terminal month (dates[36] == '{anchor}-01').",
+      "Per-node monthly trajectory matrix (DKK: S_monthly over 60 nodes; GNP: villages[].sold_share_monthly over 120 villages).",
+      "track: projection|intervention vocabulary.",
+      "Endpoint cross-check against the annual/anchor readout with tolerance 1e-6.",
+      "Generated by an engine, never hand-authored; parameter tagging mandatory ([DERIVED_PROXY])."
+    ],
+    "asymmetric": [
+      "DIMENSION: GNP trajectory quantity is sold_share (market-structure family: p_farmgate/retention_rate/kappa/hhi), NOT DKK S = R/(R+C). Never join the two quantities in one comparison; compare structures, not values (GENERAL-PRINCIPLES: comparison typology — different types are not commensurable).",
+      "LAYOUT: GNP is village-major (villages[].sold_share_monthly[regime][m]); DKK v4 is month-major (S_monthly[m][node]).",
+      "REGIMES: GNP carries a three-regime counterfactual block (free_evolution / cartel_lock / cartel_split) per village; DKK v4 carries a single trajectory per node (projection vs intervention live in separate files).",
+      "AUXILIARY STATE: GNP exposes kappa(t) collusion index in [0,1] as the driving state; DKK S-trajectory has no kappa (kappa identical to 1 on the worker-state side, per SLOT-MIRROR §六).",
+      "WORLDLINE TAG: GNP must carry worldline=beta_1_gnp; DKK v4 implies the worker-state worldline."
+    ]
+  }
+}
