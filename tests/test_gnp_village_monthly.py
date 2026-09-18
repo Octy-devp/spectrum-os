@@ -203,6 +203,83 @@ def _needs_ecc():
     return Path(ECC_ROOT).exists()
 
 
+def test_1917_window_parameterization():
+    """Window parameterization: start_year=1917 yields the 1920-layer window
+    1917-01..1920-01 (37 points). Terminal-year schema keys follow the window
+    (sold_share_1920_*, feedback_metrics_1920, p_terminal_1920), annual readouts
+    gain 1918/1919/1920, and endpoint consistency holds against the same window."""
+    cfg = get_all_market_configs()['ar_frigorifico']
+    # 1920 p_world canon must be wired (committed ECC build-1920-bifurcation-suite value)
+    assert cfg.p_world_series[1920] == 110.0
+    # 1918/1919 are exact linear thirds of the 1917→1920 ramp
+    assert cfg.p_world_series[1918] == round(131.0 + (110.0 - 131.0) / 3.0, 4)
+    assert cfg.p_world_series[1919] == round(131.0 + 2.0 * (110.0 - 131.0) / 3.0, 4)
+
+    villages = [
+        VillageProfile(
+            village_id=f"synth-w17-{i:03d}",
+            zone_id=f"zone_{i % 2}",
+            source_volume_1917=f"census/synth-w17-{i:03d}-1917.json",
+            source_volume_1914=f"census/synth-w17-{i:03d}-1914.json",
+            market_id="ar_frigorifico",
+            crops=["wheat"],
+            sold_share_1914=0.80,
+        )
+        for i in range(6)
+    ]
+    engine = MarketDynamicsEngine(cfg, villages=villages)
+    suite = engine.run_comparative_suite(start_year=1917)
+    doc = engine.build_village_monthly_document(suite=suite, start_year=1917)
+
+    # Monthly grid shifts to the 1917 window
+    ms = suite['regimes']['free_evolution']['monthly_series']
+    assert ms[0]['month_label'] == '1917-01' and ms[-1]['month_label'] == '1920-01'
+    assert len(ms) == 37
+    assert suite['regimes']['free_evolution']['annual_readouts']['1920']['month_label'] == '1920-01'
+    assert '1918' in suite['regimes']['free_evolution']['annual_readouts']
+    assert suite['time_horizon'] == '1905-1920'  # 1905 anchor pre-recorded, terminal 1920
+
+    assert doc['dates'][0] == '1917-01' and doc['dates'][-1] == '1920-01'
+    assert doc['dates'][12] == '1918-01'
+    assert doc['time_horizon'] == '1917-01..1920-01'
+    assert len(doc['dates']) == 37
+
+    # Terminal-year key naming follows the window (no 1917-terminal keys left)
+    vr = suite['village_transmission']['villages'][0]
+    assert 'sold_share_1920_free' in vr and 'sold_share_1917_free' not in vr
+    assert 'feedback_metrics_1920' in suite['village_transmission']
+    assert 'p_terminal_1920' in suite['bifurcation_summary']
+
+    # Endpoint consistency (monthly[-1] == annual 1920 regime value) must hold
+    assert doc['endpoint_consistency']['passed'] is True
+    assert doc['endpoint_consistency']['max_abs_deviation'] <= 1e-6
+    suite_by_id = {v['village_id']: v for v in suite['village_transmission']['villages']}
+    for v in doc['villages']:
+        base = suite_by_id[v['village_id']]
+        assert abs(v['sold_share_monthly']['free_evolution'][-1] - base['sold_share_1920_free']) <= 1e-6
+        assert abs(v['sold_share_monthly']['cartel_lock'][-1] - base['sold_share_1920_lock']) <= 1e-6
+        assert abs(v['sold_share_monthly']['cartel_split'][-1] - base['sold_share_1920_split']) <= 1e-6
+
+
+def test_default_window_keeps_legacy_keys():
+    """Backward compatibility: default start_year=1914 keeps every legacy terminal-
+    year key name (sold_share_1917_*, feedback_metrics_1917, p_terminal_1917,
+    time_horizon '1905-1917') so existing 1917-layer artifacts keep their shape."""
+    engine = _make_engine(4)
+    suite = engine.run_comparative_suite()
+
+    vr = suite['village_transmission']['villages'][0]
+    assert 'sold_share_1917_free' in vr and 'sold_share_1920_free' not in vr
+    assert 'feedback_metrics_1917' in suite['village_transmission']
+    assert 'p_terminal_1917' in suite['bifurcation_summary']
+    assert suite['time_horizon'] == '1905-1917'
+
+    doc = engine.build_village_monthly_document(suite=suite)
+    assert doc['dates'][0] == '1914-01' and doc['dates'][-1] == '1917-01'
+    assert doc['time_horizon'] == '1914-01..1917-01'
+    assert doc['endpoint_consistency']['passed'] is True
+
+
 @pytest.mark.skipif(not _needs_ecc(), reason="ECC worldline root not available")
 def test_real_ecc_census_end_to_end_in_memory():
     """End-to-end against the real 120-village GNP census: all 7 markets covered,

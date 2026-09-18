@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "spectrum-os:schema:s-trajectory-gnp-village-monthly-v1",
   "title": "S-trajectory-gnp (per-village monthly, GNP market suite)",
-  "description": "Schema DRAFT for the GNP-side equivalent of the DKK counterfactual-S-trajectory-v4: a per-village monthly sold_share trajectory serialized from MarketDynamicsEngine (spectrum_os/extensions/market_suite_dynamics.py), one document per commodity market. STATUS: draft v1 — emitted by build_village_monthly_document(); the engine-side implementation is live, the dual-world-bifurcation constitution entry ('GNP 不適用 S 軌道') is owned by the main agent and is NOT modified by this draft. This schema describes market-structure trajectory quantities, not force ratios.",
+  "description": "Schema DRAFT for the GNP-side equivalent of the DKK counterfactual-S-trajectory-v4: a per-village monthly sold_share trajectory serialized from MarketDynamicsEngine (spectrum_os/extensions/market_suite_dynamics.py), one document per commodity market. STATUS: draft v1 — emitted by build_village_monthly_document(); the engine-side implementation is live, the dual-world-bifurcation constitution entry ('GNP 不適用 S 軌道') is owned by the main agent and is NOT modified by this draft. This schema describes market-structure trajectory quantities, not force ratios. 2026-09-18: grid generalized to the engine's window parameterization (start_year) — two sanctioned windows: 1914-01..1917-01 (legacy default) and 1917-01..1920-01 (1920 observation layer); see x-era-rules.",
   "type": "object",
   "required": [
     "schema",
@@ -47,13 +47,13 @@
         "kappa_range": { "const": "[0, 1]", "description": "kappa(t) collusion index range: 0 = cartel split / cutthroat bidding, 1 = quota cartel / full monopsony collusion (SLOT-MIRROR §六)." }
       }
     },
-    "time_horizon": { "type": "string", "const": "1914-01..1917-01" },
+    "time_horizon": { "enum": ["1914-01..1917-01", "1917-01..1920-01"], "description": "Engine window: legacy default 1914-01..1917-01 (start_year=1914) or the 1920 observation-layer window 1917-01..1920-01 (start_year=1917). Both are 36-month runs emitting 37 monthly points." },
     "dates": {
       "type": "array",
-      "items": { "type": "string", "pattern": "^(1914|1915|1916|1917)-([1-9]|1[0-2])$" },
+      "items": { "type": "string", "pattern": "^(191[4-9]|1920)-(0[1-9]|1[0-2])$", "description": "Zero-padded month labels (engine emits f'{...:02d}'); the previous draft pattern ([1-9]|1[0-2]) never matched the engine's own output and is corrected here." },
       "minItems": 37,
       "maxItems": 37,
-      "description": "Monthly labels generated as {1914 + m//12}-{(m%12)+1:02} for m=0..36. First = 1914-01, last = 1917-01."
+      "description": "Monthly labels generated as {start_year + m//12}-{(m%12)+1:02} for m=0..36. First = {start_year}-01, last = {start_year+3}-01."
     },
     "total_villages": { "type": "integer", "minimum": 1 },
     "model_specification": {
@@ -103,7 +103,7 @@
       "type": "object",
       "required": ["check", "tolerance", "max_abs_deviation", "passed"],
       "properties": {
-        "check": { "type": "string", "description": "sold_share_monthly[regime][-1] == village_transmission sold_share_1917_{free,lock,split}." },
+        "check": { "type": "string", "description": "sold_share_monthly[regime][-1] == village_transmission sold_share_{terminal_year}_{free,lock,split} (terminal_year = start_year+3: 1917 legacy / 1920 for the 1920 layer)." },
         "tolerance": { "type": "number", "const": 1e-6, "description": "Same 1e-6 convention as the DKK S-trajectory v4 curation cross-check (row-endpoint vs annual, max |delta| < 1e-6)." },
         "max_abs_deviation": { "type": "number", "minimum": 0 },
         "cross_checked_against_suite": { "type": "boolean" },
@@ -112,9 +112,9 @@
     }
   },
   "x-era-rules": {
-    "grid": "Fixed 37-point monthly grid 1914-01..1917-01 shared by all villages, regimes and markets (mirrors DKK v4's fixed dates[37] grid ending at the anchor year-01 month).",
-    "anchor_semantics": "dates[0]=1914-01 is the empirical baseline year (census sold_share_1914); dates[36]=1917-01 is the anchor/bust endpoint whose values must equal the annual three-regime village readouts.",
-    "regime_era_marker": "Under cartel_split the collusion-collapse window opens at month index m=24 (dates[24]=1916-01, kappa decay exp(-0.35*(m-24))); free_evolution has no exogenous era marker (endogenous ODE).",
+    "grid": "Fixed 37-point monthly grid over the engine window, shared by all villages, regimes and markets (mirrors DKK v4's fixed dates[37] grid ending at the anchor year-01 month). Two sanctioned windows: start_year=1914 (1914-01..1917-01, legacy default) and start_year=1917 (1917-01..1920-01, 1920 observation layer; p_world 1920 canon per engine P_WORLD_1920_CANON = ECC build-1920-bifurcation-suite.py market_specs).",
+    "anchor_semantics": "dates[0]={start_year}-01 opens the window (for the 1914 window this is the empirical baseline year where census sold_share_1914 anchors the transmission law; for the 1917 window the village state starts at the 1917 price level); dates[36]={start_year+3}-01 is the terminal endpoint whose values must equal the annual three-regime village readouts of the same window.",
+    "regime_era_marker": "Under cartel_split the collusion-collapse window opens at month index m=24 (dates[24], kappa decay exp(-0.35*(m-24))); free_evolution has no exogenous era marker (endogenous ODE). The m=24 marker is window-relative, not calendar-anchored.",
     "era_boundary_law": "No date may be invented outside the grid; extensions of the horizon require a new engine run and a schema version bump, not label edits."
   },
   "x-dkk-s-trajectory-v4-symmetry": {

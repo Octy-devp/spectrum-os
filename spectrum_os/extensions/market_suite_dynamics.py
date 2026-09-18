@@ -7,6 +7,9 @@ Universal N-Actor Oligopoly Simulation Engine implementing:
 - Three regimes: Free Evolution (endogenous kappa(t)), Cartel Lock (kappa=1.0), Cartel Split (kappa=0.05).
 - 120 GNP village empirical transmission grounded in 360 observation-gnp volumes.
 - All derived parameters tagged with [DERIVED_PROXY].
+- Window parameterization: start_year=1914 (legacy 1914-01..1917-01, default;
+  byte-identical outputs) or start_year=1917 (1920 observation layer,
+  1917-01..1920-01, p_world 1920 canon per P_WORLD_1920_CANON).
 """
 
 from __future__ import annotations
@@ -177,20 +180,32 @@ class MarketDynamicsEngine:
         # state the loop already computes (village_shares_history) — no physics change.
         self.village_monthly: Dict[str, Dict[str, List[float]]] = {}
 
-    def _interpolate_p_world(self, month_idx: int) -> float:
-        p14 = self.cfg.p_world_series[1914]
-        p15 = self.cfg.p_world_series[1915]
-        p16 = self.cfg.p_world_series[1916]
-        p17 = self.cfg.p_world_series[1917]
+    def _interpolate_p_world(self, month_idx: int, start_year: int = 1914) -> float:
+        """Piecewise-linear monthly p_world over the window [start_year .. start_year+3].
+
+        Default start_year=1914 reproduces the legacy 1914-01..1917-01 window
+        exactly (same anchors, same segment arithmetic). The 1917 start needs
+        anchors 1917..1920 (see extend_p_world_to_1920).
+        """
+        series = self.cfg.p_world_series
+        p0 = series[start_year]
+        p1 = series[start_year + 1]
+        p2 = series[start_year + 2]
+        p3 = series[start_year + 3]
 
         if month_idx <= 12:
-            return p14 + (p15 - p14) * (month_idx / 12.0)
+            return p0 + (p1 - p0) * (month_idx / 12.0)
         elif month_idx <= 24:
-            return p15 + (p16 - p15) * ((month_idx - 12) / 12.0)
+            return p1 + (p2 - p1) * ((month_idx - 12) / 12.0)
         else:
-            return p16 + (p17 - p16) * ((month_idx - 24) / 12.0)
+            return p2 + (p3 - p2) * ((month_idx - 24) / 12.0)
 
-    def run_simulation(self, mode: str = 'free_evolution', delta_idle_override: Optional[float] = None) -> Dict[str, Any]:
+    def run_simulation(
+        self,
+        mode: str = 'free_evolution',
+        delta_idle_override: Optional[float] = None,
+        start_year: int = 1914,
+    ) -> Dict[str, Any]:
         actor_ids = list(self.cfg.actors.keys())
         a1_id, a2_id = actor_ids[0], actor_ids[1]
         a1_data, a2_data = self.cfg.actors[a1_id], self.cfg.actors[a2_id]
@@ -226,18 +241,18 @@ class MarketDynamicsEngine:
         village_shares_history: Dict[str, List[float]] = {v.village_id: [] for v in self.villages}
 
         for m in range(total_months + 1):
-            year = 1914 + m // 12
+            year = start_year + m // 12
             month_in_year = (m % 12) + 1
             month_label = f'{year}-{month_in_year:02d}'
 
-            p_w_idx = self._interpolate_p_world(m)
+            p_w_idx = self._interpolate_p_world(m, start_year)
             p_terminal = self.cfg.base_terminal_price * (p_w_idx / 100.0)
 
             # dP_world / dt approximation
             if m < total_months:
-                dp_dt = (self._interpolate_p_world(m + 1) - p_w_idx) / dt
+                dp_dt = (self._interpolate_p_world(m + 1, start_year) - p_w_idx) / dt
             else:
-                dp_dt = (p_w_idx - self._interpolate_p_world(m - 1)) / dt
+                dp_dt = (p_w_idx - self._interpolate_p_world(m - 1, start_year)) / dt
 
             # Mode overrides for kappa
             if mode == 'cartel_lock':
@@ -350,7 +365,8 @@ class MarketDynamicsEngine:
     def village_monthly_series(self, village_id: str, mode: str = 'free_evolution') -> List[float]:
         """Return the per-village monthly sold_share series for a regime.
 
-        Series length is total_months + 1 (37 points, 1914-01..1917-01), matching
+        Series length is total_months + 1 (37 points over the engine window,
+        dates[0] = {start_year}-01 .. dates[36] = {start_year+3}-01), matching
         the market-level monthly_series grid. Raises KeyError if the mode has not
         been run or the village_id is unknown.
         """
@@ -370,17 +386,19 @@ class MarketDynamicsEngine:
         self,
         suite: Optional[Dict[str, Any]] = None,
         endpoint_tolerance: float = 1e-6,
+        start_year: int = 1914,
     ) -> Dict[str, Any]:
         """Build the S-trajectory-gnp per-village monthly document (draft schema
         ``s-trajectory-gnp-village-monthly-v1``).
 
         Requires that all three regimes have been run on this engine (i.e. after
-        run_comparative_suite). If ``suite`` (the run_comparative_suite output) is
-        supplied, monthly series endpoints are cross-checked against the annual
-        three-regime village values in village_transmission (tolerance
-        ``endpoint_tolerance``, default 1e-6 — same convention as the DKK
-        S-trajectory v4 curation cross-check).
+        run_comparative_suite) **with the same ``start_year``**. If ``suite`` (the
+        run_comparative_suite output) is supplied, monthly series endpoints are
+        cross-checked against the annual three-regime village values in
+        village_transmission (tolerance ``endpoint_tolerance``, default 1e-6 —
+        same convention as the DKK S-trajectory v4 curation cross-check).
         """
+        terminal_year = start_year + 3
         required_modes = ('free_evolution', 'cartel_lock', 'cartel_split')
         missing = [m for m in required_modes if m not in self.village_monthly]
         if missing:
@@ -394,7 +412,7 @@ class MarketDynamicsEngine:
                 f"'{self.cfg.market_id}'; per-village monthly serialization is undefined"
             )
 
-        dates = [f'{1914 + m // 12}-{(m % 12) + 1:02d}' for m in range(36 + 1)]
+        dates = [f'{start_year + m // 12}-{(m % 12) + 1:02d}' for m in range(36 + 1)]
 
         village_entries = []
         max_abs_dev = 0.0
@@ -404,9 +422,9 @@ class MarketDynamicsEngine:
                 vr['village_id']: vr for vr in suite['village_transmission']['villages']
             }
         endpoint_field = {
-            'free_evolution': 'sold_share_1917_free',
-            'cartel_lock': 'sold_share_1917_lock',
-            'cartel_split': 'sold_share_1917_split',
+            'free_evolution': f'sold_share_{terminal_year}_free',
+            'cartel_lock': f'sold_share_{terminal_year}_lock',
+            'cartel_split': f'sold_share_{terminal_year}_split',
         }
 
         for v in self.villages:
@@ -450,7 +468,7 @@ class MarketDynamicsEngine:
                              'kappa(t) here is the collusion index in [0,1], not a force ratio.',
                 'kappa_range': '[0, 1]',
             },
-            'time_horizon': '1914-01..1917-01',
+            'time_horizon': f'{start_year}-01..{terminal_year}-01',
             'dates': dates,
             'total_villages': len(self.villages),
             'model_specification': 'sold_share_v(t) = sold_share_v,1914 * (P_farmgate(t) / P_1914)^epsilon_p * [1 - epsilon_kappa * (kappa(t) - kappa_0)]',
@@ -465,14 +483,25 @@ class MarketDynamicsEngine:
             'endpoint_consistency': endpoint_consistency,
         }
 
-    def run_comparative_suite(self, delta_idle_override: Optional[float] = None) -> Dict[str, Any]:
-        res_free = self.run_simulation(mode='free_evolution', delta_idle_override=delta_idle_override)
-        res_split = self.run_simulation(mode='cartel_split', delta_idle_override=delta_idle_override)
-        res_lock = self.run_simulation(mode='cartel_lock', delta_idle_override=delta_idle_override)
+    def run_comparative_suite(
+        self,
+        delta_idle_override: Optional[float] = None,
+        start_year: int = 1914,
+    ) -> Dict[str, Any]:
+        terminal_year = start_year + 3
+        res_free = self.run_simulation(
+            mode='free_evolution', delta_idle_override=delta_idle_override, start_year=start_year
+        )
+        res_split = self.run_simulation(
+            mode='cartel_split', delta_idle_override=delta_idle_override, start_year=start_year
+        )
+        res_lock = self.run_simulation(
+            mode='cartel_lock', delta_idle_override=delta_idle_override, start_year=start_year
+        )
 
-        y17_free = res_free['annual_readouts']['1917']
-        y17_split = res_split['annual_readouts']['1917']
-        y17_lock = res_lock['annual_readouts']['1917']
+        t_free = res_free['annual_readouts'][str(terminal_year)]
+        t_split = res_split['annual_readouts'][str(terminal_year)]
+        t_lock = res_lock['annual_readouts'][str(terminal_year)]
 
         delta_idle_val = self.cfg.delta_idle if delta_idle_override is None else delta_idle_override
 
@@ -488,16 +517,16 @@ class MarketDynamicsEngine:
                     'zone_id': v.zone_id,
                     'source_volume_1917': v.source_volume_1917,
                     'sold_share_1914': v.sold_share_1914,
-                    'sold_share_1917_free': ss_free,
-                    'sold_share_1917_lock': ss_lock,
-                    'sold_share_1917_split': ss_split,
+                    f'sold_share_{terminal_year}_free': ss_free,
+                    f'sold_share_{terminal_year}_lock': ss_lock,
+                    f'sold_share_{terminal_year}_split': ss_split,
                     'delta_sold_share_split_vs_lock': round(ss_split - ss_lock, 4),
                 })
 
         mean_1914 = round(sum(v.sold_share_1914 for v in self.villages) / len(self.villages), 4) if self.villages else self.cfg.village_sold_share_0
-        mean_17_free = y17_free['village_sold_share']
-        mean_17_lock = y17_lock['village_sold_share']
-        mean_17_split = y17_split['village_sold_share']
+        mean_t_free = t_free['village_sold_share']
+        mean_t_lock = t_lock['village_sold_share']
+        mean_t_split = t_split['village_sold_share']
 
         village_transmission = {
             'model_specification': 'sold_share_v(t) = sold_share_v,1914 * (P_farmgate(t) / P_1914)^epsilon_p * [1 - epsilon_kappa * (kappa(t) - kappa_0)]',
@@ -507,10 +536,10 @@ class MarketDynamicsEngine:
             'total_villages': len(self.villages),
             'village_panel_summary': {
                 'mean_sold_share_1914': mean_1914,
-                'mean_sold_share_1917_free': mean_17_free,
-                'mean_sold_share_1917_lock': mean_17_lock,
-                'mean_sold_share_1917_split': mean_17_split,
-                'delta_split_vs_lock': round(mean_17_split - mean_17_lock, 4),
+                f'mean_sold_share_{terminal_year}_free': mean_t_free,
+                f'mean_sold_share_{terminal_year}_lock': mean_t_lock,
+                f'mean_sold_share_{terminal_year}_split': mean_t_split,
+                'delta_split_vs_lock': round(mean_t_split - mean_t_lock, 4),
             },
             'villages': village_records,
             'effective_sold_share_trajectory': {
@@ -524,46 +553,46 @@ class MarketDynamicsEngine:
                     yr: ro['village_sold_share'] for yr, ro in res_split['annual_readouts'].items()
                 },
             },
-            'feedback_metrics_1917': {
-                'effective_sold_share_free': mean_17_free,
-                'effective_sold_share_lock': mean_17_lock,
-                'effective_sold_share_split': mean_17_split,
-                'idle_capacity_penalty_free': y17_free['penalty_idle'],
-                'idle_capacity_penalty_lock': y17_lock['penalty_idle'],
-                'idle_capacity_penalty_split': y17_split['penalty_idle'],
+            f'feedback_metrics_{terminal_year}': {
+                'effective_sold_share_free': mean_t_free,
+                'effective_sold_share_lock': mean_t_lock,
+                'effective_sold_share_split': mean_t_split,
+                'idle_capacity_penalty_free': t_free['penalty_idle'],
+                'idle_capacity_penalty_lock': t_lock['penalty_idle'],
+                'idle_capacity_penalty_split': t_split['penalty_idle'],
             },
         }
 
         bifurcation = {
-            'p_terminal_1917': y17_free['p_terminal'],
+            f'p_terminal_{terminal_year}': t_free['p_terminal'],
             'kappa_comparison': {
-                'free_evolution': y17_free['kappa'],
-                'cartel_split': y17_split['kappa'],
-                'cartel_lock': y17_lock['kappa'],
-                'delta_split_vs_lock': round(y17_split['kappa'] - y17_lock['kappa'], 4),
+                'free_evolution': t_free['kappa'],
+                'cartel_split': t_split['kappa'],
+                'cartel_lock': t_lock['kappa'],
+                'delta_split_vs_lock': round(t_split['kappa'] - t_lock['kappa'], 4),
             },
-            'market_shares_actor_2_1917': {
-                'free_evolution': y17_free['share_actor_2'],
-                'cartel_split': y17_split['share_actor_2'],
-                'cartel_lock': y17_lock['share_actor_2'],
-                'actor_2_gain_under_split': round(y17_split['share_actor_2'] - y17_lock['share_actor_2'], 4),
+            f'market_shares_actor_2_{terminal_year}': {
+                'free_evolution': t_free['share_actor_2'],
+                'cartel_split': t_split['share_actor_2'],
+                'cartel_lock': t_lock['share_actor_2'],
+                'actor_2_gain_under_split': round(t_split['share_actor_2'] - t_lock['share_actor_2'], 4),
             },
-            'village_farmgate_price_1917': {
-                'free_evolution': y17_free['p_farmgate'],
-                'cartel_split': y17_split['p_farmgate'],
-                'cartel_lock': y17_lock['p_farmgate'],
-                'farmgate_premium_split_vs_lock': round(y17_split['p_farmgate'] - y17_lock['p_farmgate'], 2),
+            f'village_farmgate_price_{terminal_year}': {
+                'free_evolution': t_free['p_farmgate'],
+                'cartel_split': t_split['p_farmgate'],
+                'cartel_lock': t_lock['p_farmgate'],
+                'farmgate_premium_split_vs_lock': round(t_split['p_farmgate'] - t_lock['p_farmgate'], 2),
             },
-            'village_sold_share_1917': {
-                'free_evolution': mean_17_free,
-                'cartel_split': mean_17_split,
-                'cartel_lock': mean_17_lock,
-                'bifurcation_delta_sold_share': round(mean_17_split - mean_17_lock, 4),
+            f'village_sold_share_{terminal_year}': {
+                'free_evolution': mean_t_free,
+                'cartel_split': mean_t_split,
+                'cartel_lock': mean_t_lock,
+                'bifurcation_delta_sold_share': round(mean_t_split - mean_t_lock, 4),
             },
-            'oligarch_total_margin_1917': {
-                'free_evolution': round(y17_free['margin_actor_1'] + y17_free['margin_actor_2'], 2),
-                'cartel_split': round(y17_split['margin_actor_1'] + y17_split['margin_actor_2'], 2),
-                'cartel_lock': round(y17_lock['margin_actor_1'] + y17_lock['margin_actor_2'], 2),
+            f'oligarch_total_margin_{terminal_year}': {
+                'free_evolution': round(t_free['margin_actor_1'] + t_free['margin_actor_2'], 2),
+                'cartel_split': round(t_split['margin_actor_1'] + t_split['margin_actor_2'], 2),
+                'cartel_lock': round(t_lock['margin_actor_1'] + t_lock['margin_actor_2'], 2),
             },
             'lenin_proposition_readout': self.cfg.lenin_thesis_notes,
         }
@@ -576,7 +605,7 @@ class MarketDynamicsEngine:
             'commodity': self.cfg.commodity,
             'geography': self.cfg.geography,
             'base_unit': self.cfg.base_unit,
-            'time_horizon': '1905-1917' if 1905 in self.cfg.historical_anchors else '1914-1917',
+            'time_horizon': f'1905-{terminal_year}' if 1905 in self.cfg.historical_anchors else f'{start_year}-{terminal_year}',
             'provenance': {
                 'canon_ruling': 'SINGLE_CANON_DIRECT_ADJUSTMENT',
                 'framework': 'SLOT-MIRROR-SCHEMA §六 + Lenin 1916 Monopoly-Competition Coexistence + Closed-Loop Feedback',
@@ -1073,15 +1102,54 @@ def get_jp_rice_tenancy_config() -> MarketConfig:
     )
 
 
+# =========================================================================
+# 1917→1920 WINDOW SUPPORT — p_world anchors beyond the 1914-1917 baseline
+# =========================================================================
+# The engine's native window is 1914-01..1917-01 (anchor year 1914, 36 months).
+# The 1920 observation layer needs the window 1917-01..1920-01 (37 points), which
+# reads p_world anchors 1917..1920. The 1920 values below are the committed canon
+# from the ECC 1920 projection suite (ECC scripts/build-1920-bifurcation-suite.py
+# market_specs p_world_1920, consumed by 1920/projection/dynamics-gnp.json,
+# [DERIVED_PROXY], SSOT＝該檔). 1918/1919 are mechanical linear midpoints of the
+# 1917→1920 ramp — no new economic judgement is introduced. The default 1914
+# window only reads keys 1914..1917, so extending the series is a no-op for it.
+P_WORLD_1920_CANON: Dict[str, float] = {
+    'ar_frigorifico': 110.0,
+    'us_midwest_grain': 108.0,
+    'uk_corn_factor': 115.0,
+    'in_chettiar_credit': 105.0,
+    'us_furnish_lien': 120.0,
+    'prd_silk_filature': 72.0,
+    'jp_rice_tenancy': 118.0,
+}
+
+
+def extend_p_world_to_1920(cfg: MarketConfig) -> MarketConfig:
+    """Attach [DERIVED_PROXY] p_world anchors 1918/1919/1920 to a market config.
+
+    1918 and 1919 are exact thirds of the 1917→1920 canon ramp, so the monthly
+    p_world path over the 1917 window is a single linear glide from the committed
+    1917 anchor to the committed 1920 canon value. No-op for the default 1914
+    window (those months only ever read keys 1914..1917).
+    """
+    p17 = cfg.p_world_series[1917]
+    p20 = P_WORLD_1920_CANON[cfg.market_id]
+    cfg.p_world_series = dict(cfg.p_world_series)
+    cfg.p_world_series[1918] = round(p17 + (p20 - p17) / 3.0, 4)
+    cfg.p_world_series[1919] = round(p17 + 2.0 * (p20 - p17) / 3.0, 4)
+    cfg.p_world_series[1920] = p20
+    return cfg
+
+
 def get_all_market_configs() -> Dict[str, MarketConfig]:
     return {
-        'ar_frigorifico': get_ar_frigorifico_config(),
-        'us_midwest_grain': get_us_midwest_grain_config(),
-        'uk_corn_factor': get_uk_corn_factor_config(),
-        'in_chettiar_credit': get_in_chettiar_credit_config(),
-        'us_furnish_lien': get_us_furnish_lien_config(),
-        'prd_silk_filature': get_prd_silk_filature_config(),
-        'jp_rice_tenancy': get_jp_rice_tenancy_config(),
+        'ar_frigorifico': extend_p_world_to_1920(get_ar_frigorifico_config()),
+        'us_midwest_grain': extend_p_world_to_1920(get_us_midwest_grain_config()),
+        'uk_corn_factor': extend_p_world_to_1920(get_uk_corn_factor_config()),
+        'in_chettiar_credit': extend_p_world_to_1920(get_in_chettiar_credit_config()),
+        'us_furnish_lien': extend_p_world_to_1920(get_us_furnish_lien_config()),
+        'prd_silk_filature': extend_p_world_to_1920(get_prd_silk_filature_config()),
+        'jp_rice_tenancy': extend_p_world_to_1920(get_jp_rice_tenancy_config()),
     }
 
 
@@ -1090,14 +1158,21 @@ def run_and_save_all_markets(
     root_path: Optional[Path] = None,
     delta_idle: float = 0.20,
     save_village_monthly: bool = False,
+    start_year: int = 1914,
 ) -> Dict[str, Any]:
     """Run simulation for all 7 markets with 120-village feedback loop and save outputs.
+
+    ``start_year`` selects the engine window: 1914 (default, legacy
+    1914-01..1917-01) or 1917 (1920 observation layer, 1917-01..1920-01). Terminal-
+    year keys in the outputs follow the window (sold_share_1917_* vs
+    sold_share_1920_*, macro_scorecard_1917 vs macro_scorecard_1920, ...).
 
     When ``save_village_monthly`` is True, additionally writes one
     ``village-monthly-{market}.json`` per market (per-village monthly sold_share
     series, schema draft s-trajectory-gnp-village-monthly-v1). Default False so
     existing callers keep producing exactly the artifacts they produced before.
     """
+    terminal_year = start_year + 3
     root_path = _require_root(root_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1116,17 +1191,20 @@ def run_and_save_all_markets(
         v_list = all_market_villages.get(mid, [])
         cfg.delta_idle = delta_idle
         engine = MarketDynamicsEngine(cfg, villages=v_list)
-        suite = engine.run_comparative_suite(delta_idle_override=delta_idle)
+        suite = engine.run_comparative_suite(delta_idle_override=delta_idle, start_year=start_year)
 
         # Save individual market file
         out_file = output_dir / f'dynamics-gnp-{mid.replace("_", "-")}.json'
         with open(out_file, 'w', encoding='utf-8') as f:
             json.dump(suite, f, indent=2, ensure_ascii=False)
-        print(f'[OK] Generated {mid} ({len(v_list)} villages) -> {out_file.relative_to(root_path)}')
+        _log = out_file.relative_to(root_path) if out_file.is_relative_to(root_path) else out_file
+        print(f'[OK] Generated {mid} ({len(v_list)} villages) -> {_log}')
         market_results[mid] = suite
 
         if save_village_monthly:
-            vm_doc = engine.build_village_monthly_document(suite=suite)
+            vm_doc = engine.build_village_monthly_document(
+                suite=suite, start_year=start_year
+            )
             if not vm_doc['endpoint_consistency']['passed']:
                 raise AssertionError(
                     f"village-monthly endpoint consistency failed for {mid}: "
@@ -1135,23 +1213,24 @@ def run_and_save_all_markets(
             vm_file = output_dir / f'village-monthly-{mid.replace("_", "-")}.json'
             with open(vm_file, 'w', encoding='utf-8') as f:
                 json.dump(vm_doc, f, indent=2, ensure_ascii=False)
-            print(f'[OK] Generated village-monthly {mid} ({len(v_list)} villages) -> {vm_file.relative_to(root_path)}')
+            _log = vm_file.relative_to(root_path) if vm_file.is_relative_to(root_path) else vm_file
+            print(f'[OK] Generated village-monthly {mid} ({len(v_list)} villages) -> {_log}')
 
         for vr in suite['village_transmission']['villages']:
             all_village_shifts.append({
                 'village_id': vr['village_id'],
                 'market_id': mid,
                 'sold_share_1914': vr['sold_share_1914'],
-                'sold_share_1917_free': vr['sold_share_1917_free'],
-                'sold_share_1917_lock': vr['sold_share_1917_lock'],
-                'sold_share_1917_split': vr['sold_share_1917_split'],
+                f'sold_share_{terminal_year}_free': vr[f'sold_share_{terminal_year}_free'],
+                f'sold_share_{terminal_year}_lock': vr[f'sold_share_{terminal_year}_lock'],
+                f'sold_share_{terminal_year}_split': vr[f'sold_share_{terminal_year}_split'],
             })
 
     # Calculate 120-village macro metrics
     macro_14 = round(sum(x['sold_share_1914'] for x in all_village_shifts) / len(all_village_shifts), 4)
-    macro_17_free = round(sum(x['sold_share_1917_free'] for x in all_village_shifts) / len(all_village_shifts), 4)
-    macro_17_lock = round(sum(x['sold_share_1917_lock'] for x in all_village_shifts) / len(all_village_shifts), 4)
-    macro_17_split = round(sum(x['sold_share_1917_split'] for x in all_village_shifts) / len(all_village_shifts), 4)
+    macro_t_free = round(sum(x[f'sold_share_{terminal_year}_free'] for x in all_village_shifts) / len(all_village_shifts), 4)
+    macro_t_lock = round(sum(x[f'sold_share_{terminal_year}_lock'] for x in all_village_shifts) / len(all_village_shifts), 4)
+    macro_t_split = round(sum(x[f'sold_share_{terminal_year}_split'] for x in all_village_shifts) / len(all_village_shifts), 4)
 
     # Build consolidated document
     consolidated_doc = {
@@ -1162,13 +1241,13 @@ def run_and_save_all_markets(
         'total_gnp_villages_audited': total_villages,
         'delta_idle_baseline': delta_idle,
         'parameter_tagging': '[DERIVED_PROXY]',
-        'macro_scorecard_1917': {
+        f'macro_scorecard_{terminal_year}': {
             'mean_sold_share_1914_baseline': macro_14,
-            'mean_sold_share_1917_free_evolution': macro_17_free,
-            'mean_sold_share_1917_cartel_lock': macro_17_lock,
-            'mean_sold_share_1917_cartel_split': macro_17_split,
-            'macro_bifurcation_split_vs_lock': round(macro_17_split - macro_17_lock, 4),
-            'macro_retention_suppression_lock_vs_free': round(macro_17_lock - macro_17_free, 4),
+            f'mean_sold_share_{terminal_year}_free_evolution': macro_t_free,
+            f'mean_sold_share_{terminal_year}_cartel_lock': macro_t_lock,
+            f'mean_sold_share_{terminal_year}_cartel_split': macro_t_split,
+            'macro_bifurcation_split_vs_lock': round(macro_t_split - macro_t_lock, 4),
+            'macro_retention_suppression_lock_vs_free': round(macro_t_lock - macro_t_free, 4),
         },
         'markets': {},
     }
@@ -1177,7 +1256,7 @@ def run_and_save_all_markets(
         free_ann = res['regimes']['free_evolution']['annual_readouts']
         lock_ann = res['regimes']['cartel_lock']['annual_readouts']
         split_ann = res['regimes']['cartel_split']['annual_readouts']
-        
+
         consolidated_doc['markets'][mid] = {
             'commodity': res['commodity'],
             'geography': res['geography'],
@@ -1189,27 +1268,27 @@ def run_and_save_all_markets(
             'sold_share_trajectory': {
                 yr: ro['village_sold_share'] for yr, ro in free_ann.items()
             },
-            'bifurcation_1917': {
+            f'bifurcation_{terminal_year}': {
                 'kappa': {
-                    'free_evolution': free_ann['1917']['kappa'],
-                    'cartel_split': split_ann['1917']['kappa'],
-                    'cartel_lock': lock_ann['1917']['kappa'],
-                    'delta_split_vs_lock': round(split_ann['1917']['kappa'] - lock_ann['1917']['kappa'], 4),
+                    'free_evolution': free_ann[str(terminal_year)]['kappa'],
+                    'cartel_split': split_ann[str(terminal_year)]['kappa'],
+                    'cartel_lock': lock_ann[str(terminal_year)]['kappa'],
+                    'delta_split_vs_lock': round(split_ann[str(terminal_year)]['kappa'] - lock_ann[str(terminal_year)]['kappa'], 4),
                 },
                 'sold_share': {
-                    'free_evolution': free_ann['1917']['village_sold_share'],
-                    'cartel_split': split_ann['1917']['village_sold_share'],
-                    'cartel_lock': lock_ann['1917']['village_sold_share'],
+                    'free_evolution': free_ann[str(terminal_year)]['village_sold_share'],
+                    'cartel_split': split_ann[str(terminal_year)]['village_sold_share'],
+                    'cartel_lock': lock_ann[str(terminal_year)]['village_sold_share'],
                     'bifurcation_delta_sold_share': round(
-                        split_ann['1917']['village_sold_share'] - lock_ann['1917']['village_sold_share'], 4
+                        split_ann[str(terminal_year)]['village_sold_share'] - lock_ann[str(terminal_year)]['village_sold_share'], 4
                     ),
                 },
                 'farmgate_price': {
-                    'free_evolution': free_ann['1917']['p_farmgate'],
-                    'cartel_split': split_ann['1917']['p_farmgate'],
-                    'cartel_lock': lock_ann['1917']['p_farmgate'],
+                    'free_evolution': free_ann[str(terminal_year)]['p_farmgate'],
+                    'cartel_split': split_ann[str(terminal_year)]['p_farmgate'],
+                    'cartel_lock': lock_ann[str(terminal_year)]['p_farmgate'],
                     'farmgate_premium_split_vs_lock': round(
-                        split_ann['1917']['p_farmgate'] - lock_ann['1917']['p_farmgate'], 2
+                        split_ann[str(terminal_year)]['p_farmgate'] - lock_ann[str(terminal_year)]['p_farmgate'], 2
                     ),
                 },
             },
@@ -1220,7 +1299,8 @@ def run_and_save_all_markets(
     cons_path = output_dir / 'dynamics-gnp-markets-consolidated.json'
     with open(cons_path, 'w', encoding='utf-8') as f:
         json.dump(consolidated_doc, f, indent=2, ensure_ascii=False)
-    print(f'[OK] Generated Consolidated Suite -> {cons_path.relative_to(root_path)}')
+    _log = cons_path.relative_to(root_path) if cons_path.is_relative_to(root_path) else cons_path
+    print(f'[OK] Generated Consolidated Suite -> {_log}')
 
     return {
         'market_results': market_results,
@@ -1233,6 +1313,7 @@ def run_and_save_village_monthly(
     output_dir: Path,
     root_path: Optional[Path] = None,
     delta_idle: float = 0.20,
+    start_year: int = 1914,
 ) -> Dict[str, Dict[str, Any]]:
     """Serialize per-village monthly sold_share series for all 7 GNP markets.
 
@@ -1240,6 +1321,7 @@ def run_and_save_village_monthly(
     ``s-trajectory-gnp-village-monthly-v1``) without touching the existing
     ``dynamics-gnp-{market}.json`` artifacts. Endpoint consistency against the
     annual three-regime village values is asserted per market (tolerance 1e-6).
+    ``start_year`` selects the window (1914 legacy / 1917 for the 1920 layer).
     """
     root_path = _require_root(root_path)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1255,8 +1337,8 @@ def run_and_save_village_monthly(
         v_list = all_market_villages.get(mid, [])
         cfg.delta_idle = delta_idle
         engine = MarketDynamicsEngine(cfg, villages=v_list)
-        suite = engine.run_comparative_suite(delta_idle_override=delta_idle)
-        doc = engine.build_village_monthly_document(suite=suite)
+        suite = engine.run_comparative_suite(delta_idle_override=delta_idle, start_year=start_year)
+        doc = engine.build_village_monthly_document(suite=suite, start_year=start_year)
         assert doc['endpoint_consistency']['passed'], (
             f"village-monthly endpoint consistency failed for {mid}: "
             f"max_abs_deviation={doc['endpoint_consistency']['max_abs_deviation']}"
@@ -1264,7 +1346,8 @@ def run_and_save_village_monthly(
         out_file = output_dir / f'village-monthly-{mid.replace("_", "-")}.json'
         with open(out_file, 'w', encoding='utf-8') as f:
             json.dump(doc, f, indent=2, ensure_ascii=False)
-        print(f'[OK] Generated village-monthly {mid} ({len(v_list)} villages) -> {out_file.relative_to(root_path)}')
+        _log = out_file.relative_to(root_path) if out_file.is_relative_to(root_path) else out_file
+        print(f'[OK] Generated village-monthly {mid} ({len(v_list)} villages) -> {_log}')
         docs[mid] = doc
 
     return docs
@@ -1324,12 +1407,41 @@ def main():
         required=True,
         help="Worldline data root (contains index/locations/data/almanac)"
     )
+    parser.add_argument(
+        '--start-year',
+        type=int,
+        default=1914,
+        help='Engine window start year: 1914 (default, legacy 1914-01..1917-01) '
+             'or 1917 (1920 observation layer, 1917-01..1920-01).'
+    )
+    parser.add_argument(
+        '--save-village-monthly',
+        action='store_true',
+        help='Also write village-monthly-{market}.json per market (opt-in).'
+    )
+    parser.add_argument(
+        '--out-dir',
+        type=str,
+        default=None,
+        help='Output directory (default: the legacy 1917 projection dir).'
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
-    out_dir = root / 'index/locations/data/almanac/1910-1920/1917/projection'
-    print('=== EXECUTING COMPLETE 7-MARKET CLOSED-LOOP SUITE ===')
-    run_and_save_all_markets(out_dir, root_path=root, delta_idle=args.delta_idle)
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    elif args.start_year == 1917:
+        out_dir = root / 'index/locations/data/almanac/1920-1929/1920/projection'
+    else:
+        out_dir = root / 'index/locations/data/almanac/1910-1920/1917/projection'
+    print(f'=== EXECUTING COMPLETE 7-MARKET CLOSED-LOOP SUITE (window {args.start_year}-01..{args.start_year + 3}-01) ===')
+    run_and_save_all_markets(
+        out_dir,
+        root_path=root,
+        delta_idle=args.delta_idle,
+        save_village_monthly=args.save_village_monthly,
+        start_year=args.start_year,
+    )
 
 
 if __name__ == '__main__':
