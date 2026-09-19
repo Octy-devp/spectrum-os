@@ -1714,7 +1714,18 @@ class ForceFieldDynamics:
         # magnitude reads in s()/tension()/panic weight.
         # (AUDIT FIX 2026-09-17: fast5 lane crash "c_source returned a
         # negative value" — stage undershoot, not substrate poison.)
-        c_source = c_eff * np.maximum(C_arr, 0.0) + fc["kappa_c"] * (1.0 - Phi_arr)
+        # 阻塞源是一個份額讀數：κ_C·(1−Φ) 對 Φ ∈ [0,1] 定義（Φ 是電導率份額，
+        # 步末 clip 到同界）。RK4 中間步 Φ 可暫時越上界 > 1（κ_Φ·drive·dt/2 > 1
+        # 時 stage 即越界；logistic 連續流單調指向 Φ* ≤ 1，是自癒流，步末 clip
+        # 兜底）——裸讀 stage 使 (1−Φ) < 0，κ_C > 0 且主項小時 c_source 總額為
+        # 負，誤爆 driver 防護於健康軌道。夾制與步末 clip 同界（份額的定義域，
+        # 非 ≥0 幅度量）。同家法：b55d6ba（本律主項）、42a0de3（k_inflow）。
+        # (H4 AUDIT FIX 2026-09-19: b55d6ba 附帶條件——"c_source returned a
+        # negative value" 於 Φ stage > 1；stage 越界，不是 substrate 毒律。
+        # c_source_fn 仍收到原始 ctx["Phi"]，返回負值照樣大聲爆炸。)
+        c_source = (c_eff * np.maximum(C_arr, 0.0)
+                    + fc["kappa_c"]
+                    * (1.0 - np.clip(Phi_arr, _PHI_MIN, _PHI_MAX)))
         c_source = _driver_value(c_source, fc["c_source_fn"], t, ctx, C_arr,
                                  "c_source")
         dC_sink = (fc["alpha_rc"] * R_arr * C_arr
@@ -1747,8 +1758,17 @@ class ForceFieldDynamics:
         j_alien = _driver_value(
             fc["eta"] * fc["mu_e"] * np.maximum(Pp_arr, 0.0), fc["k_inflow_fn"],
             t, ctx, Pp_arr, "k_inflow")
-        k_decay = _driver_value(fc["gamma_k"] * K_arr, fc["k_decay_fn"],
-                                t, ctx, K_arr, "k_decay")
+        # K 折舊是一個幅度量：預設律 γ_K·K 對 K ≥ 0 定義。RK4 中間步 K 可暫時
+        # 下潛 < 0（γ_K·dt/2 > 1 時首個中段 stage 即越界；無流入時連續律
+        # dK = −γ_K·K 單調指向 0，是自癒流，步末 clamp_nonneg 兜底）——裸讀
+        # stage 使預設項為負，誤爆 driver 防護於健康軌道。同家法：b55d6ba
+        # （C 源律）、42a0de3（k_inflow）——kernel 只夾制自己構造的預設律讀數；
+        # substrate 的 k_decay_fn 仍收到原始 ctx["K"]（世界有權看到真實狀態），
+        # 返回負值照樣大聲爆炸。
+        # (H4 AUDIT FIX 2026-09-19: "k_decay returned a negative value" —
+        # stage 下潛，不是 substrate 毒律。)
+        k_decay = _driver_value(fc["gamma_k"] * np.maximum(K_arr, 0.0),
+                                fc["k_decay_fn"], t, ctx, K_arr, "k_decay")
         dK = j_alien - k_decay
 
         # Morphology dissolution: J_dissolve = k_dissolve * g(M) * P_pool
