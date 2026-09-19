@@ -68,40 +68,111 @@ class MarketConfig:
     lenin_thesis_notes: Dict[str, str] = field(default_factory=dict)
 
 
+def _village_crops(data: Dict[str, Any]) -> List[str]:
+    """Lowercased production.crops of the volume's first census household (commodity tokens)."""
+    census = data.get('census') or []
+    if not census:
+        return []
+    return [str(c).lower() for c in
+            (census[0].get('household_year', {}).get('production', {}).get('crops') or [])]
+
+
 def classify_village_market(rel_path_str: str, data: Dict[str, Any]) -> str:
-    """Classify an observation volume into one of the 7 empirical commodity markets."""
+    """Classify an observation volume into one of the 7 empirical commodity markets.
+
+    v2 joint geography+commodity routing (2026-09-19; B2/B4 cross-audit fix).
+    Geography routes a village to its own continent/empire pole first; commodity
+    tokens decide only for geographies with no native pole among the 7 markets
+    (continental Europe outside the UK). The legacy unconditional
+    ``return 'us_midwest_grain'`` path-prefix fallback — which hung French,
+    Swiss and Mediterranean family-farm volumes under a US midwest market — is
+    abolished; the final residual default remains world-grain so an unknown
+    future volume is never silently filed under the UK pole.
+    """
     p = rel_path_str.lower()
     z = str(data.get('zone_id', '')).lower()
 
-    # 1. Argentine frigorifico & River Plate agro-export
+    # --- Geography first: continent/empire poles --------------------------------
+
+    # 1. Argentine frigorifico & River Plate agro-export — beef frigorificos AND
+    #    pampa wheat/maize/flax clear the same BA/Rosario/Bahia Blanca
+    #    frigorifico-capital port system (bahia-blanca/rosario volumes live under
+    #    usa/ dirs: directory prefixes are not geography).
     if any(k in p for k in ['argentina', 'bahia-blanca', 'rosario']) or z.startswith('ar_'):
         return 'ar_frigorifico'
 
-    # 2. US Cotton South debt crop lien
+    # 2. US Cotton South debt crop lien — furnish-merchant credit covers cotton
+    #    and the same plantation belt's cane/corn (geo token).
     if any(k in p for k in ['alabama', 'georgia-cotton', 'memphis', 'new-orleans', 'vicksburg']) or any(
         z.startswith(k) for k in ['us_alabama', 'us_georgia', 'us_tennessee', 'us_louisiana', 'us_mississippi']
     ):
         return 'us_furnish_lien'
+    # 2b. Commodity backstop — a USA-lane volume with cotton as lead crop is lien
+    #     economy even if its geo token is missed.
+    if p.startswith('usa/') and _village_crops(data)[:1] == ['cotton']:
+        return 'us_furnish_lien'
 
-    # 3. PRD silk filature & commercial agriculture
+    # 3. PRD silk filature & commercial agriculture — mulberry-dike silk economy
+    #    (geo token).
     if 'prd-' in p or z.startswith('cn_prd'):
         return 'prd_silk_filature'
 
-    # 4. Japan rice tenancy & zaibatsu
+    # 4. Japan rice tenancy & zaibatsu — parasitic landlordism pole; Japanese
+    #    sericulture villages (kanto/shinano mulberry) stay here: geography
+    #    outranks the silk commodity token.
     if any(k in p for k in ['tohoku', 'kanto', 'kyushu', 'shinano']) or z.startswith('jp_'):
         return 'jp_rice_tenancy'
 
-    # 5. India / Ceylon / Malaya Chettiar credit & imperial export
+    # 5. India / Ceylon / Malaya Chettiar credit & imperial export — jute/rice/
+    #    cotton/tea/rubber/wheat-canal exports under the Chettiar+Arhtiya circle.
     if any(k in p for k in ['benares', 'bengal', 'ceylon', 'deccan', 'madras', 'malaya', 'punjab']) or any(
         z.startswith(k) for k in ['in_', 'lk_', 'my_']
     ):
         return 'in_chettiar_credit'
 
-    # 6. UK Corn factor ring
+    # 6. UK Corn factor ring — London-system agricultural belt takes ALL British
+    #    volumes: grain, wool (Wales hill sheep, Yorkshire wool clips marketed
+    #    through the same London/provincial factor chains) and dairy (Somerset);
+    #    no wool pole exists in the 7-market world, and the metropolitan
+    #    commission-factor structure is the matching economics.
     if p.startswith('uk/') or z.startswith('uk_'):
         return 'uk_corn_factor'
 
-    # 7. US Midwest / North American grain & continental
+    # 7. North American continental pole (US Midwest grain: Chicago/Minneapolis
+    #    system) — US/Canada grain belt plus North American dairy/specialty
+    #    agriculture without a dedicated pole (Montreal Dairy Co., Yakima fruit
+    #    growers, ZCMI sugar beet; precedent members: Minnesota springwheat-dairy,
+    #    New England dairy) — one terminal-market commercialization system.
+    if p.startswith('usa/') or 'canada' in p or 'montreal' in p or z.startswith('us_'):
+        return 'us_midwest_grain'
+
+    # --- Commodity override: geographies with no native pole --------------------
+    # (continental Europe outside the UK: France, Switzerland, Danube, Balkans)
+
+    # 8. Silk commodity token — mulberry/silk/cocoon signature crop routes to the
+    #    silk filature pole: Lyon/Rhone sericulture feeds the same filature
+    #    procurement + merchant export-house structure as the Pearl River Delta
+    #    (fixes lyon-primary/secondary mis-filed under us_midwest_grain).
+    if any('mulberry' in c or 'silk' in c or 'cocoon' in c for c in _village_crops(data)):
+        return 'prd_silk_filature'
+
+    # 9. Danube/Black Sea export-grain estates — 1000+ ha extensive cereal
+    #    economies shipping f.o.b. via Vidin/Galatz into the world grain market:
+    #    Chicago-parallel estate structure, not metropolitan consignment.
+    if any(k in p for k in ['danube', 'vidin', 'romania', 'galatz']):
+        return 'us_midwest_grain'
+
+    # 10. Remaining continental European family farms — France north wheat
+    #     (Paris basin), Bordeaux vineyards, Marseille Mediterranean polyculture
+    #     (durum/olive/savonnerie), Swiss alp cheese + Zurich mixed farming:
+    #     European metropolitan market pole (city exchanges / commission factors,
+    #     Mark Lane structure family) — the only European pole among the 7.
+    if any(k in p for k in ['france', 'lyon', 'marseille', 'bordeaux', 'paris',
+                            'swiss', 'bern', 'zurich']):
+        return 'uk_corn_factor'
+
+    # 11. World-grain residual for unmapped future volumes — never silently file
+    #     a non-European village under the UK pole.
     return 'us_midwest_grain'
 
 
