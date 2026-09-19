@@ -376,12 +376,47 @@ def test_real_warfare_trees_parse(field):
 
 @needs_ecc
 def test_real_warfare_tomography_track0():
+    # Verdict expectation CONTESTED since f0c9bdb9 (ECC 2026-09-08): the track0
+    # tree was rebuilt single-entry-per-round (R4 adjudicated dead — tombstone,
+    # WARFARE-BOARD 2026-09-07; old multi-branch tree archived with c1695ece).
+    # rus/r01 has exactly one active measurement context ⇒ CONTESTED is the
+    # honest verdict ("collapsed by construction"). ASSERTED semantics (≥2
+    # threads) stay pinned by the 1915 multi-branch positive case below; if
+    # track0 R4d is ever revived with multi-branch rounds, this expectation
+    # should follow the data back to ASSERTED.
     graph = load_warfare_tree(f"{ECC_WARFARE_FIELDS}/experiment-track0/dca-branch-tree.yaml")
     scan = tomography(graph, "rus/r01")
-    assert scan.verdict is Verdict.ASSERTED
+    assert scan.verdict is Verdict.CONTESTED
+    assert scan.values["n_threads"] == 1
     dist = scan.values["role_distribution"]
     for role in ROLES:
-        assert dist[role] > 0.0  # round 1 quads fully populated
+        assert dist[role] == pytest.approx(0.25)  # 5key quads fully populated
+
+
+@needs_ecc
+def test_real_warfare_tomography_1915_multibranch_asserted():
+    """Positive pin for the ≥2-threads ⇒ ASSERTED semantics on real data:
+    the 1915 anti-intervention-war field has multi-entry rounds (e.g. rus
+    round 5 carries six dca entries), unlike the rebuilt single-entry
+    track0 tree (see test_real_warfare_tomography_track0). Rounds are
+    data-scanned — any round whose tomography yields ≥2 measurement
+    contexts must verdict ASSERTED."""
+    path = f"{ECC_WARFARE_FIELDS}/anti-intervention-war-1915/dca-branch-tree.yaml"
+    if not os.path.exists(path):
+        pytest.skip(f"{path} missing")
+    graph = load_warfare_tree(path)
+    picked = None
+    for sid in sorted(graph.states()):
+        if not sid.startswith("rus/"):
+            continue
+        scan = tomography(graph, sid)
+        if scan.values.get("n_threads", 0) >= 2:
+            picked = (sid, scan)
+            break
+    assert picked is not None, "no multi-branch round found in 1915 field"
+    sid, scan = picked
+    assert scan.verdict is Verdict.ASSERTED
+    assert scan.values["n_threads"] >= 2
 
 
 @needs_ecc
