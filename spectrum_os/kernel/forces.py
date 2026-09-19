@@ -154,8 +154,10 @@ def _driver_value(slot: Any, fn: Callable | None, t: float, ctx: dict,
     ``fn`` (when given) takes precedence over ``slot``. A callable is called as
     ``fn(t, ctx)`` where ``ctx`` carries the universal observables
     (``R, C, P, Phi, K, S, T``) — the world supplies *intensity*, the kernel owns
-    the structure. Scalars are broadcast; results are clamped non-negative
-    (all four driver slots are magnitudes).
+    the structure. Scalars are broadcast. Driver slots are magnitudes: a NaN/Inf
+    or negative result RAISES — the kernel clamps its own default-law reads
+    (magnitude idiom), so a bad value here means a substrate fn supplied an
+    invalid law, and that must be loud, not silently repaired.
     """
     value = fn if fn is not None else slot
     if callable(value):
@@ -1731,8 +1733,20 @@ class ForceFieldDynamics:
         # alienation inflow is proportional to a release rate rather than to
         # the extraction parameter). One flow, two places: it is the K inflow
         # AND the P_pool drain, so the two can never drift apart.
-        j_alien = _driver_value(fc["eta"] * fc["mu_e"] * Pp_arr, fc["k_inflow_fn"],
-                                t, ctx, Pp_arr, "k_inflow")
+        # Alienation inflow is a magnitude: the default law is linear in
+        # P_pool and defined for P >= 0. RK4 stage states may transiently
+        # undershoot zero (the λ/ρ drains then act as restoring flows, so the
+        # continuous dynamics is self-correcting); reading the stage P raw
+        # here would make the default term negative and trip the driver guard
+        # on a healthy trajectory. Same idiom as the magnitude reads in
+        # s()/tension()/panic weight and the C-source clamp (b55d6ba).
+        # (AUDIT FIX 2026-09-19: policy×fast5 lane crash "k_inflow returned a
+        # negative value" — stage undershoot, not substrate poison. The
+        # substrate fn keeps receiving the raw ctx["P"] — a world sees the
+        # real state; a fn returning negative is still rejected loudly below.)
+        j_alien = _driver_value(
+            fc["eta"] * fc["mu_e"] * np.maximum(Pp_arr, 0.0), fc["k_inflow_fn"],
+            t, ctx, Pp_arr, "k_inflow")
         k_decay = _driver_value(fc["gamma_k"] * K_arr, fc["k_decay_fn"],
                                 t, ctx, K_arr, "k_decay")
         dK = j_alien - k_decay
