@@ -1184,14 +1184,17 @@ def get_jp_rice_tenancy_config() -> MarketConfig:
 # [DERIVED_PROXY], SSOT＝該檔). 1918/1919 are mechanical linear midpoints of the
 # 1917→1920 ramp — no new economic judgement is introduced. The default 1914
 # window only reads keys 1914..1917, so extending the series is a no-op for it.
+# 2026-09-23 doctrinal derivation (內爆＝無戰爭繁榮): common 1916 boom premium
+# revoked (median 110→100 = 1913 baseline); per-market structural differentiation
+# preserved (uniform −10). See ECC docs/plans/GNP-ANCHOR-1917-20-PROPOSAL.md 附錄.
 P_WORLD_1920_CANON: Dict[str, float] = {
-    'ar_frigorifico': 110.0,
-    'us_midwest_grain': 108.0,
-    'uk_corn_factor': 115.0,
-    'in_chettiar_credit': 105.0,
-    'us_furnish_lien': 120.0,
-    'prd_silk_filature': 72.0,
-    'jp_rice_tenancy': 118.0,
+    'ar_frigorifico': 100.0,
+    'us_midwest_grain': 98.0,
+    'uk_corn_factor': 105.0,
+    'in_chettiar_credit': 95.0,
+    'us_furnish_lien': 110.0,
+    'prd_silk_filature': 62.0,
+    'jp_rice_tenancy': 108.0,
 }
 
 
